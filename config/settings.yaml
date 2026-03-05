@@ -1,0 +1,39 @@
+data_source: yahoo
+
+redis:
+  url: "redis://localhost:6379"
+  max_connections: 10
+
+polling:
+  stock_quote_interval_seconds: 10
+  option_chain_interval_seconds: 30
+  history_interval_seconds: 60
+
+watchlist:
+  symbols:
+    - AAPL
+    - TSLA
+    - SPY
+    - QQQ
+    - NVDA
+
+trading_hours:
+  pre_market_minutes: 30
+  market_open: "09:30"
+  market_close: "16:00"
+  timezone: "America/New_York"
+
+telegram:
+  bot_token: "${TELEGRAM_BOT_TOKEN}"
+  chat_id: "${TELEGRAM_CHAT_ID}"
+  max_notifications_per_minute: 10
+
+rate_limit:
+  max_requests_per_hour: 1500
+  backoff_base_seconds: 1
+  backoff_max_seconds: 60
+
+sqlite:
+  db_path: "data/monitor.db"
+
+strategies_dir: "config/strategies"
