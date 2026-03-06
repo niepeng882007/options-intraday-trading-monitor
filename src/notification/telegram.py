@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import html
+import re
 import time
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -38,9 +41,13 @@ ENTRY_SIGNAL_TEMPLATE = (
     "━━━━━━━━━━━━━━━━━━━━\n"
     "🆔 信号ID: <code>{signal_id}</code>\n"
     "⚠️ 数据源: Yahoo Finance (延迟~15s)\n\n"
-    "确认建仓: /confirm {signal_id} &lt;成交价&gt;\n"
+    "确认建仓: /confirm {signal_id} &lt;股票价格&gt;\n"
+    "  (输入建仓时底层股票价格，非期权价格)\n"
     "跳过: /skip {signal_id}"
 )
+
+
+_esc = html.escape
 
 
 def _format_indicator_value(value: float | None, decimals: int = 4) -> str:
@@ -56,19 +63,17 @@ def _build_quality_section(quality: EntryQuality | None) -> str:
     if quality is None:
         return ""
     emoji = QUALITY_GRADE_EMOJI.get(quality.grade, "⚪")
-    lines = [f"⭐ <b>入场质量: {emoji} {quality.grade} ({quality.score}/100)</b>"]
+    lines = [f"⭐ <b>入场质量: {emoji} {_esc(quality.grade)} ({quality.score}/100)</b>"]
     if quality.vwap_distance_pct:
-        vwap_ok = "✅" if abs(quality.vwap_distance_pct) < 0.5 else "⚠️"
-        lines.append(f"   📍 距VWAP: {quality.vwap_distance_pct:+.2f}% {vwap_ok}")
+        lines.append(f"   📍 距VWAP: {quality.vwap_distance_pct:+.2f}%")
     if quality.range_percentile:
-        rp_ok = "✅" if quality.range_percentile < 60 else "⚠️"
-        lines.append(f"   📍 日内位置: {quality.range_percentile:.0f}% {rp_ok}")
+        lines.append(f"   📍 日内位置: {quality.range_percentile:.0f}%")
     if quality.volume_ratio:
-        vr_ok = "✅" if quality.volume_ratio >= 1.0 else "⚠️"
-        lines.append(f"   📍 量比: {quality.volume_ratio:.1f}x {vr_ok}")
+        vol_label = "缩量" if quality.volume_ratio < 0.8 else "放量" if quality.volume_ratio > 1.2 else "正常"
+        lines.append(f"   📍 量比: {quality.volume_ratio:.1f}x ({vol_label})")
     if quality.reasons:
         for reason in quality.reasons:
-            lines.append(f"   ⚠️ {reason}")
+            lines.append(f"   • {_esc(reason)}")
     return "\n".join(lines) + "\n\n"
 
 
@@ -76,7 +81,7 @@ def _build_strategy_rationale(meta: dict[str, Any]) -> str:
     desc = meta.get("description", "").strip()
     if not desc:
         return ""
-    return f"💡 <b>策略逻辑:</b> {desc}\n\n"
+    return f"💡 <b>策略逻辑:</b> {_esc(desc)}\n\n"
 
 
 def _build_sop_section(meta: dict[str, Any]) -> str:
@@ -85,7 +90,7 @@ def _build_sop_section(meta: dict[str, Any]) -> str:
         return ""
     lines = ["📋 <b>操作清单:</b>"]
     for i, item in enumerate(checklist, 1):
-        lines.append(f"   {i}. {item}")
+        lines.append(f"   {i}. {_esc(item)}")
     return "\n".join(lines) + "\n\n"
 
 
@@ -93,7 +98,7 @@ def _build_option_section(meta: dict[str, Any]) -> str:
     text = meta.get("option_selection", "")
     if not text:
         return ""
-    return f"🎯 <b>期权选择:</b> {text}\n\n"
+    return f"🎯 <b>期权选择:</b> {_esc(text)}\n\n"
 
 
 def _build_exit_plan_section(meta: dict[str, Any]) -> str:
@@ -104,9 +109,9 @@ def _build_exit_plan_section(meta: dict[str, Any]) -> str:
     sl = plan.get("stop_loss", "")
     tp = plan.get("take_profit", "")
     if sl:
-        lines.append(f"   🔴 止损: {sl}")
+        lines.append(f"   🔴 止损: {_esc(sl)}")
     if tp:
-        lines.append(f"   🟢 止盈: {tp}")
+        lines.append(f"   🟢 止盈: {_esc(tp)}")
     return "\n".join(lines) + "\n\n"
 
 
@@ -124,7 +129,7 @@ def _build_indicator_snapshot(
         return ""
 
     sections: list[str] = []
-    for timeframe in ("5m", "1m"):
+    for timeframe in ("15m", "5m", "1m"):
         ind = indicators_by_tf.get(timeframe)
         if ind is None:
             continue
@@ -136,12 +141,21 @@ def _build_indicator_snapshot(
             f"Signal: {_format_indicator_value(ind.macd_signal)} / "
             f"Hist: {_format_indicator_value(ind.macd_histogram)}"
         )
-        lines.append(
-            f"   EMA: 9={_format_indicator_value(ind.ema_9, 2)} / "
-            f"21={_format_indicator_value(ind.ema_21, 2)}"
-        )
+        ema_parts = [f"9={_format_indicator_value(ind.ema_9, 2)}"]
+        ema_parts.append(f"21={_format_indicator_value(ind.ema_21, 2)}")
+        if ind.ema_50 is not None:
+            ema_parts.append(f"50={_format_indicator_value(ind.ema_50, 2)}")
+        if ind.ema_200 is not None:
+            ema_parts.append(f"200={_format_indicator_value(ind.ema_200, 2)}")
+        lines.append(f"   EMA: {' / '.join(ema_parts)}")
         lines.append(f"   VWAP: {_format_indicator_value(ind.vwap, 2)}")
+        if ind.bb_width_pct is not None:
+            lines.append(f"   BB宽度: {_format_indicator_value(ind.bb_width_pct, 4)}%")
         lines.append(f"   ATR(14): {_format_indicator_value(ind.atr, 4)}")
+        if ind.candle_body_pct is not None:
+            lines.append(f"   K线实体: {_format_indicator_value(ind.candle_body_pct, 3)}%")
+        if ind.volume_ratio is not None:
+            lines.append(f"   量比: {_format_indicator_value(ind.volume_ratio, 2)}x")
         sections.append("\n".join(lines))
 
     if not sections:
@@ -153,7 +167,8 @@ EXIT_SIGNAL_TEMPLATE = (
     "━━━━━━━━━━━━━━━━━━━━\n"
     "📌 标的: {symbol} (${underlying_price})\n"
     "📊 触发: {exit_reason}\n"
-    "   入场价 ${entry_price} → 当前 ${current_price} ({pnl_pct})\n"
+    "   股票: ${entry_price} → ${current_price} ({pnl_pct})\n"
+    "   📊 期权参考: ATM 0DTE 约 {option_pnl_est}\n"
     "⏱ 持仓 {hold_duration}\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
     "⚠️ 数据源: Yahoo Finance (延迟~15s)"
@@ -246,7 +261,9 @@ class TelegramNotifier:
             logger.warning("Rate limit exceeded, skipping entry signal")
             return False
 
-        conditions_text = "\n".join(f"   {c}" for c in signal.conditions_detail)
+        conditions_text = "\n".join(
+            f"   {_esc(c)}" for c in signal.conditions_detail
+        )
         trigger_time = datetime.now(ET).strftime("%H:%M:%S")
 
         quote_text = ""
@@ -259,10 +276,10 @@ class TelegramNotifier:
         meta = signal.strategy_meta or {}
 
         message = ENTRY_SIGNAL_TEMPLATE.format(
-            strategy_name=signal.strategy_name,
+            strategy_name=_esc(signal.strategy_name),
             strategy_rationale=_build_strategy_rationale(meta),
             quality_section=_build_quality_section(signal.entry_quality),
-            symbol=signal.symbol,
+            symbol=_esc(signal.symbol),
             underlying_price=f"{underlying_price:.2f}",
             quote_detail=quote_text,
             conditions_detail=conditions_text,
@@ -272,7 +289,7 @@ class TelegramNotifier:
             exit_plan_section=_build_exit_plan_section(meta),
             trigger_time=trigger_time,
             trading_window_hint=_build_trading_window_hint(meta),
-            signal_id=signal_id,
+            signal_id=_esc(signal_id),
         )
         return await self._send_message(message)
 
@@ -288,15 +305,20 @@ class TelegramNotifier:
             return False
 
         pnl_pct = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+        # Rough ATM 0DTE option PnL estimate: ~15x stock move for 0DTE ATM
+        option_pnl_low = pnl_pct * 12
+        option_pnl_high = pnl_pct * 20
+        option_pnl_est = f"{option_pnl_low:+.0f}% ~ {option_pnl_high:+.0f}%"
         message = EXIT_SIGNAL_TEMPLATE.format(
-            strategy_name=signal.strategy_name,
-            symbol=signal.symbol,
+            strategy_name=_esc(signal.strategy_name),
+            symbol=_esc(signal.symbol),
             underlying_price=f"{underlying_price:.2f}",
-            exit_reason=signal.exit_reason,
+            exit_reason=_esc(signal.exit_reason),
             entry_price=f"{entry_price:.2f}",
             current_price=f"{current_price:.2f}",
             pnl_pct=f"{pnl_pct:+.1f}%",
-            hold_duration=hold_duration,
+            option_pnl_est=option_pnl_est,
+            hold_duration=_esc(hold_duration),
         )
         return await self._send_message(message)
 
@@ -304,25 +326,40 @@ class TelegramNotifier:
         self, strategy_id: str, strategy_name: str, status: str
     ) -> bool:
         message = STRATEGY_UPDATE_TEMPLATE.format(
-            strategy_name=strategy_name,
-            strategy_id=strategy_id,
-            status=status,
+            strategy_name=_esc(strategy_name),
+            strategy_id=_esc(strategy_id),
+            status=_esc(status),
         )
         return await self._send_message(message)
 
     async def send_text(self, text: str) -> bool:
         return await self._send_message(text)
 
+    _STRIP_HTML_RE = re.compile(r"<[^>]+>")
+
     async def _send_message(self, text: str) -> bool:
+        if not (self._app and self._app.bot):
+            return False
         try:
-            if self._app and self._app.bot:
+            await self._app.bot.send_message(
+                chat_id=self._chat_id,
+                text=text,
+                parse_mode="HTML",
+            )
+            self._send_timestamps.append(time.time())
+            return True
+        except BadRequest as exc:
+            logger.warning("HTML parse failed, retrying as plain text: %s", exc)
+            try:
+                plain = self._STRIP_HTML_RE.sub("", text)
                 await self._app.bot.send_message(
                     chat_id=self._chat_id,
-                    text=text,
-                    parse_mode="HTML",
+                    text=plain,
                 )
                 self._send_timestamps.append(time.time())
                 return True
+            except Exception:
+                logger.exception("Plain-text fallback also failed")
         except Exception:
             logger.exception("Failed to send Telegram message")
         return False
@@ -504,7 +541,8 @@ class TelegramNotifier:
     async def _cmd_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not context.args or len(context.args) < 2:
             await update.message.reply_text(  # type: ignore[union-attr]
-                "用法: /confirm <signal_id> <成交价>"
+                "用法: /confirm <signal_id> <股票价格>\n"
+                "  请输入建仓时底层股票价格（非期权价格）"
             )
             return
 
@@ -521,7 +559,7 @@ class TelegramNotifier:
 
         if self._state_manager.confirm_entry(signal_id, entry_price):
             await update.message.reply_text(  # type: ignore[union-attr]
-                f"✅ 已确认建仓 {signal_id} @ ${entry_price:.2f}\n开始追踪出场条件"
+                f"✅ 已确认建仓 {signal_id} @ ${entry_price:.2f} (股票价格)\n开始追踪出场条件"
             )
         else:
             await update.message.reply_text(  # type: ignore[union-attr]
@@ -543,8 +581,8 @@ class TelegramNotifier:
         """发送模拟入场与出场提醒，用于验证 Telegram 推送链路是否正常。"""
         TEST_SIGNAL_ID = f"TEST-{int(time.time())}"
         TEST_UNDERLYING_PRICE = 185.50
-        TEST_ENTRY_PRICE = 3.50
-        TEST_EXIT_PRICE = 5.25
+        TEST_ENTRY_PRICE = 185.20  # Stock entry price (not option)
+        TEST_EXIT_PRICE = 186.10   # Stock current price
 
         await update.message.reply_text("🧪 开始发送测试提醒...")  # type: ignore[union-attr]
 

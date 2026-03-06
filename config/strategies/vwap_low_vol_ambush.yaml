@@ -1,0 +1,97 @@
+strategy_id: "vwap-low-vol-ambush"
+name: "VWAP 极度缩量埋伏"
+enabled: true
+description: >
+  大趋势向上时，价格回落到 VWAP 附近且成交量极度萎缩（死水状态），
+  在横盘中从容埋伏进场。延迟 15s 对横盘毫无影响。
+
+watchlist:
+  underlyings: ["QQQ", "AAPL", "NVDA", "TSLA", "META", "AMZN"]
+  option_filter:
+    type: "call"
+    max_dte: 2
+    moneyness: "ATM"
+    min_volume: 100
+    max_spread_pct: 0.15
+
+trading_window:
+  start: "10:00"
+  end: "15:30"
+  timezone: "US/Eastern"
+
+entry_conditions:
+  operator: "AND"
+  rules:
+    # 非空头日过滤：日内跌幅不超过 0.15%（收紧，Futu 数据更精确）
+    - indicator: "PRICE"
+      field: "day_change_pct"
+      comparator: ">"
+      threshold: -0.15
+      timeframe: "5m"
+
+    # 大趋势向上：价格 > 50 EMA
+    - indicator: "PRICE"
+      field: "close"
+      comparator: ">"
+      reference_field: "ema_50"
+      timeframe: "5m"
+
+    # 价格在 VWAP 附近：偏离率绝对值 < 0.08%（收紧精度）
+    - indicator: "PRICE"
+      field: "abs_vwap_distance_pct"
+      comparator: "<"
+      threshold: 0.08
+      timeframe: "5m"
+
+    # 关键过滤 — 买在死水：K 线实体极小 AND 成交量萎缩（双重确认）
+    - indicator: "CANDLE"
+      field: "body_pct"
+      comparator: "<"
+      threshold: 0.05
+      timeframe: "5m"
+    - indicator: "PRICE"
+      field: "volume_ratio"
+      comparator: "<"
+      threshold: 0.5
+      timeframe: "5m"
+
+market_context_filters:
+  max_spy_day_drop_pct: -1.0
+  max_adx: 30
+
+time_penalty_enabled: true
+
+exit_conditions:
+  operator: "OR"
+  rules:
+    - type: "take_profit_pct"
+      threshold: 0.005
+    - type: "stop_loss_pct"
+      threshold: -0.003
+    - type: "time_exit"
+      minutes_before_close: 15
+
+option_selection:
+  preference: "ATM Call"
+  reason: "横盘区间入场，delta 最高效"
+
+exit_plan:
+  stop_loss: "股票跌 0.3% 止损 (期权约 -20%~40%)"
+  take_profit: "股票涨 0.5% 止盈 (期权约 +30%~80%)"
+  time_exit: "收盘前 15 分钟强制退出"
+
+sop_checklist:
+  - "收到警报后打开券商实时数据"
+  - "确认价格仍在 VWAP 附近磨蹭、未爆发"
+  - "买入 ATM Call"
+  - "止损设在 VWAP 下方 0.2%"
+
+notification:
+  cooldown_seconds: 180
+  priority: "high"
+
+entry_quality_filters:
+  min_score: 65
+  prefer_low_volume: true
+  max_distance_from_vwap_pct: 0.15
+  max_candle_body_pct: 0.08

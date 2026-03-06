@@ -1,0 +1,93 @@
+strategy_id: "bb-squeeze-ambush"
+name: "布林带极限挤压埋伏 (The Squeeze)"
+enabled: true
+description: >
+  午后垃圾时间（13:00-14:00），布林带宽度跌至全天极低值，
+  波动率弹簧压到极限。以极低成本买入 0DTE Call，等待 14:00 力量时间突破。
+
+watchlist:
+  underlyings: ["SPY", "QQQ", "NVDA", "TSLA", "META"]
+  option_filter:
+    type: "call"
+    max_dte: 2
+    moneyness: "ATM"
+    min_volume: 100
+    max_spread_pct: 0.15
+
+trading_window:
+  start: "13:00"
+  end: "14:00"
+  timezone: "US/Eastern"
+
+entry_conditions:
+  operator: "AND"
+  rules:
+    # 非空头日过滤：日内跌幅不超过 0.3%
+    - indicator: "PRICE"
+      field: "day_change_pct"
+      comparator: ">"
+      threshold: -0.3
+      timeframe: "5m"
+
+    # 布林带宽度百分位数跌至全天 10% 以下（相对值，比固定阈值更适应不同标的）
+    - indicator: "BOLLINGER"
+      field: "width_percentile"
+      comparator: "<"
+      threshold: 10
+      timeframe: "5m"
+
+    # 方向判定升级：价格在 VWAP 之上（比 EMA200 更灵敏）
+    - indicator: "PRICE"
+      field: "close"
+      comparator: ">"
+      reference_field: "vwap"
+      timeframe: "5m"
+
+    # 多头动能确认：RSI > 48
+    - indicator: "RSI"
+      field: "value"
+      comparator: ">"
+      threshold: 48
+      timeframe: "5m"
+
+market_context_filters:
+  max_spy_day_drop_pct: -1.0
+
+time_penalty_enabled: true
+
+exit_conditions:
+  operator: "OR"
+  rules:
+    - type: "take_profit_pct"
+      threshold: 0.008
+    - type: "trailing_stop"
+      activation_pct: 0.005
+      trail_pct: 0.002
+    - type: "stop_loss_pct"
+      threshold: -0.005
+    - type: "time_exit"
+      minutes_before_close: 15
+
+option_selection:
+  preference: "0DTE ATM Call"
+  reason: "Theta 已耗干且无 IV，成本极低"
+
+exit_plan:
+  stop_loss: "股票跌 0.5% 止损 (期权约 -30%~50%)"
+  take_profit: "股票涨 0.8% 止盈 (期权约 +50%~100%)，追踪止盈(0.5%激活，0.2%回撤)"
+  time_exit: "收盘前 15 分钟强制退出"
+
+sop_checklist:
+  - "13:30 收到警报：布林带极度挤压"
+  - "确认盘面仍在横盘，无异常波动"
+  - "以极低成本买入 0DTE ATM Call"
+  - "等待 14:00 力量时间的方向突破"
+
+notification:
+  cooldown_seconds: 300
+  priority: "high"
+
+entry_quality_filters:
+  min_score: 60
+  max_bb_width_pct: 0.20
+  prefer_above_ema200: true

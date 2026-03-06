@@ -31,6 +31,7 @@ class StrategyConfig:
         self.exit_conditions: dict = data.get("exit_conditions", {})
         self.notification: dict = data.get("notification", {})
         self.entry_quality_filters: dict = data.get("entry_quality_filters", {})
+        self.market_context_filters: dict = data.get("market_context_filters", {})
 
     @property
     def underlyings(self) -> list[str]:

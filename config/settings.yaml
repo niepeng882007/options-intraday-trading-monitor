@@ -1,4 +1,11 @@
-data_source: yahoo
+data_source: futu
+
+futu:
+  host: "127.0.0.1"
+  port: 11111
+  use_push_subscription: true
+  subscription_quota: 300
+  reconnect_interval_seconds: 5
 
 redis:
   url: "redis://localhost:6379"
@@ -6,7 +13,7 @@ redis:
 
 polling:
   stock_quote_interval_seconds: 10
-  option_chain_interval_seconds: 30
+  option_chain_interval_seconds: 60
   history_interval_seconds: 60
 
 watchlist:
@@ -16,6 +23,9 @@ watchlist:
     - SPY
     - QQQ
     - NVDA
+    - META
+    - AMD
+    - AMZN
 
 trading_hours:
   pre_market_minutes: 30
@@ -35,5 +45,12 @@ rate_limit:
 
 sqlite:
   db_path: "data/monitor.db"
+
+risk_management:
+  midday_no_trade:
+    enabled: true
+    start: "11:00"
+    end: "13:00"
+  max_daily_loss_pct: -1.5
 
 strategies_dir: "config/strategies"

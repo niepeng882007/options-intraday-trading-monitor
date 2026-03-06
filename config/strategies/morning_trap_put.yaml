@@ -1,0 +1,109 @@
+strategy_id: "morning-trap-put"
+name: "早盘诱多衰竭 (Morning Trap Put)"
+enabled: true
+description: >
+  早盘急拉诱多后买盘耗尽。价格虽仍在 VWAP 之上（看似多头），
+  但 9 EMA 已被跌穿、MACD 柱状图由正转负，动能底层率先崩塌。
+
+watchlist:
+  underlyings: ["SPY", "QQQ", "AAPL", "NVDA", "TSLA", "META"]
+  option_filter:
+    type: "put"
+    max_dte: 2
+    moneyness: "ATM"
+    min_volume: 100
+    max_spread_pct: 0.15
+
+trading_window:
+  start: "10:00"
+  end: "12:00"
+  timezone: "US/Eastern"
+
+entry_conditions:
+  operator: "AND"
+  rules:
+    # 条件 1（看似多头）：价格仍在 VWAP 之上
+    - indicator: "PRICE"
+      field: "close"
+      comparator: ">"
+      reference_field: "vwap"
+      timeframe: "5m"
+
+    # 条件 2（确认明显在 VWAP 之上）：VWAP 乖离率 > 0.1%（新增）
+    - indicator: "PRICE"
+      field: "vwap_distance_pct"
+      comparator: ">"
+      threshold: 0.05
+      timeframe: "5m"
+
+    # 条件 3（跌破短线生命线）：价格穿越下破 9 EMA
+    - indicator: "PRICE"
+      field: "close"
+      comparator: "crosses_below"
+      reference_field: "ema_9"
+      timeframe: "5m"
+      confirm_bars: 1
+
+    # 条件 4（动能死叉）：MACD 柱状图由正转负
+    - indicator: "MACD"
+      field: "histogram"
+      comparator: "turns_negative"
+      threshold: 0
+      timeframe: "5m"
+      confirm_bars: 1
+      min_magnitude: 0.003
+
+    # 条件 5（冲高回落）：RSI 已从高位回落至 60 以下（放宽）
+    - indicator: "RSI"
+      field: "value"
+      comparator: "<"
+      threshold: 60
+      timeframe: "5m"
+
+    # 条件 6（跌破放量确认）：量比 > 0.8（放宽）
+    - indicator: "PRICE"
+      field: "volume_ratio"
+      comparator: ">"
+      threshold: 0.8
+      timeframe: "5m"
+
+market_context_filters:
+  max_spy_day_drop_pct: -2.5
+  max_adx: 30
+
+time_penalty_enabled: true
+
+exit_conditions:
+  operator: "OR"
+  rules:
+    - type: "stop_loss_pct"
+      threshold: -0.003
+    - type: "take_profit_pct"
+      threshold: 0.005
+    - type: "time_exit"
+      minutes_before_close: 15
+
+option_selection:
+  preference: "ATM Put"
+  reason: "诱多反转信号明确，ATM Put 提供最佳风险收益比"
+
+exit_plan:
+  stop_loss: "股票跌 0.3% 止损 (期权约 -20%~40%)"
+  take_profit: "股票涨 0.5% 止盈 (期权约 +30%~80%)"
+  time_exit: "收盘前 15 分钟强制退出"
+
+sop_checklist:
+  - "收到警报后打开券商实时数据"
+  - "确认价格仍在 VWAP 附近或之上（诱多形态成立）"
+  - "在券商确认 MACD 柱状图确实翻绿、9 EMA 已被跌穿"
+  - "确认早盘冲高动能已明显衰减（RSI 回落）"
+  - "买入 ATM Put"
+  - "止损设在期权 -20%"
+
+notification:
+  cooldown_seconds: 120
+  priority: "high"
+
+entry_quality_filters:
+  min_score: 60
+  max_distance_from_vwap_pct: 0.50

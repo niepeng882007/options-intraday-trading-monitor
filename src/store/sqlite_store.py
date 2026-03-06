@@ -142,6 +142,30 @@ class SQLiteStore:
                 continue
         return results
 
+    # ── Prev values (for crosses_*/turns_* continuity across restarts) ──
+
+    def save_prev_values(self, data: dict[str, dict[str, float | None]]) -> None:
+        conn = self._ensure_conn()
+        conn.execute(
+            """INSERT OR REPLACE INTO strategy_states
+               (strategy_id, symbol, state_json, updated_at)
+               VALUES ('__prev_values__', '__prev_values__', ?, datetime('now'))""",
+            (json.dumps(data),),
+        )
+        conn.commit()
+
+    def load_prev_values(self) -> dict[str, dict[str, float | None]]:
+        conn = self._ensure_conn()
+        row = conn.execute(
+            "SELECT state_json FROM strategy_states WHERE strategy_id = '__prev_values__' AND symbol = '__prev_values__'"
+        ).fetchone()
+        if row:
+            try:
+                return json.loads(row["state_json"])
+            except (json.JSONDecodeError, KeyError):
+                pass
+        return {}
+
     # ── Indicator history ──
 
     def save_indicators(

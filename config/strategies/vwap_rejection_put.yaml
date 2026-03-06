@@ -1,0 +1,108 @@
+strategy_id: "vwap-rejection-put"
+name: "VWAP 绝望压制 (The VWAP Rejection Put)"
+enabled: true
+description: >
+  典型单边下跌日，价格在弱势中反弹触碰 VWAP 附近停顿（死水）。
+  反弹缩量无力时提前埋伏做空，吃第二波主跌浪。
+
+watchlist:
+  underlyings: ["SPY", "QQQ", "AAPL", "AMZN"]
+  option_filter:
+    type: "put"
+    max_dte: 2
+    moneyness: "ATM"
+    min_volume: 100
+    max_spread_pct: 0.15
+
+trading_window:
+  start: "10:00"
+  end: "15:30"
+  timezone: "US/Eastern"
+
+entry_conditions:
+  operator: "AND"
+  rules:
+    # 条件 1（空头日确认）：日内跌幅 > 0.3%
+    - indicator: "PRICE"
+      field: "day_change_pct"
+      comparator: "<"
+      threshold: -0.3
+      timeframe: "5m"
+
+    # 条件 2（埋伏区域）：价格在 VWAP ±0.10% 范围内（收紧）
+    - indicator: "PRICE"
+      field: "close"
+      comparator: "within_pct_of"
+      reference_field: "vwap"
+      threshold: 0.0025
+      timeframe: "5m"
+
+    # 条件 3（反弹无力）：RSI < 45（放宽）
+    - indicator: "RSI"
+      field: "value"
+      comparator: "<"
+      threshold: 45
+      timeframe: "5m"
+
+    # 条件 4（反弹缩量确认）：量比 < 0.8（新增）
+    - indicator: "PRICE"
+      field: "volume_ratio"
+      comparator: "<"
+      threshold: 0.9
+      timeframe: "5m"
+
+    # 条件 5（死水停顿）：K 线实体极小 OR 高低幅极小
+    - operator: "OR"
+      rules:
+        - indicator: "CANDLE"
+          field: "body_pct"
+          comparator: "<"
+          threshold: 0.08
+          timeframe: "5m"
+        - indicator: "CANDLE"
+          field: "spread_pct"
+          comparator: "<"
+          threshold: 0.20
+          timeframe: "5m"
+
+market_context_filters:
+  max_spy_day_drop_pct: -2.0
+  max_adx: 30
+
+time_penalty_enabled: true
+
+exit_conditions:
+  operator: "OR"
+  rules:
+    - type: "stop_loss_pct"
+      threshold: -0.003
+    - type: "take_profit_pct"
+      threshold: 0.005
+    - type: "time_exit"
+      minutes_before_close: 15
+
+option_selection:
+  preference: "ATM Put"
+  reason: "下跌趋势中做空反弹，ATM Put Delta 足够且流动性好"
+
+exit_plan:
+  stop_loss: "股票跌 0.3% 止损 (期权约 -20%~40%)"
+  take_profit: "股票涨 0.5% 止盈 (期权约 +30%~80%)"
+  time_exit: "收盘前 15 分钟强制退出"
+
+sop_checklist:
+  - "收到警报后打开券商实时数据"
+  - "确认价格仍在 VWAP 附近停顿、反弹缩量无力"
+  - "确认大盘/标的全天趋势偏空（价格在 EMA50 之下）"
+  - "买入 ATM Put"
+  - "止损设在期权 -20%"
+
+notification:
+  cooldown_seconds: 180
+  priority: "high"
+
+entry_quality_filters:
+  min_score: 60
+  max_distance_from_vwap_pct: 0.30
+  prefer_low_volume: true
+  max_candle_body_pct: 0.08

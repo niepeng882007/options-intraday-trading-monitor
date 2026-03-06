@@ -74,11 +74,22 @@ class OptionsMonitor:
         self.scheduler = AsyncIOScheduler(timezone="America/New_York")
         self._shutdown_event = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._last_entry_eval: dict[str, float] = {}  # P5.1 dedup timestamps
+        self._daily_pnl: float = 0.0  # cumulative daily stock PnL %
+        self._daily_pnl_date: str = ""  # current tracking date
 
     def _build_collector(self) -> BaseCollector:
         source = self.config.get("data_source", "yahoo")
         if source == "yahoo":
             return YahooCollector()
+        elif source == "futu":
+            from src.collector.futu import FutuCollector
+            futu_cfg = self.config.get("futu", {})
+            return FutuCollector(
+                host=futu_cfg.get("host", "127.0.0.1"),
+                port=futu_cfg.get("port", 11111),
+                subscription_quota=futu_cfg.get("subscription_quota", 300),
+            )
         raise ValueError(f"Unknown data source: {source}")
 
     # ── Lifecycle ──
@@ -89,6 +100,7 @@ class OptionsMonitor:
 
         await self.redis_store.connect()
         self.sqlite_store.connect()
+        await self.collector.connect()
 
         self.strategy_loader.load_all()
         self.strategy_loader.on_change(self._on_strategy_change)
@@ -119,6 +131,7 @@ class OptionsMonitor:
         self.strategy_loader.stop_watching()
         self._persist_states()
         await self.notifier.stop()
+        await self.collector.close()
         await self.redis_store.close()
         self.sqlite_store.close()
         logger.info("Options Monitor stopped")
@@ -136,13 +149,23 @@ class OptionsMonitor:
     def _register_jobs(self) -> None:
         poll = self.config.get("polling", {})
 
-        self.scheduler.add_job(
-            self._poll_stock_quotes,
-            "interval",
-            seconds=poll.get("stock_quote_interval_seconds", 10),
-            id="stock_quotes",
-            max_instances=1,
-        )
+        # If futu push subscription is enabled, use push instead of polling for quotes
+        use_push = self.config.get("futu", {}).get("use_push_subscription", False)
+        if use_push and self.config.get("data_source") == "futu":
+            symbols = list(
+                self.strategy_loader.get_all_symbols()
+                | set(self.config.get("watchlist", {}).get("symbols", []))
+            )
+            self.collector.subscribe_quotes(symbols, self._on_quote_push)
+            logger.info("Using Futu push subscription for %d symbols", len(symbols))
+        else:
+            self.scheduler.add_job(
+                self._poll_stock_quotes,
+                "interval",
+                seconds=poll.get("stock_quote_interval_seconds", 10),
+                id="stock_quotes",
+                max_instances=1,
+            )
         self.scheduler.add_job(
             self._poll_option_chains,
             "interval",
@@ -228,6 +251,29 @@ class OptionsMonitor:
             except Exception:
                 logger.exception("Failed to poll quote for %s", symbol)
 
+    async def _on_quote_push(self, quote) -> None:
+        """Callback for Futu real-time quote push — processes a single symbol."""
+        if not self._is_trading_hours():
+            return
+        symbol = quote.symbol
+        try:
+            await self.redis_store.publish_quote(quote)
+
+            for holding in self.state_manager.get_holding_positions():
+                if holding.symbol == symbol:
+                    self.state_manager.update_highest_price(
+                        holding.strategy_id, symbol, quote.price
+                    )
+                    await self._evaluate_exit(holding.strategy_id, symbol, quote.price)
+
+            indicators = self.indicator_engine.update_live_price(
+                symbol, quote.price, quote.timestamp
+            )
+            if any(v is not None for v in indicators.values()):
+                await self._evaluate_entries(symbol, indicators)
+        except Exception:
+            logger.exception("Failed to process push quote for %s", symbol)
+
     async def _poll_option_chains(self) -> None:
         if not self._is_trading_hours():
             return
@@ -249,7 +295,11 @@ class OptionsMonitor:
         )
         for symbol in symbols:
             try:
-                df = await self.collector.get_history(symbol, interval="1m", period="1d")
+                period = "5d" if self.indicator_engine.needs_warmup(symbol) else "1d"
+                if period == "5d":
+                    logger.info("Warming up indicators for %s (fetching 5d history)", symbol)
+
+                df = await self.collector.get_history(symbol, interval="1m", period=period)
                 if df.empty:
                     continue
 
@@ -267,6 +317,42 @@ class OptionsMonitor:
                 await self._evaluate_entries(symbol, results)
             except Exception:
                 logger.exception("Failed to poll history for %s", symbol)
+
+    # ── Risk management helpers ──
+
+    def _is_midday_blocked(self, now: datetime) -> bool:
+        """Check if current time falls in the midday no-trade window."""
+        rm = self.config.get("risk_management", {})
+        midday = rm.get("midday_no_trade", {})
+        if not midday.get("enabled", False):
+            return False
+        start_str = midday.get("start", "11:00")
+        end_str = midday.get("end", "13:00")
+        s_h, s_m = map(int, start_str.split(":"))
+        e_h, e_m = map(int, end_str.split(":"))
+        t = now.hour * 60 + now.minute
+        return s_h * 60 + s_m <= t < e_h * 60 + e_m
+
+    def _check_daily_loss_limit(self) -> bool:
+        """Return True if daily loss limit has been breached."""
+        rm = self.config.get("risk_management", {})
+        limit = rm.get("max_daily_loss_pct")
+        if limit is None:
+            return False
+        return self._daily_pnl <= limit
+
+    def _track_exit_pnl(self, strategy_id: str, entry_price: float, exit_price: float) -> None:
+        """Accumulate daily PnL from a closed trade."""
+        strategy = self.strategy_loader.get(strategy_id)
+        if strategy is None:
+            return
+        today = datetime.now(ET).strftime("%Y-%m-%d")
+        if self._daily_pnl_date != today:
+            self._daily_pnl = 0.0
+            self._daily_pnl_date = today
+        stock_pnl = (exit_price - entry_price) / entry_price * 100 if entry_price > 0 else 0.0
+        direction = strategy.option_filter.get("type", "call")
+        self._daily_pnl += stock_pnl if direction == "call" else -stock_pnl
 
     # ── Strategy evaluation ──
 
@@ -286,6 +372,25 @@ class OptionsMonitor:
 
     async def _evaluate_entries(self, symbol: str, indicators_by_tf: dict) -> None:
         now = datetime.now(ET)
+        now_ts = time.time()
+
+        # P5.2: Data staleness check — skip if indicators are older than 10 minutes
+        latest_ind_ts = 0.0
+        for ind in indicators_by_tf.values():
+            if ind and ind.timestamp > latest_ind_ts:
+                latest_ind_ts = ind.timestamp
+        if latest_ind_ts > 0 and now_ts - latest_ind_ts > 600:
+            logger.warning("Stale indicators for %s (%.0fs old), skipping", symbol, now_ts - latest_ind_ts)
+            return
+
+        # P0: Midday no-trade filter (11:00-13:00 ET)
+        if self._is_midday_blocked(now):
+            return
+
+        # P2: Daily loss circuit breaker
+        if self._check_daily_loss_limit():
+            logger.warning("Daily loss limit breached (%.2f%%), no new entries", self._daily_pnl)
+            return
 
         for strategy in self.strategy_loader.get_active():
             if symbol not in strategy.underlyings:
@@ -294,12 +399,44 @@ class OptionsMonitor:
             if not self._is_in_trading_window(strategy, now):
                 continue
 
+            # P5.1: Per-(strategy, symbol) 5-second dedup
+            dedup_key = f"{strategy.strategy_id}:{symbol}"
+            if now_ts - self._last_entry_eval.get(dedup_key, 0) < 5:
+                continue
+            self._last_entry_eval[dedup_key] = now_ts
+
             state = self.state_manager.get_state(strategy.strategy_id, symbol)
             if state.state != StrategyState.WATCHING:
                 continue
 
             if await self.redis_store.is_in_cooldown(strategy.strategy_id, symbol):
                 continue
+
+            # P2.2: Market context filters
+            mcf = strategy.market_context_filters
+            if mcf:
+                skip = False
+                spy_ind = self.indicator_engine.get_last("SPY", "5m")
+                if spy_ind:
+                    max_drop = mcf.get("max_spy_day_drop_pct")
+                    if max_drop is not None and spy_ind.day_change_pct is not None:
+                        if spy_ind.day_change_pct < max_drop:
+                            logger.debug(
+                                "Market filter: SPY drop %.2f%% < %.2f%%, skip %s",
+                                spy_ind.day_change_pct, max_drop, strategy.strategy_id,
+                            )
+                            skip = True
+                max_adx = mcf.get("max_adx")
+                if not skip and max_adx is not None:
+                    sym_ind = indicators_by_tf.get("5m")
+                    if sym_ind and sym_ind.adx is not None and sym_ind.adx > max_adx:
+                        logger.debug(
+                            "Market filter: ADX %.1f > %.1f, skip %s",
+                            sym_ind.adx, max_adx, strategy.strategy_id,
+                        )
+                        skip = True
+                if skip:
+                    continue
 
             entry_signal = self.rule_matcher.evaluate_entry(strategy, symbol, indicators_by_tf)
             if entry_signal is None:
@@ -363,12 +500,14 @@ class OptionsMonitor:
         minutes_to_close = self._minutes_to_close()
 
         exit_signal = self.rule_matcher.evaluate_exit(
-            strategy, symbol, current_price, entry_price, minutes_to_close
+            strategy, symbol, current_price, entry_price, minutes_to_close,
+            highest_price=state.position.highest_price,
         )
         if exit_signal is None:
             return
 
         self.state_manager.trigger_exit(strategy_id, symbol)
+        self._track_exit_pnl(strategy_id, entry_price, current_price)
 
         hold_seconds = time.time() - state.position.entry_timestamp
         hold_h = int(hold_seconds // 3600)
@@ -412,12 +551,20 @@ class OptionsMonitor:
         states = self.state_manager.export_all()
         if states:
             self.sqlite_store.save_strategy_states(states)
+        # P1.3: Persist prev_values for crosses_*/turns_* continuity
+        prev_data = self.rule_matcher.export_prev_values()
+        if prev_data:
+            self.sqlite_store.save_prev_values(prev_data)
 
     def _restore_states(self) -> None:
         states = self.sqlite_store.load_strategy_states()
         if states:
             self.state_manager.import_all(states)
             logger.info("Restored %d strategy states from SQLite", len(states))
+        # P1.3: Restore prev_values
+        prev_data = self.sqlite_store.load_prev_values()
+        if prev_data:
+            self.rule_matcher.import_prev_values(prev_data)
 
     # ── Hot-reload callback ──
 

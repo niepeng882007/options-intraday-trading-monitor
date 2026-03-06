@@ -71,3 +71,12 @@ class BaseCollector(ABC):
         period: str = "1d",
     ) -> pd.DataFrame:
         ...
+
+    async def connect(self) -> None:
+        """Initialize connection. No-op by default."""
+
+    async def close(self) -> None:
+        """Close connection. No-op by default."""
+
+    def subscribe_quotes(self, symbols: list[str], callback) -> None:
+        """Subscribe to real-time push. No-op by default."""
