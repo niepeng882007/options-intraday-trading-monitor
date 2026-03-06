@@ -133,7 +133,9 @@ class SQLiteStore:
 
     def load_strategy_states(self) -> list[dict]:
         conn = self._ensure_conn()
-        rows = conn.execute("SELECT state_json FROM strategy_states").fetchall()
+        rows = conn.execute(
+            "SELECT state_json FROM strategy_states WHERE strategy_id != '__prev_values__'"
+        ).fetchall()
         results: list[dict] = []
         for row in rows:
             try:

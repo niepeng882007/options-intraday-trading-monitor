@@ -1,3 +1,5 @@
+> **已归档** — 本文档为 Futu 与 Yahoo Finance 的数据源对比分析。系统已实现双数据源架构（Futu 主力 + Yahoo 备用）。仅供历史参考。
+
 # 在搭建个人量化和监测系统时，Yahoo Finance API（通常指 Python 中的 yfinance 库）和 富途 OpenAPI 是两个处于完全不同维度的工具。简单来说：Yahoo Finance 是一个免费的“民间爬虫/公开接口封装”工具，而富途 OpenAPI 是由持牌券商提供的“专业级机构/量化网关”。针对你要搭建的“美股及期权监测系统”，富途 API 相比 Yahoo Finance 具有以下几个压倒性的核心优势：
 
 1. 数据获取方式：真正的“实时推送 (Push)” vs 低效的“轮询拉取 (Pull)”

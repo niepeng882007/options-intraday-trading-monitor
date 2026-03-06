@@ -70,6 +70,7 @@ class OptionsMonitor:
             strategy_loader=self.strategy_loader,
             state_manager=self.state_manager,
             sqlite_store=self.sqlite_store,
+            data_source=config.get("data_source", "yahoo"),
         )
         self.scheduler = AsyncIOScheduler(timezone="America/New_York")
         self._shutdown_event = asyncio.Event()
@@ -467,6 +468,9 @@ class OptionsMonitor:
                 underlying_price=underlying_price,
                 quote_detail=quote,
                 indicators_by_tf=indicators_by_tf,
+                exit_conditions=strategy.exit_conditions,
+                option_filter=strategy.option_filter,
+                risk_config=self.config.get("risk_management"),
             )
             await self.redis_store.set_cooldown(strategy.strategy_id, symbol, strategy.cooldown_seconds)
 
@@ -523,6 +527,9 @@ class OptionsMonitor:
             entry_price=entry_price,
             current_price=current_price,
             hold_duration=hold_duration,
+            cooldown_seconds=strategy.cooldown_seconds,
+            daily_pnl=self._daily_pnl,
+            option_type=strategy.option_filter.get("type", "call"),
         )
 
         self.state_manager.confirm_exit(strategy_id, symbol)

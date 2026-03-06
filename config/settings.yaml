@@ -52,5 +52,8 @@ risk_management:
     start: "11:00"
     end: "13:00"
   max_daily_loss_pct: -1.5
+  account_size: 10000
+  risk_per_trade_pct: 0.02
+  default_option_price_est: 2.00
 
 strategies_dir: "config/strategies"

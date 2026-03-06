@@ -5,11 +5,11 @@
 这是一个**实时期权日内交易监控系统**，核心流程：
 
 ```
-YahooCollector(10s/30s/60s轮询) → IndicatorEngine(RSI/MACD/EMA/VWAP/BB/ATR)
+FutuCollector (主力) / YahooCollector (备用) → IndicatorEngine(RSI/MACD/EMA/VWAP/BB/ATR/ADX)
   → RuleMatcher(嵌套规则树) → StateManager(状态机) → TelegramNotifier → SQLite持久化
 ```
 
-**当前策略风格：** 7个策略，主打 VWAP/BB 伏击 + 0DTE 期权，在低波动整理期买入廉价期权等待突破。
+**当前策略风格：** 10个策略（8 活跃 + 2 禁用），主打 VWAP/BB 伏击 + 0DTE 期权，含左侧埋伏与右侧突破双轨体系，在低波动整理期买入廉价期权等待突破。
 
 ---
 
@@ -80,6 +80,7 @@ YahooCollector(10s/30s/60s轮询) → IndicatorEngine(RSI/MACD/EMA/VWAP/BB/ATR)
 - A/B 级信号才发通知，C/D 级仅记录
 
 ### 八、回测框架缺失
+> ✅ **已实现** — 见 `src/backtest/` 和 `docs/backtest.md`
 
 **问题：** 无法验证策略修改的效果，只能靠实盘试错。
 
@@ -94,10 +95,10 @@ YahooCollector(10s/30s/60s轮询) → IndicatorEngine(RSI/MACD/EMA/VWAP/BB/ATR)
 
 | 优化项 | 改动文件 | 复杂度 |
 |--------|----------|--------|
-| Trailing stop 出场 | `matcher.py`, `state.py` | 中 |
+| ✅ Trailing stop 出场 | `matcher.py`, `state.py` | 中 |
 | 提高质量评分门槛 | 各策略 YAML | 低 |
-| BB squeeze 方向确认 | 策略 YAML 增加规则 | 低 |
+| ✅ BB squeeze 方向确认 | 策略 YAML 增加规则 | 低 |
 | 日内 pivot points | `engine.py` | 中 |
 | 最大同时持仓数限制 | `state.py`, `main.py` | 低 |
-| 每日最大亏损限制 | `state.py` | 低 |
+| ✅ 每日最大亏损限制 | `state.py` | 低 |
 | IV rank 过滤 | `engine.py`, 策略 YAML | 中 |

@@ -4,7 +4,7 @@ import asyncio
 import html
 import re
 import time
-from collections import deque
+from collections import deque, OrderedDict
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -24,31 +24,73 @@ logger = setup_logger("telegram_notifier")
 
 ET = timezone(timedelta(hours=-5))
 
+# ── Templates ──
+
 ENTRY_SIGNAL_TEMPLATE = (
-    "🟢 <b>入场信号 | {strategy_name}</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "{strategy_rationale}"
-    "{quality_section}"
-    "📌 标的: {symbol} (${underlying_price})\n"
-    "{quote_detail}"
-    "\n📊 触发条件:\n"
-    "{conditions_detail}\n"
-    "\n{indicator_snapshot}"
-    "{sop_section}"
-    "{option_section}"
-    "{exit_plan_section}"
+    "{dir_emoji} <b>入场 | {strategy_name}</b>\n"
+    "📌 {symbol} ${underlying_price} | {quality_inline}\n"
+    "\n"
+    "▶ 买入 {option_desc}\n"
+    "📍 {order_type}\n"
+    "{position_line}"
+    "\n"
+    "🎯 目标: ${tp_price} ({tp_arrow}{tp_pct})\n"
+    "🚫 止损: ${sl_price} ({sl_arrow}{sl_pct})\n"
+    "{time_exit_line}"
+    "\n"
+    "📊 {key_indicators}\n"
+    "💡 {rationale}\n"
+    "\n"
     "⏱ {trigger_time} ET{trading_window_hint}\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "🆔 信号ID: <code>{signal_id}</code>\n"
-    "⚠️ 数据源: Yahoo Finance (延迟~15s)\n\n"
-    "确认建仓: /confirm {signal_id} &lt;股票价格&gt;\n"
-    "  (输入建仓时底层股票价格，非期权价格)\n"
-    "跳过: /skip {signal_id}"
+    "/confirm {signal_id} &lt;价格&gt;  /skip {signal_id}"
 )
 
+EXIT_SIGNAL_TEMPLATE = (
+    "🔴 <b>出场 | {strategy_name}</b>\n"
+    "📌 {symbol} ${entry_price} → ${current_price}\n"
+    "\n"
+    "📊 {exit_reason} ({pnl_arrow}{pnl_pct})\n"
+    "📈 期权参考: {option_pnl_est}\n"
+    "⏱ 持仓 {hold_duration}\n"
+    "\n"
+    "{cooldown_line}"
+    "💰 今日累计: {daily_pnl}"
+)
+
+STRATEGY_UPDATE_TEMPLATE = (
+    "🔄 <b>策略已更新</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "📋 策略: {strategy_name}\n"
+    "🆔 ID: <code>{strategy_id}</code>\n"
+    "状态: {status}"
+)
 
 _esc = html.escape
 
+QUALITY_GRADE_EMOJI = {"A": "🟢", "B": "🟡", "C": "🟠", "D": "🔴"}
+
+# ── Strategy → key indicators mapping ──
+
+STRATEGY_KEY_INDICATORS: dict[str, list[str]] = {
+    "vwap-low-vol-ambush":       ["vwap_dist", "volume_ratio", "candle_body"],
+    "vwap-rejection-put":        ["vwap_dist", "rsi", "volume_ratio"],
+    "bb-squeeze-ambush":         ["bb_width_pct", "rsi", "vwap_dist"],
+    "bb-squeeze-bearish":        ["bb_width_pct", "rsi", "vwap_dist"],
+    "extreme-oversold-reversal": ["rsi", "vwap_dist", "volume_spike"],
+    "vwap-breakout-momentum":    ["vwap_dist", "volume_spike", "macd_hist"],
+    "ema-momentum-breakout":     ["ema_cross", "rsi", "volume_ratio"],
+    "breakdown-vwap-put":        ["vwap_dist", "volume_spike", "macd_hist"],
+    "morning-trap-put":          ["rsi", "macd_hist", "vwap_dist"],
+    "spy-vwap-ambush":           ["vwap_dist", "volume_ratio", "rsi"],
+}
+
+RIGHT_SIDE_STRATEGIES = {"vwap-breakout-momentum", "ema-momentum-breakout", "breakdown-vwap-put"}
+
+MAX_NOTIFICATIONS_PER_MINUTE = 10
+MAX_SIGNAL_CACHE = 20
+
+
+# ── Helper functions ──
 
 def _format_indicator_value(value: float | None, decimals: int = 4) -> str:
     if value is None:
@@ -56,25 +98,11 @@ def _format_indicator_value(value: float | None, decimals: int = 4) -> str:
     return f"{value:.{decimals}f}"
 
 
-QUALITY_GRADE_EMOJI = {"A": "🟢", "B": "🟡", "C": "🟠", "D": "🔴"}
-
-
-def _build_quality_section(quality: EntryQuality | None) -> str:
+def _inline_quality(quality: EntryQuality | None) -> str:
     if quality is None:
         return ""
     emoji = QUALITY_GRADE_EMOJI.get(quality.grade, "⚪")
-    lines = [f"⭐ <b>入场质量: {emoji} {_esc(quality.grade)} ({quality.score}/100)</b>"]
-    if quality.vwap_distance_pct:
-        lines.append(f"   📍 距VWAP: {quality.vwap_distance_pct:+.2f}%")
-    if quality.range_percentile:
-        lines.append(f"   📍 日内位置: {quality.range_percentile:.0f}%")
-    if quality.volume_ratio:
-        vol_label = "缩量" if quality.volume_ratio < 0.8 else "放量" if quality.volume_ratio > 1.2 else "正常"
-        lines.append(f"   📍 量比: {quality.volume_ratio:.1f}x ({vol_label})")
-    if quality.reasons:
-        for reason in quality.reasons:
-            lines.append(f"   • {_esc(reason)}")
-    return "\n".join(lines) + "\n\n"
+    return f"{emoji}{quality.grade} ({quality.score}分)"
 
 
 def _build_strategy_rationale(meta: dict[str, Any]) -> str:
@@ -84,47 +112,187 @@ def _build_strategy_rationale(meta: dict[str, Any]) -> str:
     return f"💡 <b>策略逻辑:</b> {_esc(desc)}\n\n"
 
 
-def _build_sop_section(meta: dict[str, Any]) -> str:
-    checklist = meta.get("sop_checklist", [])
-    if not checklist:
-        return ""
-    lines = ["📋 <b>操作清单:</b>"]
-    for i, item in enumerate(checklist, 1):
-        lines.append(f"   {i}. {_esc(item)}")
-    return "\n".join(lines) + "\n\n"
-
-
-def _build_option_section(meta: dict[str, Any]) -> str:
-    text = meta.get("option_selection", "")
-    if not text:
-        return ""
-    return f"🎯 <b>期权选择:</b> {_esc(text)}\n\n"
-
-
-def _build_exit_plan_section(meta: dict[str, Any]) -> str:
-    plan = meta.get("exit_plan", {})
-    if not plan:
-        return ""
-    lines = ["🚪 <b>止盈止损:</b>"]
-    sl = plan.get("stop_loss", "")
-    tp = plan.get("take_profit", "")
-    if sl:
-        lines.append(f"   🔴 止损: {_esc(sl)}")
-    if tp:
-        lines.append(f"   🟢 止盈: {_esc(tp)}")
-    return "\n".join(lines) + "\n\n"
-
-
 def _build_trading_window_hint(meta: dict[str, Any]) -> str:
     tw = meta.get("trading_window", "")
     if not tw:
         return ""
-    return f" | 🕐 窗口 {tw}"
+    return f" | 窗口 {tw}"
+
+
+def _compute_price_levels(
+    underlying_price: float,
+    exit_conditions: dict | None,
+    option_type: str,
+) -> dict[str, Any]:
+    """Extract TP/SL from exit_conditions rules and compute concrete prices."""
+    result: dict[str, Any] = {
+        "tp_price": 0.0, "tp_pct": "", "tp_arrow": "",
+        "sl_price": 0.0, "sl_pct": "", "sl_arrow": "",
+        "time_exit_min": 0,
+        "has_trailing": False, "trail_activation": 0.0, "trail_distance": 0.0,
+    }
+    if not exit_conditions or not underlying_price:
+        return result
+
+    rules = exit_conditions.get("rules", [])
+    tp_threshold = 0.0
+    sl_threshold = 0.0
+
+    for rule in rules:
+        rtype = rule.get("type", "")
+        if rtype == "take_profit_pct":
+            tp_threshold = rule.get("threshold", 0)
+        elif rtype == "stop_loss_pct":
+            sl_threshold = rule.get("threshold", 0)
+        elif rtype == "time_exit":
+            result["time_exit_min"] = rule.get("minutes_before_close", 15)
+        elif rtype == "trailing_stop":
+            result["has_trailing"] = True
+            result["trail_activation"] = rule.get("activation_pct", 0)
+            result["trail_distance"] = rule.get("trail_pct", 0)
+
+    is_put = option_type == "put"
+
+    if tp_threshold:
+        if is_put:
+            result["tp_price"] = underlying_price * (1 - tp_threshold)
+            result["tp_arrow"] = "↓"
+        else:
+            result["tp_price"] = underlying_price * (1 + tp_threshold)
+            result["tp_arrow"] = "↑"
+        result["tp_pct"] = f"{abs(tp_threshold) * 100:.1f}%"
+
+    if sl_threshold:
+        if is_put:
+            # sl_threshold is negative; put SL = stock rises → price * (1 - sl_threshold) = price * (1 + |sl|)
+            result["sl_price"] = underlying_price * (1 - sl_threshold)
+            result["sl_arrow"] = "↑"
+        else:
+            # sl_threshold is negative; call SL = stock drops → price * (1 + sl_threshold) = price * (1 - |sl|)
+            result["sl_price"] = underlying_price * (1 + sl_threshold)
+            result["sl_arrow"] = "↓"
+        result["sl_pct"] = f"{abs(sl_threshold) * 100:.2g}%"
+
+    return result
+
+
+def _compute_position_size(
+    risk_config: dict | None,
+    underlying_price: float,
+    sl_pct: float,
+    option_price_est: float | None = None,
+) -> str:
+    """Estimate position size based on risk config. Returns e.g. '2张 (~$400)' or ''."""
+    if not risk_config:
+        return ""
+    account_size = risk_config.get("account_size", 0)
+    risk_pct = risk_config.get("risk_per_trade_pct", 0)
+    if not account_size or not risk_pct:
+        return ""
+
+    opt_price = option_price_est or risk_config.get("default_option_price_est", 2.0)
+    risk_amount = account_size * risk_pct  # e.g. $200
+
+    # Estimate per-contract risk: option_price * 100 shares * |sl_stock_%| * 15x leverage
+    abs_sl = abs(sl_pct) if sl_pct else 0.003  # default 0.3%
+    risk_per_contract = opt_price * 100 * abs_sl * 15
+    if risk_per_contract <= 0:
+        return ""
+
+    contracts = max(1, int(risk_amount / risk_per_contract))
+    # Cap: don't exceed 10% of account per trade
+    max_contracts = max(1, int(account_size * 0.1 / (opt_price * 100)))
+    contracts = min(contracts, max_contracts)
+    cost = contracts * opt_price * 100
+    return f"{contracts}张 (~${cost:.0f})"
+
+
+def _suggest_order_type(strategy_id: str) -> str:
+    if strategy_id in RIGHT_SIDE_STRATEGIES:
+        return "市价单 (突破追入)"
+    return "限价单 @ Bid附近"
+
+
+def _fmt_key_indicator(key: str, ind: IndicatorResult) -> str | None:
+    """Format a single indicator key into a short Chinese label."""
+    if key == "rsi":
+        if ind.rsi is not None:
+            return f"RSI {ind.rsi:.0f}"
+    elif key == "vwap_dist":
+        if ind.vwap_distance_pct is not None:
+            return f"VWAP{ind.vwap_distance_pct:+.2f}%"
+    elif key == "volume_ratio":
+        if ind.volume_ratio is not None:
+            label = "缩量" if ind.volume_ratio < 0.8 else "放量" if ind.volume_ratio > 1.2 else ""
+            return f"量比{ind.volume_ratio:.1f}x{label}"
+    elif key == "macd_hist":
+        if ind.macd_histogram is not None:
+            arrow = "↗" if ind.macd_histogram > 0 else "↘"
+            return f"MACD柱{arrow}"
+    elif key == "bb_width_pct":
+        if ind.bb_width_pct is not None:
+            return f"BB宽{ind.bb_width_pct:.1f}%"
+    elif key == "volume_spike":
+        if ind.volume_spike is not None:
+            return f"量突变{ind.volume_spike:.1f}x"
+    elif key == "ema_cross":
+        if ind.ema_9 is not None and ind.ema_21 is not None:
+            if ind.ema_9 > ind.ema_21:
+                return "EMA9/21金叉"
+            return "EMA9/21死叉"
+    elif key == "candle_body":
+        if ind.candle_body_pct is not None:
+            return f"K线{ind.candle_body_pct:.2f}%"
+    return None
+
+
+def _build_key_indicators(
+    strategy_id: str,
+    indicators_by_tf: dict[str, IndicatorResult | None] | None,
+) -> str:
+    """Build a single-line '|'-separated key indicators string."""
+    if not indicators_by_tf:
+        return "N/A"
+
+    keys = STRATEGY_KEY_INDICATORS.get(strategy_id, ["rsi", "vwap_dist", "volume_ratio"])
+
+    # Pick best available timeframe: prefer 5m, fallback 1m, 15m
+    ind: IndicatorResult | None = None
+    for tf in ("5m", "1m", "15m"):
+        if indicators_by_tf.get(tf) is not None:
+            ind = indicators_by_tf[tf]
+            break
+    if ind is None:
+        return "N/A"
+
+    parts: list[str] = []
+    for key in keys:
+        formatted = _fmt_key_indicator(key, ind)
+        if formatted:
+            parts.append(formatted)
+
+    return " | ".join(parts) if parts else "N/A"
+
+
+def _shorten_rationale(description: str, max_len: int = 35) -> str:
+    """Shorten strategy description to first sentence or max_len chars."""
+    text = description.strip()
+    if not text:
+        return ""
+    # Try to cut at first period/comma
+    for sep in ("。", "，", ".", ","):
+        idx = text.find(sep)
+        if 0 < idx <= max_len:
+            return text[:idx]
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "…"
 
 
 def _build_indicator_snapshot(
     indicators_by_tf: dict[str, IndicatorResult | None] | None,
 ) -> str:
+    """Full indicator snapshot — used only for /detail command."""
     if not indicators_by_tf:
         return ""
 
@@ -160,33 +328,16 @@ def _build_indicator_snapshot(
 
     if not sections:
         return ""
-    return "\n".join(sections) + "\n\n"
-
-EXIT_SIGNAL_TEMPLATE = (
-    "🔴 <b>出场信号 | {strategy_name}</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "📌 标的: {symbol} (${underlying_price})\n"
-    "📊 触发: {exit_reason}\n"
-    "   股票: ${entry_price} → ${current_price} ({pnl_pct})\n"
-    "   📊 期权参考: ATM 0DTE 约 {option_pnl_est}\n"
-    "⏱ 持仓 {hold_duration}\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "⚠️ 数据源: Yahoo Finance (延迟~15s)"
-)
-
-STRATEGY_UPDATE_TEMPLATE = (
-    "🔄 <b>策略已更新</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "📋 策略: {strategy_name}\n"
-    "🆔 ID: <code>{strategy_id}</code>\n"
-    "状态: {status}"
-)
-
-MAX_NOTIFICATIONS_PER_MINUTE = 10
+    return "\n".join(sections) + "\n"
 
 
 class TelegramNotifier:
     """Sends trading signals via Telegram and handles Bot commands."""
+
+    DATA_SOURCE_LABELS: dict[str, str] = {
+        "futu": "Futu OpenD (实时推送)",
+        "yahoo": "Yahoo Finance (延迟~15s)",
+    }
 
     def __init__(
         self,
@@ -196,6 +347,7 @@ class TelegramNotifier:
         strategy_loader: Any = None,
         state_manager: Any = None,
         sqlite_store: Any = None,
+        data_source: str = "yahoo",
     ) -> None:
         self._bot_token = bot_token
         self._chat_id = chat_id
@@ -203,9 +355,13 @@ class TelegramNotifier:
         self._strategy_loader = strategy_loader
         self._state_manager = state_manager
         self._sqlite_store = sqlite_store
+        self._data_source_label = self.DATA_SOURCE_LABELS.get(
+            data_source, f"{data_source} (未知源)"
+        )
         self._app: Application | None = None
         self._send_timestamps: deque[float] = deque()
         self._paused_until: float = 0.0
+        self._signal_cache: OrderedDict[str, dict] = OrderedDict()
 
     # ── Bot setup ──
 
@@ -225,6 +381,7 @@ class TelegramNotifier:
         self._app.add_handler(CommandHandler("history", self._cmd_history))
         self._app.add_handler(CommandHandler("confirm", self._cmd_confirm))
         self._app.add_handler(CommandHandler("skip", self._cmd_skip))
+        self._app.add_handler(CommandHandler("detail", self._cmd_detail))
         self._app.add_handler(CommandHandler("test", self._cmd_test))
         return self._app
 
@@ -252,6 +409,9 @@ class TelegramNotifier:
         underlying_price: float = 0.0,
         quote_detail: dict[str, Any] | None = None,
         indicators_by_tf: dict[str, IndicatorResult | None] | None = None,
+        exit_conditions: dict | None = None,
+        option_filter: dict | None = None,
+        risk_config: dict | None = None,
     ) -> bool:
         if self._is_paused():
             logger.debug("Notifications paused, skipping entry signal")
@@ -261,36 +421,86 @@ class TelegramNotifier:
             logger.warning("Rate limit exceeded, skipping entry signal")
             return False
 
-        conditions_text = "\n".join(
-            f"   {_esc(c)}" for c in signal.conditions_detail
-        )
-        trigger_time = datetime.now(ET).strftime("%H:%M:%S")
-
-        quote_text = ""
-        if quote_detail:
-            bid = quote_detail.get("bid", 0)
-            ask = quote_detail.get("ask", 0)
-            volume = quote_detail.get("volume", 0)
-            quote_text = f"   Bid: ${bid:.2f} / Ask: ${ask:.2f} | Vol: {volume:,}\n"
-
+        trigger_time = datetime.now(ET).strftime("%H:%M")
         meta = signal.strategy_meta or {}
 
+        # Determine direction
+        opt_filter = option_filter or {}
+        option_type = opt_filter.get("type", "call")
+        is_put = option_type == "put"
+        dir_emoji = "🔴" if is_put else "🟢"
+
+        # Option description
+        moneyness = opt_filter.get("moneyness", "ATM")
+        max_dte = opt_filter.get("max_dte", 0)
+        dte_label = "0DTE" if max_dte <= 1 else f"{max_dte}DTE"
+        opt_type_label = "Put" if is_put else "Call"
+        option_desc = f"{moneyness} {opt_type_label} {dte_label}"
+
+        # Quality inline
+        quality_inline = _inline_quality(signal.entry_quality)
+
+        # Price levels
+        levels = _compute_price_levels(underlying_price, exit_conditions, option_type)
+
+        # Order type
+        order_type = _suggest_order_type(signal.strategy_id)
+
+        # Position size
+        sl_threshold = 0.0
+        if exit_conditions:
+            for rule in exit_conditions.get("rules", []):
+                if rule.get("type") == "stop_loss_pct":
+                    sl_threshold = rule.get("threshold", 0)
+        position_text = _compute_position_size(risk_config, underlying_price, sl_threshold)
+        position_line = f"💰 建议: {position_text}\n" if position_text else ""
+
+        # Key indicators
+        key_indicators = _build_key_indicators(signal.strategy_id, indicators_by_tf)
+
+        # Rationale
+        rationale = _shorten_rationale(meta.get("description", ""))
+
+        # Time exit line
+        time_exit_line = ""
+        if levels["time_exit_min"]:
+            time_exit_line = f"⏰ 尾盘{levels['time_exit_min']}min强退\n"
+
+        # Trading window hint
+        trading_window_hint = _build_trading_window_hint(meta)
+
         message = ENTRY_SIGNAL_TEMPLATE.format(
+            dir_emoji=dir_emoji,
             strategy_name=_esc(signal.strategy_name),
-            strategy_rationale=_build_strategy_rationale(meta),
-            quality_section=_build_quality_section(signal.entry_quality),
             symbol=_esc(signal.symbol),
             underlying_price=f"{underlying_price:.2f}",
-            quote_detail=quote_text,
-            conditions_detail=conditions_text,
-            indicator_snapshot=_build_indicator_snapshot(indicators_by_tf),
-            sop_section=_build_sop_section(meta),
-            option_section=_build_option_section(meta),
-            exit_plan_section=_build_exit_plan_section(meta),
+            quality_inline=quality_inline,
+            option_desc=option_desc,
+            order_type=order_type,
+            position_line=position_line,
+            tp_price=f"{levels['tp_price']:.2f}" if levels["tp_price"] else "N/A",
+            tp_arrow=levels["tp_arrow"],
+            tp_pct=levels["tp_pct"] or "N/A",
+            sl_price=f"{levels['sl_price']:.2f}" if levels["sl_price"] else "N/A",
+            sl_arrow=levels["sl_arrow"],
+            sl_pct=levels["sl_pct"] or "N/A",
+            time_exit_line=time_exit_line,
+            key_indicators=key_indicators,
+            rationale=_esc(rationale),
             trigger_time=trigger_time,
-            trading_window_hint=_build_trading_window_hint(meta),
+            trading_window_hint=trading_window_hint,
             signal_id=_esc(signal_id),
         )
+
+        # Cache signal details for /detail command
+        self._cache_signal(signal_id, {
+            "signal": signal,
+            "underlying_price": underlying_price,
+            "indicators_by_tf": indicators_by_tf,
+            "exit_conditions": exit_conditions,
+            "timestamp": time.time(),
+        })
+
         return await self._send_message(message)
 
     async def send_exit_signal(
@@ -300,25 +510,46 @@ class TelegramNotifier:
         entry_price: float = 0.0,
         current_price: float = 0.0,
         hold_duration: str = "",
+        cooldown_seconds: int = 120,
+        daily_pnl: float = 0.0,
+        option_type: str = "call",
     ) -> bool:
         if self._is_paused() and signal.priority != "high":
             return False
 
-        pnl_pct = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
-        # Rough ATM 0DTE option PnL estimate: ~15x stock move for 0DTE ATM
-        option_pnl_low = pnl_pct * 12
-        option_pnl_high = pnl_pct * 20
+        # PnL calculation — for put, stock drop = profit
+        stock_move_pct = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+        if option_type == "put":
+            effective_pnl = -stock_move_pct  # put profits when stock drops
+        else:
+            effective_pnl = stock_move_pct
+
+        pnl_arrow = "↑" if effective_pnl >= 0 else "↓"
+
+        # Option PnL estimate: ~12-20x stock move
+        option_pnl_low = effective_pnl * 12
+        option_pnl_high = effective_pnl * 20
         option_pnl_est = f"{option_pnl_low:+.0f}% ~ {option_pnl_high:+.0f}%"
+
+        # Cooldown
+        cooldown_min = cooldown_seconds // 60
+        cooldown_line = f"📋 冷却 {cooldown_min}min 后可重新入场\n" if cooldown_min else ""
+
+        # Daily PnL display
+        daily_pnl_str = f"{daily_pnl:+.1f}%"
+
         message = EXIT_SIGNAL_TEMPLATE.format(
             strategy_name=_esc(signal.strategy_name),
             symbol=_esc(signal.symbol),
-            underlying_price=f"{underlying_price:.2f}",
-            exit_reason=_esc(signal.exit_reason),
             entry_price=f"{entry_price:.2f}",
             current_price=f"{current_price:.2f}",
-            pnl_pct=f"{pnl_pct:+.1f}%",
+            exit_reason=_esc(signal.exit_reason),
+            pnl_arrow=pnl_arrow,
+            pnl_pct=f"{abs(effective_pnl):.1f}%",
             option_pnl_est=option_pnl_est,
             hold_duration=_esc(hold_duration),
+            cooldown_line=cooldown_line,
+            daily_pnl=daily_pnl_str,
         )
         return await self._send_message(message)
 
@@ -334,6 +565,13 @@ class TelegramNotifier:
 
     async def send_text(self, text: str) -> bool:
         return await self._send_message(text)
+
+    # ── Signal cache for /detail ──
+
+    def _cache_signal(self, signal_id: str, data: dict) -> None:
+        self._signal_cache[signal_id] = data
+        while len(self._signal_cache) > MAX_SIGNAL_CACHE:
+            self._signal_cache.popitem(last=False)
 
     _STRIP_HTML_RE = re.compile(r"<[^>]+>")
 
@@ -419,7 +657,7 @@ class TelegramNotifier:
                 f"💰 价格: ${quote.price:.2f}\n"
                 f"Bid: ${quote.bid:.2f} / Ask: ${quote.ask:.2f}\n"
                 f"成交量: {quote.volume:,}\n"
-                f"⚠️ 延迟~15s"
+                f"⚠️ 数据源: {self._data_source_label}"
             )
         except Exception as exc:
             text = f"查询失败: {exc}"
@@ -461,7 +699,7 @@ class TelegramNotifier:
                     f"最新: ${opt.last:.2f}\n"
                     f"成交量: {opt.volume:,} | OI: {opt.open_interest:,}\n"
                     f"IV: {opt.implied_volatility:.2%}\n"
-                    f"⚠️ 延迟~15s"
+                    f"⚠️ 数据源: {self._data_source_label}"
                 )
         except Exception as exc:
             text = f"查询失败: {exc}"
@@ -577,20 +815,54 @@ class TelegramNotifier:
         else:
             await update.message.reply_text(f"❌ 信号 {signal_id} 不存在或已处理")  # type: ignore[union-attr]
 
+    async def _cmd_detail(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show full indicator snapshot for a cached signal."""
+        if not context.args:
+            await update.message.reply_text("用法: /detail <signal_id>")  # type: ignore[union-attr]
+            return
+
+        signal_id = context.args[0]
+        cached = self._signal_cache.get(signal_id)
+        if not cached:
+            await update.message.reply_text(f"❌ 信号 {signal_id} 详情已过期或不存在")  # type: ignore[union-attr]
+            return
+
+        sig: Signal = cached["signal"]
+        indicators_by_tf = cached.get("indicators_by_tf")
+
+        lines = [
+            f"📋 <b>信号详情 | {_esc(sig.strategy_name)}</b>",
+            f"🆔 {_esc(signal_id)} | {_esc(sig.symbol)}",
+            "",
+        ]
+
+        # Full indicator snapshot
+        snapshot = _build_indicator_snapshot(indicators_by_tf)
+        if snapshot:
+            lines.append(snapshot)
+
+        # Conditions detail
+        if sig.conditions_detail:
+            lines.append("📊 <b>触发条件:</b>")
+            for c in sig.conditions_detail:
+                lines.append(f"   {_esc(c)}")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")  # type: ignore[union-attr]
+
     async def _cmd_test(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """发送模拟入场与出场提醒，用于验证 Telegram 推送链路是否正常。"""
         TEST_SIGNAL_ID = f"TEST-{int(time.time())}"
         TEST_UNDERLYING_PRICE = 185.50
-        TEST_ENTRY_PRICE = 185.20  # Stock entry price (not option)
-        TEST_EXIT_PRICE = 186.10   # Stock current price
+        TEST_ENTRY_PRICE = 185.20
+        TEST_EXIT_PRICE = 186.15
 
         await update.message.reply_text("🧪 开始发送测试提醒...")  # type: ignore[union-attr]
 
         entry_signal = Signal(
-            strategy_id="test-alert",
-            strategy_name="测试策略",
+            strategy_id="vwap-low-vol-ambush",
+            strategy_name="VWAP 极度缩量埋伏",
             signal_type="entry",
-            symbol="TEST",
+            symbol="AAPL",
             conditions_detail=[
                 "RSI(value) [5m] crosses_above 30 → ✅ 当前=35.0000 (前值=28.0000)",
                 "MACD(histogram) [5m] turns_positive → ✅ 当前=0.2000 (前值=-0.1000)",
@@ -598,41 +870,43 @@ class TelegramNotifier:
             priority="high",
             timestamp=time.time(),
             strategy_meta={
-                "description": "RSI 从超卖区回升叠加 MACD 转正，短期抛压耗尽、多头动能回归。",
-                "sop_checklist": [
-                    "确认RSI从超卖区上穿30",
-                    "确认MACD柱状图由负转正",
-                    "买入ATM Call",
-                ],
-                "option_selection": "ATM Call（高Delta捕捉反弹）",
-                "exit_plan": {
-                    "stop_loss": "浮亏20%立刻砍仓",
-                    "take_profit": "浮盈50%止盈",
-                },
-                "trading_window": "09:45-11:00 US/Eastern",
+                "description": "价格回落到VWAP附近且成交量极度萎缩，在横盘中从容埋伏进场。",
+                "trading_window": "09:45-11:00",
             },
+            entry_quality=EntryQuality(score=82, grade="A", reasons=["VWAP附近", "缩量"]),
         )
 
         mock_indicators = {
             "5m": IndicatorResult(
-                symbol="TEST", timeframe="5m", timestamp=time.time(),
+                symbol="AAPL", timeframe="5m", timestamp=time.time(),
                 rsi=35.0, macd_line=0.1500, macd_signal=0.0800, macd_histogram=0.2000,
                 ema_9=185.30, ema_21=184.90, vwap=185.20, atr=1.2500,
-            ),
-            "1m": IndicatorResult(
-                symbol="TEST", timeframe="1m", timestamp=time.time(),
-                rsi=38.5, macd_line=0.1200, macd_signal=0.0600, macd_histogram=0.1800,
-                ema_9=185.35, ema_21=184.95, vwap=185.22, atr=0.8500,
+                vwap_distance_pct=0.16, volume_ratio=0.8, candle_body_pct=0.03,
             ),
         }
-        mock_quote = {"bid": 185.45, "ask": 185.55, "volume": 12345678}
+        mock_exit_conditions = {
+            "operator": "OR",
+            "rules": [
+                {"type": "take_profit_pct", "threshold": 0.005},
+                {"type": "stop_loss_pct", "threshold": -0.003},
+                {"type": "time_exit", "minutes_before_close": 15},
+            ],
+        }
+        mock_option_filter = {"type": "call", "max_dte": 2, "moneyness": "ATM"}
+        mock_risk_config = {
+            "account_size": 10000,
+            "risk_per_trade_pct": 0.02,
+            "default_option_price_est": 2.00,
+        }
 
         entry_sent = await self.send_entry_signal(
             entry_signal,
             TEST_SIGNAL_ID,
             underlying_price=TEST_UNDERLYING_PRICE,
-            quote_detail=mock_quote,
             indicators_by_tf=mock_indicators,
+            exit_conditions=mock_exit_conditions,
+            option_filter=mock_option_filter,
+            risk_config=mock_risk_config,
         )
 
         if not entry_sent:
@@ -647,21 +921,25 @@ class TelegramNotifier:
 
         await update.message.reply_text("✅ 入场提醒发送成功")  # type: ignore[union-attr]
 
+        # Test put exit signal
         exit_signal = Signal(
-            strategy_id="test-alert",
-            strategy_name="测试策略",
+            strategy_id="vwap-low-vol-ambush",
+            strategy_name="VWAP 极度缩量埋伏",
             signal_type="exit",
-            symbol="TEST",
-            exit_reason=f"止盈 (+{(TEST_EXIT_PRICE - TEST_ENTRY_PRICE) / TEST_ENTRY_PRICE:+.1%})",
+            symbol="AAPL",
+            exit_reason="止盈",
             priority="high",
         )
 
         exit_sent = await self.send_exit_signal(
             exit_signal,
-            underlying_price=190.00,
+            underlying_price=TEST_EXIT_PRICE,
             entry_price=TEST_ENTRY_PRICE,
             current_price=TEST_EXIT_PRICE,
-            hold_duration="2h 15m",
+            hold_duration="45m",
+            cooldown_seconds=180,
+            daily_pnl=0.8,
+            option_type="call",
         )
 
         if exit_sent:
