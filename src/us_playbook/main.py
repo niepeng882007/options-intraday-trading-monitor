@@ -138,8 +138,6 @@ class USPlaybook:
         regime_cfg = cfg.get("regime", {})
         filter_cfg = cfg.get("filters", {})
 
-        is_preliminary = update_type == "morning"
-
         # 1. Fetch history bars
         lookback = vp_cfg.get("lookback_days", 3)
         bars = await self._collector.get_history_bars(symbol, days=lookback + 2)
@@ -164,7 +162,7 @@ class USPlaybook:
         vwap = calculate_vwap(today)
         rvol = calculate_us_rvol(
             today, history,
-            window_minutes=rvol_cfg.get("window_minutes", 15),
+            skip_open_minutes=rvol_cfg.get("skip_open_minutes", 3),
             lookback_days=rvol_cfg.get("lookback_days", 10),
         )
 
@@ -207,7 +205,6 @@ class USPlaybook:
         )
 
         # 10. Regime classification
-        gg_rvol_key = "gap_and_go_rvol_preliminary" if is_preliminary else "gap_and_go_rvol"
         regime = classify_us_regime(
             price=price,
             prev_close=prev_close,
@@ -217,10 +214,9 @@ class USPlaybook:
             vp=vp,
             gamma_wall=gamma_wall,
             spy_regime=spy_regime,
-            gap_and_go_rvol=regime_cfg.get(gg_rvol_key, 2.0 if is_preliminary else 1.5),
+            gap_and_go_rvol=regime_cfg.get("gap_and_go_rvol", 1.5),
             trend_day_rvol=regime_cfg.get("trend_day_rvol", 1.2),
             fade_chop_rvol=regime_cfg.get("fade_chop_rvol", 1.0),
-            is_preliminary=is_preliminary,
         )
 
         # 11. Build key levels

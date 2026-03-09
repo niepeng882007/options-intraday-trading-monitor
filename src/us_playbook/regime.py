@@ -19,7 +19,6 @@ def classify_us_regime(
     gap_and_go_rvol: float = 1.5,
     trend_day_rvol: float = 1.2,
     fade_chop_rvol: float = 1.0,
-    is_preliminary: bool = False,
 ) -> USRegimeResult:
     """Classify US intraday regime into 4 styles.
 
@@ -48,9 +47,6 @@ def classify_us_regime(
     below_pm = price < pml if pml > 0 else False
     pm_breakout = above_pm or below_pm
 
-    # Preliminary mode uses stricter thresholds (15min RVOL is noisy)
-    gg_rvol = 2.0 if is_preliminary else gap_and_go_rvol
-
     # Near gamma wall check
     near_gamma = False
     if gamma_wall:
@@ -60,9 +56,9 @@ def classify_us_regime(
             near_gamma = abs(price - gamma_wall.put_wall_strike) / price < 0.01
 
     # ── GAP_AND_GO ──
-    if rvol >= gg_rvol and pm_breakout:
+    if rvol >= gap_and_go_rvol and pm_breakout:
         direction = "above PMH" if above_pm else "below PML"
-        confidence = min(1.0, (rvol - gg_rvol) / 0.5 * 0.3 + 0.6)
+        confidence = min(1.0, (rvol - gap_and_go_rvol) / 0.5 * 0.3 + 0.6)
         # SPY context adjustment
         if spy_regime == USRegimeType.FADE_CHOP:
             confidence = max(0.1, confidence - 0.2)
@@ -72,7 +68,7 @@ def classify_us_regime(
             regime=USRegimeType.GAP_AND_GO, confidence=confidence,
             rvol=rvol, price=price, gap_pct=gap_pct,
             spy_regime=spy_regime,
-            details=f"RVOL {rvol:.2f} >= {gg_rvol}, price {direction}, gap {gap_pct:+.2f}%",
+            details=f"RVOL {rvol:.2f} >= {gap_and_go_rvol}, price {direction}, gap {gap_pct:+.2f}%",
         )
 
     # ── TREND_DAY ──

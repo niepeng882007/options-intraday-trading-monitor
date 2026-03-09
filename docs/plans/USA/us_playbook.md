@@ -218,16 +218,17 @@ def calculate_vwap(bars: pd.DataFrame) -> float:
     cum_vol = bars["Volume"].cumsum()
     return float((cum_tp_vol / cum_vol).iloc[-1])
 
-def calculate_us_rvol(today_bars, history_bars, window_minutes=15, lookback_days=10) -> float:
-    """前 N 分钟 RVOL = 今日窗口成交量 / 过去 lookback_days 日同窗口均量
+def calculate_us_rvol(today_bars, history_bars, skip_open_minutes=3, lookback_days=10) -> float:
+    """RVOL 去噪：跳过开盘轮转 + 扩展窗口对比 (详见 rvol_denoise.md)
 
-    - today_bars: 今日全部 1m bars
-    - history_bars: 非今日 bars (多天)
-    - window_minutes: 09:30 后多少分钟 (默认 15 → 09:45 ET)
+    - skip_open_minutes: 跳过 09:30 后前 N 分钟 (默认 3 → 排除集合竞价噪声)
+    - today/history 对称排除 skip zone，按 time-of-day 截断
+    - 09:45 推送用 12min 数据，10:15 推送用 42min 数据
     """
-    # 1. 今日：筛选 index < first_bar + window_minutes 的 bars，求 sum(Volume)
-    # 2. 历史：按 date 分组，每天取同窗口 sum(Volume)，取最近 lookback_days 天
-    # 3. RVOL = today_vol / mean(hist_vols)
+    # 1. skip_cutoff = 09:33 (09:30 + 3min)
+    # 2. 今日：筛选 time >= skip_cutoff 的 bars，记录 cutoff_time
+    # 3. 历史：每天筛选 skip_cutoff <= time <= cutoff_time
+    # 4. RVOL = today_vol / mean(hist_vols)
 ```
 
 #### 2.2 `src/us_playbook/levels.py` — 关键点位
@@ -280,13 +281,12 @@ def classify_us_regime(
     gap_and_go_rvol: float = 1.5,
     trend_day_rvol: float = 1.2,
     fade_chop_rvol: float = 1.0,
-    is_preliminary: bool = False,      # 09:45 用更宽松阈值
 ) -> USRegimeResult:
 ```
 
 | 风格 | 条件 | 交易建议 |
 |------|------|---------|
-| **GAP_AND_GO** 🚀 | RVOL ≥ 1.5 (preliminary: ≥ 2.0) 且 价格突破 PMH/PML | 顺势：ATM/轻度 OTM (Delta 0.3-0.5)，VWAP 止损 |
+| **GAP_AND_GO** 🚀 | RVOL ≥ 1.5 且 价格突破 PMH/PML | 顺势：ATM/轻度 OTM (Delta 0.3-0.5)，VWAP 止损 |
 | **TREND_DAY** 📈 | RVOL ≥ 1.2 且 \|gap\| < 0.5% 且 价格在 VA 外 | 方向跟随：ATM (Delta 0.4-0.6)，PDH/PDL 止损 |
 | **FADE_CHOP** 📦 | RVOL < 1.0 且 价格在 VA 内或触及 Gamma Wall | 均值回归：**严禁 OTM**，深度 ITM (Delta > 0.7) 反向 |
 | **UNCLEAR** ❓ | 混合信号 (RVOL 在中性区间，价格/量不匹配) | 观望：等 10:15 确认，仅高确定性机会 |
@@ -296,9 +296,9 @@ def classify_us_regime(
 - 若 SPY=FADE_CHOP，降低个股 GAP_AND_GO confidence (-0.2)
 - 若 SPY=GAP_AND_GO，提升个股 GAP_AND_GO confidence (+0.1)
 
-**Preliminary（09:45）vs Confirmed（10:15）：**
-- 09:45 `is_preliminary=True`：GAP_AND_GO 阈值提高到 2.0（15 分钟 RVOL 噪声大，需更强信号）
-- 10:15 `is_preliminary=False`：使用标准阈值 1.5（45 分钟 RVOL 更稳定）
+**RVOL 去噪后 09:45 和 10:15 统一阈值：**
+- RVOL 已通过 `skip_open_minutes=3` 排除开盘轮转噪声 + 扩展窗口对比
+- 09:45 和 10:15 统一用 `gap_and_go_rvol: 1.5`（详见 `rvol_denoise.md`）
 
 #### 2.4 `src/us_playbook/filter.py` — 过滤器
 
@@ -528,12 +528,11 @@ volume_profile:
   value_area_pct: 0.70
 
 rvol:
-  window_minutes: 15
+  skip_open_minutes: 3    # 跳过开盘轮转 (09:30-09:32)
   lookback_days: 10
 
 regime:
-  gap_and_go_rvol: 1.5           # confirmed (10:15) 阈值
-  gap_and_go_rvol_preliminary: 2.0  # preliminary (09:45) 更宽松
+  gap_and_go_rvol: 1.5    # 统一阈值 (RVOL 已去噪)
   trend_day_rvol: 1.2
   fade_chop_rvol: 1.0
   market_context_symbols: [SPY, QQQ]
@@ -634,6 +633,9 @@ class TestRVOL:
     def test_normal_rvol(self): ...
     def test_high_rvol(self): ...
     def test_no_history(self): ...
+    def test_rvol_skip_open_minutes(self): ...
+    def test_rvol_expanding_window(self): ...
+    def test_rvol_all_bars_in_skip_zone(self): ...
 
 class TestKeyLevels:
     def test_pdh_pdl_extraction(self): ...
@@ -646,7 +648,7 @@ class TestUSRegime:
     def test_fade_chop(self): ...
     def test_unclear(self): ...
     def test_spy_context_reduces_confidence(self): ...
-    def test_preliminary_wider_threshold(self): ...
+    def test_gap_and_go_unified_threshold(self): ...
 
 class TestUSFilters:
     def test_fomc_day_blocked(self): ...
@@ -685,5 +687,5 @@ class TestPlaybookFormat:
 | Futu snapshot 无 pre-market 字段 | PMH/PML 精度降低 | 回退到 gap 范围 `(max(open,prev_close), min(open,prev_close))` |
 | `max_count > 1000` 不生效 | 3 天 VP 数据不完整 | 改用分页 (`page_req_key`) 或按天分批请求 |
 | 期权链 + snapshot 批量请求触发频控 | Gamma Wall 获取失败 | try/except graceful 降级：跳过 Gamma 板块，其他正常推送 |
-| 09:45 仅 15 分钟数据，RVOL 噪声大 | 错误分类为 GAP_AND_GO | 09:45 用更高阈值 (2.0)；标注"初步"；10:15 确认更新 |
+| 09:45 仅 15 分钟数据，RVOL 噪声大 | 错误分类为 GAP_AND_GO | ✅ 已解决：`skip_open_minutes=3` 排除轮转噪声 + 扩展窗口对比，统一阈值 1.5（详见 `rvol_denoise.md`） |
 | Futu US/HK 共享 300 订阅配额 | 新增 K 线请求占用配额 | `request_history_kline` 是 REST 请求不占推送配额；期权链批量查询间隔 1s |

@@ -70,37 +70,94 @@ class TestRVOL:
     def test_normal_rvol(self):
         """Same volume as history → RVOL ≈ 1.0."""
         today = _make_bars([
-            ("2026-03-09 09:30:00", 100, 101, 99, 100, 10000),
-            ("2026-03-09 09:31:00", 100, 101, 99, 100, 10000),
+            ("2026-03-09 09:33:00", 100, 101, 99, 100, 10000),
+            ("2026-03-09 09:34:00", 100, 101, 99, 100, 10000),
         ])
         history = _make_bars([
-            ("2026-03-06 09:30:00", 100, 101, 99, 100, 10000),
-            ("2026-03-06 09:31:00", 100, 101, 99, 100, 10000),
-            ("2026-03-05 09:30:00", 100, 101, 99, 100, 10000),
-            ("2026-03-05 09:31:00", 100, 101, 99, 100, 10000),
+            ("2026-03-06 09:33:00", 100, 101, 99, 100, 10000),
+            ("2026-03-06 09:34:00", 100, 101, 99, 100, 10000),
+            ("2026-03-05 09:33:00", 100, 101, 99, 100, 10000),
+            ("2026-03-05 09:34:00", 100, 101, 99, 100, 10000),
         ])
-        rvol = calculate_us_rvol(today, history, window_minutes=15)
+        rvol = calculate_us_rvol(today, history, skip_open_minutes=3)
         assert 0.8 <= rvol <= 1.2
 
     def test_high_rvol(self):
         """Double volume → RVOL ≈ 2.0."""
         today = _make_bars([
-            ("2026-03-09 09:30:00", 100, 101, 99, 100, 20000),
-            ("2026-03-09 09:31:00", 100, 101, 99, 100, 20000),
+            ("2026-03-09 09:33:00", 100, 101, 99, 100, 20000),
+            ("2026-03-09 09:34:00", 100, 101, 99, 100, 20000),
         ])
         history = _make_bars([
-            ("2026-03-06 09:30:00", 100, 101, 99, 100, 10000),
-            ("2026-03-06 09:31:00", 100, 101, 99, 100, 10000),
+            ("2026-03-06 09:33:00", 100, 101, 99, 100, 10000),
+            ("2026-03-06 09:34:00", 100, 101, 99, 100, 10000),
         ])
-        rvol = calculate_us_rvol(today, history, window_minutes=15)
+        rvol = calculate_us_rvol(today, history, skip_open_minutes=3)
         assert rvol >= 1.8
 
     def test_no_history(self):
         """No history → neutral RVOL (1.0)."""
         today = _make_bars([
-            ("2026-03-09 09:30:00", 100, 101, 99, 100, 10000),
+            ("2026-03-09 09:33:00", 100, 101, 99, 100, 10000),
         ])
-        rvol = calculate_us_rvol(today, pd.DataFrame(), window_minutes=15)
+        rvol = calculate_us_rvol(today, pd.DataFrame(), skip_open_minutes=3)
+        assert rvol == 1.0
+
+    def test_rvol_skip_open_minutes(self):
+        """Bars within the skip zone (09:30-09:32) should be excluded."""
+        today = _make_bars([
+            ("2026-03-09 09:30:00", 100, 101, 99, 100, 999999),  # skip zone
+            ("2026-03-09 09:31:00", 100, 101, 99, 100, 999999),  # skip zone
+            ("2026-03-09 09:32:00", 100, 101, 99, 100, 999999),  # skip zone
+            ("2026-03-09 09:33:00", 100, 101, 99, 100, 10000),   # counted
+            ("2026-03-09 09:34:00", 100, 101, 99, 100, 10000),   # counted
+        ])
+        history = _make_bars([
+            ("2026-03-06 09:30:00", 100, 101, 99, 100, 999999),
+            ("2026-03-06 09:31:00", 100, 101, 99, 100, 999999),
+            ("2026-03-06 09:32:00", 100, 101, 99, 100, 999999),
+            ("2026-03-06 09:33:00", 100, 101, 99, 100, 10000),
+            ("2026-03-06 09:34:00", 100, 101, 99, 100, 10000),
+        ])
+        rvol = calculate_us_rvol(today, history, skip_open_minutes=3)
+        # Only 09:33-09:34 bars count: same volume → RVOL ≈ 1.0
+        assert 0.9 <= rvol <= 1.1
+
+    def test_rvol_expanding_window(self):
+        """At 10:15, more bars are used than at 09:45."""
+        # Simulate bars from 09:33 to 10:14 (42 minutes of data)
+        today_prices = [
+            (f"2026-03-09 09:{m:02d}:00", 100, 101, 99, 100, 10000)
+            for m in range(33, 60)
+        ] + [
+            (f"2026-03-09 10:{m:02d}:00", 100, 101, 99, 100, 10000)
+            for m in range(0, 15)
+        ]
+        today = _make_bars(today_prices)
+
+        history_prices = [
+            (f"2026-03-06 09:{m:02d}:00", 100, 101, 99, 100, 10000)
+            for m in range(33, 60)
+        ] + [
+            (f"2026-03-06 10:{m:02d}:00", 100, 101, 99, 100, 10000)
+            for m in range(0, 15)
+        ]
+        history = _make_bars(history_prices)
+
+        rvol = calculate_us_rvol(today, history, skip_open_minutes=3)
+        # 42 bars of same volume → RVOL ≈ 1.0
+        assert 0.9 <= rvol <= 1.1
+
+    def test_rvol_all_bars_in_skip_zone(self):
+        """If all today bars are in skip zone → return 1.0."""
+        today = _make_bars([
+            ("2026-03-09 09:30:00", 100, 101, 99, 100, 50000),
+            ("2026-03-09 09:31:00", 100, 101, 99, 100, 50000),
+        ])
+        history = _make_bars([
+            ("2026-03-06 09:33:00", 100, 101, 99, 100, 10000),
+        ])
+        rvol = calculate_us_rvol(today, history, skip_open_minutes=3)
         assert rvol == 1.0
 
 
@@ -209,21 +266,14 @@ class TestUSRegime:
         )
         assert result_with_spy.confidence < result_no_spy.confidence
 
-    def test_preliminary_wider_threshold(self):
-        """Preliminary (09:45) uses higher RVOL threshold for GAP_AND_GO."""
-        # RVOL=1.8: should be GAP_AND_GO with confirmed, but not with preliminary
-        result_confirmed = classify_us_regime(
+    def test_gap_and_go_unified_threshold(self):
+        """Unified RVOL threshold — no more preliminary hack."""
+        result = classify_us_regime(
             price=560, prev_close=550, rvol=1.8,
             pmh=555, pml=548, vp=self._vp(),
-            is_preliminary=False, gap_and_go_rvol=1.5,
+            gap_and_go_rvol=1.5,
         )
-        result_preliminary = classify_us_regime(
-            price=560, prev_close=550, rvol=1.8,
-            pmh=555, pml=548, vp=self._vp(),
-            is_preliminary=True, gap_and_go_rvol=1.5,
-        )
-        assert result_confirmed.regime == USRegimeType.GAP_AND_GO
-        assert result_preliminary.regime != USRegimeType.GAP_AND_GO
+        assert result.regime == USRegimeType.GAP_AND_GO
 
 
 # ── Filter Tests ──

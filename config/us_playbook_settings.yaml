@@ -13,12 +13,11 @@ volume_profile:
   value_area_pct: 0.70
 
 rvol:
-  window_minutes: 15
+  skip_open_minutes: 3
   lookback_days: 10
 
 regime:
   gap_and_go_rvol: 1.5
-  gap_and_go_rvol_preliminary: 2.0
   trend_day_rvol: 1.2
   fade_chop_rvol: 1.0
   market_context_symbols: [SPY, QQQ]
