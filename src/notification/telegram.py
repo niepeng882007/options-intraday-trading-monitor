@@ -88,9 +88,20 @@ RIGHT_SIDE_STRATEGIES = {"vwap-breakout-momentum", "ema-momentum-breakout", "bre
 
 MAX_NOTIFICATIONS_PER_MINUTE = 10
 MAX_SIGNAL_CACHE = 20
+COMMAND_TIMEOUT_SECONDS = 15
 
 
 # ── Helper functions ──
+
+def _fmt_volume(vol: int) -> str:
+    if vol >= 1_000_000_000:
+        return f"{vol / 1_000_000_000:.1f}B"
+    if vol >= 1_000_000:
+        return f"{vol / 1_000_000:.1f}M"
+    if vol >= 1_000:
+        return f"{vol / 1_000:.0f}K"
+    return str(vol)
+
 
 def _format_indicator_value(value: float | None, decimals: int = 4) -> str:
     if value is None:
@@ -369,10 +380,11 @@ class TelegramNotifier:
         self._app = (
             Application.builder()
             .token(self._bot_token)
+            .concurrent_updates(True)
             .build()
         )
         self._app.add_handler(CommandHandler("status", self._cmd_status))
-        self._app.add_handler(CommandHandler("quote", self._cmd_quote))
+        self._app.add_handler(CommandHandler("market", self._cmd_market))
         self._app.add_handler(CommandHandler("chain", self._cmd_chain))
         self._app.add_handler(CommandHandler("strategies", self._cmd_strategies))
         self._app.add_handler(CommandHandler("enable", self._cmd_enable))
@@ -383,6 +395,8 @@ class TelegramNotifier:
         self._app.add_handler(CommandHandler("skip", self._cmd_skip))
         self._app.add_handler(CommandHandler("detail", self._cmd_detail))
         self._app.add_handler(CommandHandler("test", self._cmd_test))
+        self._app.add_handler(CommandHandler("conn", self._cmd_conn))
+        self._app.add_error_handler(self._on_error)
         return self._app
 
     async def start_polling(self) -> None:
@@ -399,6 +413,9 @@ class TelegramNotifier:
             await self._app.updater.stop()  # type: ignore[union-attr]
             await self._app.stop()
             await self._app.shutdown()
+
+    async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.error("Telegram handler error: %s", context.error, exc_info=context.error)
 
     # ── Notification sending ──
 
@@ -640,29 +657,71 @@ class TelegramNotifier:
 
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")  # type: ignore[union-attr]
 
-    async def _cmd_quote(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not context.args:
-            await update.message.reply_text("用法: /quote AAPL")  # type: ignore[union-attr]
-            return
-
-        symbol = context.args[0].upper()
+    async def _cmd_market(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show real-time trading info for all monitored symbols."""
         if self._collector is None:
             await update.message.reply_text("数据采集器未初始化")  # type: ignore[union-attr]
             return
+        if self._strategy_loader is None:
+            await update.message.reply_text("策略管理器未初始化")  # type: ignore[union-attr]
+            return
 
-        try:
-            quote = await self._collector.get_stock_quote(symbol)
-            text = (
-                f"📈 <b>{symbol}</b>\n"
-                f"💰 价格: ${quote.price:.2f}\n"
-                f"Bid: ${quote.bid:.2f} / Ask: ${quote.ask:.2f}\n"
-                f"成交量: {quote.volume:,}\n"
-                f"⚠️ 数据源: {self._data_source_label}"
-            )
-        except Exception as exc:
-            text = f"查询失败: {exc}"
+        symbols = sorted(self._strategy_loader.get_all_symbols())
+        if not symbols:
+            await update.message.reply_text("监控列表为空")  # type: ignore[union-attr]
+            return
 
-        await update.message.reply_text(text, parse_mode="HTML")  # type: ignore[union-attr]
+        lines = ["📊 <b>实时行情</b>", "━━━━━━━━━━━━━━━━━━━━"]
+        max_cache_age = 0.0
+
+        for symbol in symbols:
+            try:
+                q = self._collector.get_cached_quote(symbol)
+                if q is not None:
+                    max_cache_age = max(max_cache_age, time.time() - q.timestamp)
+                else:
+                    q = await asyncio.wait_for(
+                        self._collector.get_stock_quote(symbol),
+                        timeout=COMMAND_TIMEOUT_SECONDS,
+                    )
+
+                # Line 1: symbol, price, change
+                if q.change_pct is not None:
+                    arrow = "🔺" if q.change_pct >= 0 else "🔻"
+                    change_str = f" {arrow}{q.change_pct:+.2f}%"
+                else:
+                    change_str = ""
+                lines.append(f"<b>{_esc(symbol)}</b> ${q.price:.2f}{change_str}")
+
+                # Line 2: OHLC
+                if q.open_price is not None:
+                    lines.append(
+                        f"  O {q.open_price:.2f} H {q.high_price:.2f}"
+                        f" L {q.low_price:.2f}"
+                    )
+
+                # Line 3: volume + turnover rate + amplitude
+                vol_parts: list[str] = [f"  Vol {_fmt_volume(q.volume)}"]
+                if q.turnover_rate is not None:
+                    vol_parts.append(f"换手{q.turnover_rate:.2f}%")
+                if q.amplitude is not None:
+                    vol_parts.append(f"振幅{q.amplitude:.2f}%")
+                lines.append(" | ".join(vol_parts))
+
+                # Line 4: bid/ask spread
+                spread = q.ask - q.bid if q.ask and q.bid else 0
+                lines.append(f"  Bid {q.bid:.2f} / Ask {q.ask:.2f} (spd {spread:.2f})")
+                lines.append("")  # blank separator
+            except Exception:
+                lines.append(f"<b>{_esc(symbol)}</b> ❌ 查询失败")
+                lines.append("")
+
+        cache_note = f" | 缓存≤{int(max_cache_age)}s" if max_cache_age > 0 else ""
+        lines.append(
+            f"⏱ {datetime.now(ET).strftime('%H:%M:%S')} ET"
+            f" | {self._data_source_label}{cache_note}"
+        )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")  # type: ignore[union-attr]
 
     async def _cmd_chain(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not context.args or len(context.args) < 4:
@@ -681,7 +740,10 @@ class TelegramNotifier:
             return
 
         try:
-            options = await self._collector.get_option_chain(symbol)
+            options = await asyncio.wait_for(
+                self._collector.get_option_chain(symbol),
+                timeout=COMMAND_TIMEOUT_SECONDS,
+            )
             matched = [
                 o for o in options
                 if abs(o.strike - float(strike)) < 0.01
@@ -701,6 +763,8 @@ class TelegramNotifier:
                     f"IV: {opt.implied_volatility:.2%}\n"
                     f"⚠️ 数据源: {self._data_source_label}"
                 )
+        except TimeoutError:
+            text = f"⏱ 查询超时: {symbol} 数据源无响应"
         except Exception as exc:
             text = f"查询失败: {exc}"
 
@@ -946,3 +1010,74 @@ class TelegramNotifier:
             await update.message.reply_text("✅ 出场提醒发送成功\n\n🟢 Telegram 推送链路正常")  # type: ignore[union-attr]
         else:
             await update.message.reply_text("❌ 出场提醒发送失败")  # type: ignore[union-attr]
+
+    async def _cmd_conn(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show Futu connection status and diagnostics."""
+        if self._collector is None:
+            await update.message.reply_text("数据采集器未初始化")  # type: ignore[union-attr]
+            return
+
+        try:
+            info = await asyncio.wait_for(
+                self._collector.get_connection_info(),
+                timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            await update.message.reply_text("⏱ 连接状态查询超时")  # type: ignore[union-attr]
+            return
+        except Exception as exc:
+            await update.message.reply_text(f"❌ 查询失败: {exc}")  # type: ignore[union-attr]
+            return
+
+        source = info.get("source", "unknown")
+        if source != "futu":
+            await update.message.reply_text(  # type: ignore[union-attr]
+                f"📡 数据源: {self._data_source_label}\n非 Futu 连接，无详细状态"
+            )
+            return
+
+        connected = info.get("connected", False)
+        status_icon = "🟢" if connected else "🔴"
+        global_state = info.get("global_state", "N/A")
+        state_icon = "✅" if global_state == "OK" else "❌"
+
+        lines = [
+            "📡 <b>Futu 连接状态</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"{status_icon} 连接: {'已连接' if connected else '已断开'}",
+            f"🖥 节点: {info.get('host')}:{info.get('port')}",
+            f"{state_icon} 状态: {global_state}",
+        ]
+
+        # Server info
+        server_ver = info.get("server_ver")
+        if server_ver and server_ver != "N/A":
+            lines.append(f"📦 服务端版本: {server_ver}")
+
+        market_us = info.get("market_us")
+        if market_us and market_us != "N/A":
+            lines.append(f"🇺🇸 美股市场: {market_us}")
+
+        # Subscription
+        used = info.get("subscription_used", 0)
+        quota = info.get("subscription_quota", 0)
+        pct = (used / quota * 100) if quota else 0
+        lines.append(f"\n📊 订阅: {used}/{quota} ({pct:.0f}%)")
+
+        # Quote cache
+        cached = info.get("cached_quotes", 0)
+        lines.append(f"💾 报价缓存: {cached} 个标的")
+
+        quote_ages = info.get("quote_ages")
+        if quote_ages:
+            age_parts = []
+            for sym, age in quote_ages.items():
+                if age < 60:
+                    age_parts.append(f"{sym} {age:.0f}s")
+                else:
+                    age_parts.append(f"{sym} {age / 60:.1f}m")
+            lines.append(f"   {' | '.join(age_parts)}")
+
+        lines.append(f"\n⏱ {datetime.now(ET).strftime('%H:%M:%S')} ET")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")  # type: ignore[union-attr]
