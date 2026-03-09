@@ -246,6 +246,79 @@ class TestIndicatorEngine:
         assert result is not None
         assert result.adx is None
 
+    def test_bb_pct_b_calculation(self):
+        bars = _make_bars(50)
+        self.engine.update_bars("AAPL", bars)
+        result = self.engine.calculate("AAPL", "1m")
+        assert result is not None
+        assert result.bb_pct_b is not None
+        # %B can be outside [0, 1] when price is outside bands
+        assert -2.0 < result.bb_pct_b < 3.0
+
+    def test_bb_middle_stored(self):
+        bars = _make_bars(50)
+        self.engine.update_bars("AAPL", bars)
+        result = self.engine.calculate("AAPL", "1m")
+        assert result is not None
+        assert result.bb_middle is not None
+        assert result.bb_lower <= result.bb_middle <= result.bb_upper
+
+    def test_bb_width_expansion(self):
+        bars = _make_bars(50)
+        self.engine.update_bars("AAPL", bars)
+        # Need >= 10 BBW history entries
+        for _ in range(12):
+            result = self.engine.calculate("AAPL", "1m")
+        assert result is not None
+        assert result.bb_width_expansion is not None
+        assert result.bb_width_expansion > 0
+
+    def test_stochastic_kd_calculation(self):
+        bars = _make_bars(50)
+        self.engine.update_bars("AAPL", bars)
+        result = self.engine.calculate("AAPL", "1m")
+        assert result is not None
+        assert result.stoch_k is not None
+        assert result.stoch_d is not None
+        assert 0 <= result.stoch_k <= 100
+        assert 0 <= result.stoch_d <= 100
+
+    def test_stochastic_insufficient_data(self):
+        bars = _make_bars(5)
+        self.engine.update_bars("NVDA", bars)
+        result = self.engine.calculate("NVDA", "1m")
+        assert result is not None
+        assert result.stoch_k is None
+        assert result.stoch_d is None
+
+    def test_upper_lower_shadow(self):
+        bars = _make_bars(30)
+        self.engine.update_bars("AAPL", bars)
+        result = self.engine.calculate("AAPL", "1m")
+        assert result is not None
+        assert result.upper_shadow_pct is not None
+        assert result.lower_shadow_pct is not None
+        assert result.upper_shadow_pct >= 0
+        assert result.lower_shadow_pct >= 0
+
+    def test_prev_bar_close(self):
+        bars = _make_bars(30)
+        self.engine.update_bars("AAPL", bars)
+        result = self.engine.calculate("AAPL", "1m")
+        assert result is not None
+        assert result.prev_bar_close is not None
+        expected = float(bars["Close"].iloc[-2])
+        assert abs(result.prev_bar_close - expected) < 1e-6
+
+    def test_prev_bar_low(self):
+        bars = _make_bars(30)
+        self.engine.update_bars("AAPL", bars)
+        result = self.engine.calculate("AAPL", "1m")
+        assert result is not None
+        assert result.prev_bar_low is not None
+        expected = float(bars["Low"].iloc[-2])
+        assert abs(result.prev_bar_low - expected) < 1e-6
+
     def test_to_dict(self):
         bars = _make_bars(50)
         self.engine.update_bars("AAPL", bars)

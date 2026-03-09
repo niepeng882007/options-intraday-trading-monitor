@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pandas as pd
-from ta.momentum import RSIIndicator
+from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import MACD, EMAIndicator, ADXIndicator
 from ta.volatility import AverageTrueRange, BollingerBands
 
@@ -21,6 +21,7 @@ MIN_BARS_ATR = 15
 MIN_BARS_VWAP = 2
 MIN_BARS_BOLLINGER = 21
 MIN_BARS_ADX = 28
+MIN_BARS_STOCHASTIC = 15
 MIN_BARS_WARMUP = 260  # 51 × 5 + buffer, enough for EMA50 on 5m
 
 
@@ -61,6 +62,15 @@ class IndicatorResult:
     adx: float | None = None
     volume_spike: float | None = None          # current_vol / avg(last 3 bars vol)
     bb_width_percentile: float | None = None   # intraday BBW percentile (0-100)
+    bb_middle: float | None = None             # BB middle band (SMA20)
+    bb_pct_b: float | None = None              # %B = (close - lower) / (upper - lower)
+    bb_width_expansion: float | None = None    # current BBW / recent 10-period BBW avg
+    stoch_k: float | None = None               # Stochastic %K
+    stoch_d: float | None = None               # Stochastic %D
+    upper_shadow_pct: float | None = None      # (high - max(O,C)) / close * 100
+    lower_shadow_pct: float | None = None      # (min(O,C) - low) / close * 100
+    prev_bar_close: float | None = None        # previous bar close
+    prev_bar_low: float | None = None          # previous bar low
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in self.__dict__.items() if v is not None}
@@ -146,6 +156,7 @@ class IndicatorEngine:
         self._calc_ema(bars, result)
         self._calc_atr(bars, result)
         self._calc_adx(bars, result)
+        self._calc_stochastic(bars, result)
         self._calc_vwap(bars, result)
         self._calc_bollinger(bars, result, sym=sym)
         self._calc_candle_metrics(bars, result)
@@ -313,6 +324,29 @@ class IndicatorEngine:
             pass
 
     @staticmethod
+    def _calc_stochastic(
+        bars: pd.DataFrame,
+        result: IndicatorResult,
+        window: int = 9,
+        smooth_window: int = 3,
+    ) -> None:
+        if len(bars) < MIN_BARS_STOCHASTIC:
+            return
+        try:
+            indicator = StochasticOscillator(
+                high=bars["High"], low=bars["Low"], close=bars["Close"],
+                window=window, smooth_window=smooth_window,
+            )
+            k_val = indicator.stoch().iloc[-1]
+            d_val = indicator.stoch_signal().iloc[-1]
+            if pd.notna(k_val):
+                result.stoch_k = float(k_val)
+            if pd.notna(d_val):
+                result.stoch_d = float(d_val)
+        except Exception:
+            pass
+
+    @staticmethod
     def _calc_vwap(bars: pd.DataFrame, result: IndicatorResult) -> None:
         if len(bars) < MIN_BARS_VWAP:
             return
@@ -354,8 +388,21 @@ class IndicatorEngine:
                 result.bb_upper = float(upper)
                 result.bb_lower = float(lower)
                 if pd.notna(middle) and float(middle) > 0:
+                    result.bb_middle = float(middle)
                     bbw = (float(upper) - float(lower)) / float(middle) * 100
                     result.bb_width_pct = bbw
+
+                    # %B = (close - lower) / (upper - lower)
+                    close_val = float(bars["Close"].iloc[-1])
+                    band_width = float(upper) - float(lower)
+                    if band_width > 1e-9:
+                        result.bb_pct_b = (close_val - float(lower)) / band_width
+
+                    # BB width expansion rate: current BBW / recent 10-period BBW avg
+                    if sym is not None and len(sym.bbw_history) >= 10:
+                        recent_avg = sum(sym.bbw_history[-10:]) / 10
+                        if recent_avg > 1e-9:
+                            result.bb_width_expansion = bbw / recent_avg
 
                     # Track intraday BBW and compute percentile
                     if sym is not None:
@@ -390,10 +437,16 @@ class IndicatorEngine:
             if close_val > 0:
                 result.candle_body_pct = abs(close_val - open_val) / close_val * 100
                 result.candle_range_pct = (high_val - low_val) / close_val * 100
+                max_oc = max(close_val, open_val)
+                min_oc = min(close_val, open_val)
+                result.upper_shadow_pct = (high_val - max_oc) / close_val * 100
+                result.lower_shadow_pct = (min_oc - low_val) / close_val * 100
 
             if len(bars) >= 2:
                 prev = bars.iloc[-2]
                 result.prev_bar_high = float(prev["High"])
+                result.prev_bar_close = float(prev["Close"])
+                result.prev_bar_low = float(prev["Low"])
         except Exception:
             pass
 
