@@ -1,6 +1,6 @@
 strategy_id: "extreme-oversold-reversal"
 name: "极端超卖钝化反转"
-enabled: true
+enabled: false
 description: >
   标的快速急跌后，15 分钟 RSI 跌破 30（真正极端超卖）且价格偏离 VWAP 超过 1.2%，
   放量反弹 + K 线反转确认，动能衰竭触发均值回归。

@@ -6,10 +6,10 @@ description: >
   反弹缩量无力时提前埋伏做空，吃第二波主跌浪。
 
 watchlist:
-  underlyings: ["SPY", "QQQ", "AAPL", "AMZN"]
+  underlyings: ["SPY", "QQQ", "AMZN"]
   option_filter:
     type: "put"
-    max_dte: 2
+    max_dte: 5
     moneyness: "ATM"
     min_volume: 100
     max_spread_pct: 0.15
@@ -41,14 +41,14 @@ entry_conditions:
     - indicator: "RSI"
       field: "value"
       comparator: "<"
-      threshold: 45
+      threshold: 40
       timeframe: "5m"
 
     # 条件 4（反弹缩量确认）：量比 < 0.8（新增）
     - indicator: "PRICE"
       field: "volume_ratio"
       comparator: "<"
-      threshold: 0.9
+      threshold: 0.7
       timeframe: "5m"
 
     # 条件 5（死水停顿）：K 线实体极小 OR 高低幅极小
@@ -75,11 +75,12 @@ exit_conditions:
   operator: "OR"
   rules:
     - type: "stop_loss_pct"
-      threshold: -0.003
+      threshold: -0.004
     - type: "take_profit_pct"
       threshold: 0.005
-    - type: "time_exit"
-      minutes_before_close: 15
+    - type: "trailing_stop"
+      activation_pct: 0.004
+      trail_pct: 0.002
 
 option_selection:
   preference: "ATM Put"
@@ -98,7 +99,7 @@ sop_checklist:
   - "止损设在期权 -20%"
 
 notification:
-  cooldown_seconds: 180
+  cooldown_seconds: 1800
   priority: "high"
 
 entry_quality_filters:

@@ -158,7 +158,8 @@ class OptionsMonitor:
                 | set(self.config.get("watchlist", {}).get("symbols", []))
             )
             self.collector.subscribe_quotes(symbols, self._on_quote_push)
-            logger.info("Using Futu push subscription for %d symbols", len(symbols))
+            self.collector.subscribe_kline(symbols, self._on_kline_push)
+            logger.info("Using Futu push subscription for %d symbols (QUOTE+K_1M)", len(symbols))
         else:
             self.scheduler.add_job(
                 self._poll_stock_quotes,
@@ -167,13 +168,6 @@ class OptionsMonitor:
                 id="stock_quotes",
                 max_instances=1,
             )
-        self.scheduler.add_job(
-            self._poll_option_chains,
-            "interval",
-            seconds=poll.get("option_chain_interval_seconds", 30),
-            id="option_chains",
-            max_instances=1,
-        )
         self.scheduler.add_job(
             self._poll_history,
             "interval",
@@ -193,6 +187,20 @@ class OptionsMonitor:
             "interval",
             seconds=60,
             id="persist_states",
+            max_instances=1,
+        )
+        self.scheduler.add_job(
+            self._health_check,
+            "interval",
+            seconds=60,
+            id="health_check",
+            max_instances=1,
+        )
+        self.scheduler.add_job(
+            self._heartbeat,
+            "interval",
+            seconds=300,
+            id="heartbeat",
             max_instances=1,
         )
 
@@ -275,17 +283,21 @@ class OptionsMonitor:
         except Exception:
             logger.exception("Failed to process push quote for %s", symbol)
 
-    async def _poll_option_chains(self) -> None:
+    async def _on_kline_push(self, symbol: str, kline_df) -> None:
+        """Callback for Futu real-time 1-minute K-line push."""
         if not self._is_trading_hours():
             return
+        try:
+            self.indicator_engine.update_bars(symbol, kline_df)
 
-        symbols = self.strategy_loader.get_all_symbols()
-        for symbol in symbols:
-            try:
-                chain = await self.collector.get_option_chain(symbol)
-                await self.redis_store.publish_options(symbol, chain)
-            except Exception:
-                logger.exception("Failed to poll option chain for %s", symbol)
+            results = self.indicator_engine.calculate_all(symbol)
+            for tf, result in results.items():
+                if result:
+                    await self.redis_store.publish_indicators(symbol, tf, result.to_dict())
+
+            await self._evaluate_entries(symbol, results)
+        except Exception:
+            logger.exception("Failed to process kline push for %s", symbol)
 
     async def _poll_history(self) -> None:
         if not self._is_trading_hours():
@@ -436,6 +448,15 @@ class OptionsMonitor:
                             sym_ind.adx, max_adx, strategy.strategy_id,
                         )
                         skip = True
+                min_adx = mcf.get("min_adx")
+                if not skip and min_adx is not None:
+                    sym_ind = indicators_by_tf.get("5m")
+                    if sym_ind and sym_ind.adx is not None and sym_ind.adx < min_adx:
+                        logger.debug(
+                            "Market filter: ADX %.1f < %.1f (min), skip %s",
+                            sym_ind.adx, min_adx, strategy.strategy_id,
+                        )
+                        skip = True
                 if skip:
                     continue
 
@@ -503,9 +524,14 @@ class OptionsMonitor:
         entry_price = state.position.entry_price
         minutes_to_close = self._minutes_to_close()
 
+        direction = strategy.option_filter.get("type", "call")
+        indicators_by_tf = self.indicator_engine.calculate_all(symbol)
         exit_signal = self.rule_matcher.evaluate_exit(
             strategy, symbol, current_price, entry_price, minutes_to_close,
             highest_price=state.position.highest_price,
+            lowest_price=state.position.lowest_price,
+            direction=direction,
+            indicators_by_tf=indicators_by_tf,
         )
         if exit_signal is None:
             return
@@ -553,6 +579,35 @@ class OptionsMonitor:
                 f"⏰ 入场信号超时: {entry.strategy_id}:{entry.symbol}\n"
                 f"信号 {entry.signal_id} 未确认，已重置为 WATCHING"
             )
+
+    async def _health_check(self) -> None:
+        """Periodic check of data source connection health."""
+        if self.config.get("data_source") != "futu":
+            return
+        try:
+            await self.collector.health_check()
+        except Exception:
+            logger.error("Health check failed, attempting reconnect")
+            await self.notifier.send_text("⚠️ Futu 连接异常，正在重连...")
+            try:
+                await self.collector.close()
+            except Exception:
+                pass
+            try:
+                await self.collector.connect()
+                await self.notifier.send_text("✅ Futu 重连成功")
+            except Exception:
+                logger.exception("Reconnect failed")
+                await self.notifier.send_text("❌ Futu 重连失败，请检查 FutuOpenD")
+
+    async def _heartbeat(self) -> None:
+        """Periodic heartbeat log for liveness monitoring."""
+        active = len(self.strategy_loader.get_active())
+        holding = len(self.state_manager.get_holding_positions())
+        logger.info(
+            "Heartbeat: strategies=%d, holding=%d, daily_pnl=%.2f%%",
+            active, holding, self._daily_pnl,
+        )
 
     def _persist_states(self) -> None:
         states = self.state_manager.export_all()

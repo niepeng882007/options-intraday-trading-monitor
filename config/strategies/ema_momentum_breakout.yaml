@@ -9,7 +9,7 @@ watchlist:
   underlyings: ["SPY", "QQQ", "AAPL", "NVDA", "TSLA", "META"]
   option_filter:
     type: "call"
-    max_dte: 2
+    max_dte: 3
     moneyness: "ATM"
     min_volume: 100
     max_spread_pct: 0.15
@@ -56,6 +56,16 @@ entry_conditions:
       threshold: 1.0
       timeframe: "5m"
 
+    # 爆量确认：量能突变 > 1.5x（防 IV Crush）
+    - indicator: "PRICE"
+      field: "volume_spike"
+      comparator: ">"
+      threshold: 1.5
+      timeframe: "5m"
+
+market_context_filters:
+  min_adx: 20
+
 exit_conditions:
   operator: "OR"
   rules:
@@ -83,7 +93,7 @@ sop_checklist:
   - "买入 ATM Call"
 
 notification:
-  cooldown_seconds: 300
+  cooldown_seconds: 1800
   priority: "high"
 
 entry_quality_filters:

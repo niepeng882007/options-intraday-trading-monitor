@@ -1,0 +1,194 @@
+strategy_id: "bb-piercing-reversion-put"
+name: "布林带刺穿回扑做空 (BB Piercing Reversion Put)"
+enabled: true
+description: >
+  多时间框架共振均值回归（做空方向）。15 分钟线刺穿上轨后四维打分，
+  5 分钟精确入场。目标回归中轨。
+
+watchlist:
+  underlyings: ["SPY", "QQQ", "TSLA", "META"]
+  option_filter:
+    type: "put"
+    max_dte: 5
+    moneyness: "ATM"
+    min_volume: 100
+    max_spread_pct: 0.15
+
+trading_window:
+  start: "10:30"
+  end: "14:30"
+  timezone: "US/Eastern"
+
+entry_conditions:
+  operator: "AND"
+  rules:
+    # -- 日线战略层：非大涨日（涨幅>1%禁止做空回扑）--
+    - indicator: "PRICE"
+      field: "day_change_pct"
+      comparator: "<"
+      threshold: 1.0
+      timeframe: "5m"
+
+    # -- 15 分钟战术层：回看刺穿 + 确认 K 线 --
+    - operator: "OR"
+      rules:
+        # 路径 A：前根 K 线同根刺穿上轨 + 当根确认回扑
+        - operator: "AND"
+          rules:
+            - indicator: "PRICE"
+              field: "prev_bar_high"
+              comparator: ">"
+              reference_field: "bb_upper"
+              timeframe: "15m"
+            - indicator: "PRICE"
+              field: "prev_bar_close"
+              comparator: "<"
+              reference_field: "bb_upper"
+              timeframe: "15m"
+            - indicator: "PRICE"
+              field: "close"
+              comparator: "<"
+              reference_field: "prev_bar_close"
+              timeframe: "15m"
+        # 路径 B：前根收在上轨之上 + 当根收回且低于前收
+        - operator: "AND"
+          rules:
+            - indicator: "PRICE"
+              field: "prev_bar_close"
+              comparator: ">"
+              reference_field: "bb_upper"
+              timeframe: "15m"
+            - indicator: "PRICE"
+              field: "close"
+              comparator: "<"
+              reference_field: "bb_upper"
+              timeframe: "15m"
+            - indicator: "PRICE"
+              field: "close"
+              comparator: "<"
+              reference_field: "prev_bar_close"
+              timeframe: "15m"
+
+    # -- Squeeze 突破过滤 --
+    - indicator: "BOLLINGER"
+      field: "width_expansion"
+      comparator: "<"
+      threshold: 1.5
+      timeframe: "15m"
+
+    # -- 15 分钟四维打分（至少 3/4 通过）--
+    - operator: "MIN_MATCH"
+      min_count: 3
+      rules:
+        # 维度 1（BB 位置）：%B 正在从极端区域回归
+        - indicator: "BOLLINGER"
+          field: "pct_b"
+          comparator: "<"
+          threshold: 1.1
+          timeframe: "15m"
+
+        # 维度 2（动量综合）：RSI 超买 OR KD 死叉
+        - operator: "OR"
+          rules:
+            - indicator: "RSI"
+              field: "value"
+              comparator: ">"
+              threshold: 65
+              timeframe: "15m"
+            - indicator: "STOCHASTIC"
+              field: "k"
+              comparator: "crosses_below"
+              reference_field: "stoch_d"
+              timeframe: "15m"
+
+        # 维度 3（成交量）：缩量刺穿，非放量突破
+        - indicator: "PRICE"
+          field: "volume_spike"
+          comparator: "<"
+          threshold: 1.5
+          timeframe: "15m"
+
+        # 维度 4（K 线形态）：上影线较长 = 空头抵抗
+        - indicator: "CANDLE"
+          field: "upper_shadow_pct"
+          comparator: ">"
+          threshold: 0.1
+          timeframe: "15m"
+
+    # -- 5 分钟执行层 --
+    - operator: "OR"
+      rules:
+        # 价格刚从 BB 外回到 BB 内
+        - indicator: "BOLLINGER"
+          field: "pct_b"
+          comparator: "crosses_below"
+          threshold: 1.0
+          timeframe: "5m"
+        # KD 在超买区（>70）死叉
+        - operator: "AND"
+          rules:
+            - indicator: "STOCHASTIC"
+              field: "k"
+              comparator: "crosses_below"
+              reference_field: "stoch_d"
+              timeframe: "5m"
+            - indicator: "STOCHASTIC"
+              field: "k"
+              comparator: ">"
+              threshold: 70
+              timeframe: "5m"
+
+market_context_filters:
+  max_adx: 30
+  max_spy_day_drop_pct: -2.0
+
+time_penalty_enabled: true
+
+exit_conditions:
+  operator: "OR"
+  rules:
+    # 动态止盈：到达 15 分钟布林带中轨（PUT方向：价格跌到中轨以下）
+    - type: "indicator_target"
+      indicator: "BOLLINGER"
+      field: "middle"
+      timeframe: "15m"
+    # 追踪止盈：到中轨后如果继续冲，trailing 让利润奔跑
+    - type: "trailing_stop"
+      activation_pct: 0.003
+      trail_pct: 0.002
+    # 安全网止盈
+    - type: "take_profit_pct"
+      threshold: 0.01
+    # 止损
+    - type: "stop_loss_pct"
+      threshold: -0.0045
+
+option_selection:
+  preference: "ATM Put"
+  reason: "均值回归，ATM Delta 适中"
+
+exit_plan:
+  stop_loss: "安全网 0.35% 止损 + 动态 BB 中轨止盈"
+  take_profit: "目标 15 分钟布林带中轨（动态），安全网 0.8%"
+  time_exit: "收盘前 15 分钟强制退出"
+
+sop_checklist:
+  - "收到警报：布林带上轨刺穿回扑信号"
+  - "确认为刺穿（非突破）：收盘在通道内 + 非 Squeeze 扩张"
+  - "检查四维打分 >= 3/4"
+  - "在 5 分钟图等待精确入场（%B 回落或超买区 KD 死叉）"
+  - "买入 ATM Put，止盈目标 15 分钟中轨"
+
+notification:
+  cooldown_seconds: 1800
+  priority: "high"
+
+entry_quality_filters:
+  base_score: 50
+  min_score: 65
+  max_bb_width_pct: 3.0
+  prefer_low_volume: true
+  prefer_extreme_pct_b: true
+  prefer_low_adx: true
+  ideal_max_adx: 25
+  prefer_reversal_strength: true

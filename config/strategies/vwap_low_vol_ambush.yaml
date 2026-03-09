@@ -6,10 +6,10 @@ description: >
   在横盘中从容埋伏进场。延迟 15s 对横盘毫无影响。
 
 watchlist:
-  underlyings: ["QQQ", "AAPL", "NVDA", "TSLA", "META", "AMZN"]
+  underlyings: ["QQQ", "AAPL", "TSLA", "META", "AMZN"]
   option_filter:
     type: "call"
-    max_dte: 2
+    max_dte: 5
     moneyness: "ATM"
     min_volume: 100
     max_spread_pct: 0.15
@@ -66,10 +66,11 @@ exit_conditions:
   rules:
     - type: "take_profit_pct"
       threshold: 0.005
+    - type: "trailing_stop"
+      activation_pct: 0.004
+      trail_pct: 0.002
     - type: "stop_loss_pct"
       threshold: -0.003
-    - type: "time_exit"
-      minutes_before_close: 15
 
 option_selection:
   preference: "ATM Call"
@@ -87,7 +88,7 @@ sop_checklist:
   - "止损设在 VWAP 下方 0.2%"
 
 notification:
-  cooldown_seconds: 180
+  cooldown_seconds: 1800
   priority: "high"
 
 entry_quality_filters:

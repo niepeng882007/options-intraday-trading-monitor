@@ -9,7 +9,7 @@ watchlist:
   underlyings: ["SPY", "QQQ", "AAPL", "NVDA", "TSLA", "META"]
   option_filter:
     type: "put"
-    max_dte: 2
+    max_dte: 3
     moneyness: "ATM"
     min_volume: 100
     max_spread_pct: 0.15
@@ -77,11 +77,12 @@ exit_conditions:
   operator: "OR"
   rules:
     - type: "stop_loss_pct"
-      threshold: -0.003
+      threshold: -0.0035
     - type: "take_profit_pct"
       threshold: 0.005
-    - type: "time_exit"
-      minutes_before_close: 15
+    - type: "trailing_stop"
+      activation_pct: 0.004
+      trail_pct: 0.002
 
 option_selection:
   preference: "ATM Put"
@@ -101,7 +102,7 @@ sop_checklist:
   - "止损设在期权 -20%"
 
 notification:
-  cooldown_seconds: 120
+  cooldown_seconds: 1800
   priority: "high"
 
 entry_quality_filters:

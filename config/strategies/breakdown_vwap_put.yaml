@@ -9,7 +9,7 @@ watchlist:
   underlyings: ["SPY", "QQQ", "AAPL"]
   option_filter:
     type: "put"
-    max_dte: 2
+    max_dte: 3
     moneyness: "ATM"
     min_volume: 100
     max_spread_pct: 0.15
@@ -22,19 +22,19 @@ trading_window:
 entry_conditions:
   operator: "AND"
   rules:
-    # 跌破信号：价格下穿 VWAP（1m 级别捕捉最快信号）
+    # 跌破信号：价格跌破 VWAP（带 hysteresis 过滤假突破）
     - indicator: "PRICE"
       field: "close"
-      comparator: "crosses_below"
+      comparator: "breaks_below"
       reference_field: "vwap"
       timeframe: "5m"
       confirm_bars: 1
 
-    # 放量确认：量能突变 > 1.3x
+    # 放量确认：量能突变 > 1.8x（收紧，防 IV Crush）
     - indicator: "PRICE"
       field: "volume_spike"
       comparator: ">"
-      threshold: 1.3
+      threshold: 1.5
       timeframe: "5m"
 
     # 动能确认：MACD 柱状图为负（5m 级别）
@@ -50,6 +50,9 @@ entry_conditions:
       comparator: "<"
       threshold: 0.3
       timeframe: "5m"
+
+market_context_filters:
+  min_adx: 20
 
 exit_conditions:
   operator: "OR"
@@ -78,7 +81,7 @@ sop_checklist:
   - "止损设在期权 -15%"
 
 notification:
-  cooldown_seconds: 300
+  cooldown_seconds: 1800
   priority: "high"
 
 entry_quality_filters:

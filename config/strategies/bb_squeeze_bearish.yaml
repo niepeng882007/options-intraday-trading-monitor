@@ -9,7 +9,7 @@ watchlist:
   underlyings: ["SPY", "AAPL", "NVDA", "AMZN"]
   option_filter:
     type: "put"
-    max_dte: 2
+    max_dte: 5
     moneyness: "ATM"
     min_volume: 100
     max_spread_pct: 0.15
@@ -67,11 +67,12 @@ exit_conditions:
   operator: "OR"
   rules:
     - type: "take_profit_pct"
-      threshold: 0.015
+      threshold: 0.01
+    - type: "trailing_stop"
+      activation_pct: 0.006
+      trail_pct: 0.003
     - type: "stop_loss_pct"
-      threshold: -0.005
-    - type: "time_exit"
-      minutes_before_close: 15
+      threshold: -0.0045
 
 option_selection:
   preference: "0DTE ATM Put"
@@ -90,7 +91,7 @@ sop_checklist:
   - "等待午后方向性向下爆发"
 
 notification:
-  cooldown_seconds: 300
+  cooldown_seconds: 1800
   priority: "high"
 
 entry_quality_filters:
