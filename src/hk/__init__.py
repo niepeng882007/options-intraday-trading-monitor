@@ -19,6 +19,7 @@ class VolumeProfileResult:
     val: float                 # Value Area Low
     volume_by_price: dict[float, float] = field(default_factory=dict)
     total_volume: float = 0.0
+    trading_days: int = 0
 
 
 @dataclass

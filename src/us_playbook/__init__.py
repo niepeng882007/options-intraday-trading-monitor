@@ -38,6 +38,8 @@ class USRegimeResult:
     gap_pct: float               # open vs prev_close %
     spy_regime: USRegimeType | None = None
     details: str = ""
+    adaptive_thresholds: dict | None = None
+    # e.g. {"gap_and_go": 1.73, "trend_day": 1.15, "fade_chop": 0.88, "pctl_rank": 72.3, "sample": 9}
 
 
 @dataclass

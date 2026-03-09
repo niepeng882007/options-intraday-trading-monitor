@@ -18,9 +18,10 @@ from src.hk import FilterResult, GammaWallResult, VolumeProfileResult
 from src.hk.gamma_wall import calculate_gamma_wall, format_gamma_wall_message
 from src.us_playbook import KeyLevels, USPlaybookResult, USRegimeResult, USRegimeType
 from src.us_playbook.filter import check_us_filters
-from src.us_playbook.indicators import calculate_us_rvol, calculate_vwap
+from src.us_playbook.indicators import calculate_us_rvol, calculate_vwap, compute_rvol_profile
 from src.us_playbook.levels import (
     build_key_levels,
+    calc_fetch_calendar_days,
     compute_volume_profile,
     extract_previous_day_hl,
     get_history_bars,
@@ -138,19 +139,23 @@ class USPlaybook:
         regime_cfg = cfg.get("regime", {})
         filter_cfg = cfg.get("filters", {})
 
-        # 1. Fetch history bars
-        lookback = vp_cfg.get("lookback_days", 3)
-        bars = await self._collector.get_history_bars(symbol, days=lookback + 2)
+        # 1. Fetch history bars (wide window covers both VP and RVOL)
+        vp_target = vp_cfg.get("lookback_trading_days") or vp_cfg.get("lookback_days", 5)
+        min_td = vp_cfg.get("min_trading_days", 3)
+        rvol_td = rvol_cfg.get("lookback_days", 10)
+        fetch_days = calc_fetch_calendar_days(vp_target, rvol_td)
+        bars = await self._collector.get_history_bars(symbol, days=fetch_days)
         if bars.empty:
             logger.warning("No bars for %s, skipping", symbol)
             return None
 
-        # 2. Split today vs history
-        history = get_history_bars(bars)
+        # 2. Split today vs history — VP uses truncated, RVOL uses full
+        history_all = get_history_bars(bars)
+        vp_history = get_history_bars(bars, max_trading_days=vp_target)
         today = get_today_bars(bars)
 
-        # 3. Volume Profile
-        vp = compute_volume_profile(history, value_area_pct=vp_cfg.get("value_area_pct", 0.70))
+        # 3. Volume Profile (with trading_days populated)
+        vp = compute_volume_profile(vp_history, value_area_pct=vp_cfg.get("value_area_pct", 0.70))
 
         # 4. PDH/PDL
         pdh, pdl = extract_previous_day_hl(bars)
@@ -158,10 +163,10 @@ class USPlaybook:
         # 5. Pre-market HL
         pmh, pml = await self._collector.get_premarket_hl(symbol)
 
-        # 6. VWAP + RVOL
+        # 6. VWAP + RVOL (RVOL uses full history for better coverage)
         vwap = calculate_vwap(today)
         rvol = calculate_us_rvol(
-            today, history,
+            today, history_all,
             skip_open_minutes=rvol_cfg.get("skip_open_minutes", 3),
             lookback_days=rvol_cfg.get("lookback_days", 10),
         )
@@ -204,7 +209,24 @@ class USPlaybook:
             inside_day_rvol_threshold=filter_cfg.get("inside_day_rvol_threshold", 0.8),
         )
 
-        # 10. Regime classification
+        # 10. Adaptive RVOL profile
+        adaptive_cfg = regime_cfg.get("adaptive", {})
+        rvol_profile = None
+        if adaptive_cfg.get("enabled", True):
+            rvol_profile = compute_rvol_profile(
+                history_bars=history_all,
+                today_rvol=rvol,
+                skip_open_minutes=rvol_cfg.get("skip_open_minutes", 3),
+                gap_and_go_pctl=adaptive_cfg.get("gap_and_go_percentile", 85),
+                trend_day_pctl=adaptive_cfg.get("trend_day_percentile", 60),
+                fade_chop_pctl=adaptive_cfg.get("fade_chop_percentile", 30),
+                fallback_gap_and_go=regime_cfg.get("gap_and_go_rvol", 1.5),
+                fallback_trend_day=regime_cfg.get("trend_day_rvol", 1.2),
+                fallback_fade_chop=regime_cfg.get("fade_chop_rvol", 1.0),
+                min_sample_days=adaptive_cfg.get("min_sample_days", 5),
+            )
+
+        # 11. Regime classification (with VP data quality + adaptive thresholds)
         regime = classify_us_regime(
             price=price,
             prev_close=prev_close,
@@ -217,12 +239,16 @@ class USPlaybook:
             gap_and_go_rvol=regime_cfg.get("gap_and_go_rvol", 1.5),
             trend_day_rvol=regime_cfg.get("trend_day_rvol", 1.2),
             fade_chop_rvol=regime_cfg.get("fade_chop_rvol", 1.0),
+            vp_trading_days=vp.trading_days,
+            min_vp_trading_days=min_td,
+            rvol_profile=rvol_profile,
+            gap_significance_threshold=adaptive_cfg.get("gap_significance_threshold", 0.3),
         )
 
-        # 11. Build key levels
+        # 12. Build key levels
         key_levels = build_key_levels(vp, pdh, pdl, pmh, pml, vwap, gamma_wall)
 
-        # 12. Strategy text
+        # 13. Strategy text
         strategy_text = REGIME_STRATEGY.get(regime.regime, "")
 
         return USPlaybookResult(

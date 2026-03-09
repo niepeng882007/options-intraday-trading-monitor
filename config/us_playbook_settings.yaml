@@ -9,18 +9,26 @@ watchlist:
   - {symbol: AMZN, name: Amazon}
 
 volume_profile:
-  lookback_days: 3
+  lookback_trading_days: 5
   value_area_pct: 0.70
+  min_trading_days: 3
 
 rvol:
   skip_open_minutes: 3
   lookback_days: 10
 
 regime:
-  gap_and_go_rvol: 1.5
+  gap_and_go_rvol: 1.5        # static fallback
   trend_day_rvol: 1.2
   fade_chop_rvol: 1.0
   market_context_symbols: [SPY, QQQ]
+  adaptive:
+    enabled: true
+    gap_and_go_percentile: 85
+    trend_day_percentile: 60
+    fade_chop_percentile: 30
+    min_sample_days: 5
+    gap_significance_threshold: 0.3
 
 playbook:
   push_times: ["09:45", "10:15"]

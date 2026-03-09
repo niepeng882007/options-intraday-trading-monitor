@@ -94,7 +94,11 @@ def format_us_playbook_message(
         f"🎯 <b>{result.symbol}</b> — {emoji} {regime_cn} "
         f"(置信度 {conf_bar} {r.confidence:.0%})"
     )
-    lines.append(f"RVOL: {r.rvol:.2f} | Gap: {r.gap_pct:+.2f}%")
+    rvol_line = f"RVOL: {r.rvol:.2f} | Gap: {r.gap_pct:+.2f}%"
+    if r.adaptive_thresholds:
+        at = r.adaptive_thresholds
+        rvol_line += f" | 自适应 P{at.get('sample', '?')}d={at.get('gap_and_go', '?'):.2f} (rank {at.get('pctl_rank', 0):.0f}%)"
+    lines.append(rvol_line)
     lines.append("")
 
     # Section 3: Key levels (sorted descending by price)
@@ -105,6 +109,12 @@ def format_us_playbook_message(
         marker = " ← current" if annotation == "current" else ""
         oi_note = f" {annotation}" if annotation and annotation != "current" else ""
         lines.append(f"  {name:15s} {val:>10,.2f}{marker}{oi_note}")
+
+    # VP thin data warning
+    vp_td = result.volume_profile.trading_days
+    if 0 < vp_td < 3:
+        lines.append(f"  ⚠️ VP 仅 {vp_td} 天数据，VAH/VAL 参考性降低")
+
     lines.append("")
 
     # Section 4: Strategy advice

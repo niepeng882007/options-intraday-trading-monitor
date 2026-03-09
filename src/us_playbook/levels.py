@@ -53,12 +53,18 @@ def get_today_bars(bars: pd.DataFrame) -> pd.DataFrame:
     return bars[bars.index.date == today]
 
 
-def get_history_bars(bars: pd.DataFrame) -> pd.DataFrame:
-    """Extract non-today bars (for VP calculation)."""
+def get_history_bars(bars: pd.DataFrame, max_trading_days: int = 0) -> pd.DataFrame:
+    """Extract non-today bars. If max_trading_days > 0, keep only most recent N trading days."""
     if bars.empty:
         return bars
     today = bars.index[-1].date()
-    return bars[bars.index.date != today]
+    history = bars[bars.index.date != today]
+    if max_trading_days > 0 and not history.empty:
+        trading_dates = sorted(set(history.index.date))
+        if len(trading_dates) > max_trading_days:
+            cutoff = trading_dates[-max_trading_days]
+            history = history[history.index.date >= cutoff]
+    return history
 
 
 def compute_volume_profile(
@@ -71,7 +77,22 @@ def compute_volume_profile(
 
     avg_price = history_bars["Close"].mean()
     tick = us_tick_size(avg_price)
-    return calculate_volume_profile(history_bars, value_area_pct=value_area_pct, tick_size=tick)
+    result = calculate_volume_profile(history_bars, value_area_pct=value_area_pct, tick_size=tick)
+
+    # Populate trading_days from actual bar data
+    if not history_bars.empty:
+        result.trading_days = len(set(history_bars.index.date))
+
+    return result
+
+
+def calc_fetch_calendar_days(vp_trading_days: int, rvol_lookback_days: int) -> int:
+    """Calculate calendar days to fetch from Futu to cover both VP and RVOL needs.
+
+    Uses generous buffer (target * 2 + 2) to handle weekends + holidays.
+    """
+    target = max(vp_trading_days, rvol_lookback_days)
+    return target * 2 + 2
 
 
 def build_key_levels(
