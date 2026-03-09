@@ -1,8 +1,10 @@
 # Options Intraday Trading Monitor
 
-美股期权日内交易实时监控与智能通知系统
+美股 & 港股期权日内交易实时监控与智能通知系统
 
 ## 功能
+
+### 美股监控 (`src/main.py`)
 
 - **数据采集**: 支持 Futu OpenD（主力，毫秒级推送）和 Yahoo Finance（备用）双数据源，获取股票报价、期权链、分钟级 K 线
 - **指标计算**: RSI / MACD / EMA / VWAP / ATR / ADX / Bollinger Bands，支持 1m、5m、15m 时间框架
@@ -13,6 +15,18 @@
 - **市场环境过滤**: SPY 日跌幅限制、ADX 趋势强度过滤、午间禁交易时段、每日亏损熔断
 - **双轨策略体系**: 6 个左侧埋伏策略 + 4 个右侧突破策略（10 个策略，8 活跃 + 2 禁用）
 - **回测框架**: 基于历史数据验证策略参数，输出胜率、盈亏比、利润因子、权益曲线
+
+### 港股预测 (`src/hk/`)
+
+与美股完全解耦的独立模块，面向恒指/恒科期权日内交易。
+
+- **Volume Profile**: 基于 3-5 天 1m K 线计算 POC/VAH/VAL 关键点位
+- **VWAP & RVOL**: 日内 VWAP（跨午休连续计算）、相对成交量（按早午盘分 session 对比）
+- **Regime 分类**: 4 种市场风格 — 单边突破(A) / 区间震荡(B) / 高波洗盘(C) / 不明确(D)
+- **Playbook 推送**: 每日 09:35 / 10:05 / 13:05 HKT 三次 Telegram 推送交易剧本
+- **Gamma Wall**: 期权链 OI 分析，计算 Call Wall / Put Wall / Max Pain（仅 HSI/HSTECH 指数）
+- **LV2 盘口监控**: 十档盘口异常大单检测，实时告警
+- **交易过滤器**: 经济日历、Inside Day、IV+RVOL 错配、最低成交额、末日期权风险
 
 ## 快速开始
 
@@ -34,7 +48,12 @@ docker compose logs -f monitor
 
 ```bash
 pip install -r requirements.txt
+
+# 启动美股监控
 python -m src.main
+
+# 启动港股预测（独立运行）
+python -m src.hk
 ```
 
 ### 4. 运行测试
@@ -44,17 +63,28 @@ pip install pytest
 pytest tests/ -v
 ```
 
-### 5. 运行回测
+### 5. 运行回测（美股）
 
 ```bash
 python -m src.backtest --all -d 5 -v
 ```
 
+### 6. HK 数据验证
+
+```bash
+# 验证 Futu API 对港股数据的可用性（需 FutuOpenD 运行中）
+python scripts/hk_data_probe.py
+```
+
 ## 策略配置
 
-在 `config/strategies/` 下创建 YAML 文件即可添加策略，支持热更新。
+在 `config/strategies/` 下创建 YAML 文件即可添加美股策略，支持热更新。
+
+港股预测配置在 `config/hk_settings.yaml`（watchlist、regime 阈值、推送时间、simulation 参数）和 `config/hk_calendar.yaml`（经济日历）。`simulation` 配置块包含 TP/SL/滑点、退出模式（fixed/trailing/both）、排除标的和信号过滤。
 
 ## Telegram Bot 命令
+
+### 美股
 
 | 命令 | 功能 |
 |------|------|
@@ -69,3 +99,41 @@ python -m src.backtest --all -d 5 -v
 | `/confirm <signal_id> <price>` | 确认建仓 |
 | `/test` | 发送测试入场/出场提醒，验证推送链路 |
 | `/skip <signal_id>` | 跳过信号 |
+
+### 港股
+
+| 命令 | 功能 |
+|------|------|
+| `/hk` | HK 市场状态快照 |
+| `/hk_playbook [symbol]` | 手动生成今日 Playbook |
+| `/hk_orderbook [symbol]` | LV2 盘口快照 |
+| `/hk_gamma [symbol]` | Gamma Wall（仅指数） |
+| `/hk_levels [symbol]` | 关键点位 (POC/VAH/VAL/VWAP) |
+| `/hk_regime [symbol]` | 当前 Regime 分类与置信度 |
+| `/hk_quote <symbol>` | 单个标的详细报价 (OHLC/成交量/买卖盘) |
+| `/hk_filters [symbol]` | 交易过滤状态与风险等级 |
+| `/hk_watchlist` | 全部监控标的行情总览 |
+| `/hk_help` | HK 指令列表 |
+
+### HK 回测
+
+```bash
+# 基础回测（30 天，含交易模拟）
+python -m src.hk.backtest -d 30
+
+# 指定标的、排除低胜率标的
+python -m src.hk.backtest -d 30 --exclude HK.800000 HK.00941
+
+# 自定义退出模式（fixed / trailing / both）
+python -m src.hk.backtest -d 30 --exit-mode trailing --trail-activation 0.5 --trail-pct 0.3
+
+# 对比不同滑点参数
+python -m src.hk.backtest -d 30 --slippage 0.2   # 旧参数
+python -m src.hk.backtest -d 30 --slippage 0.05  # 优化后
+
+# 仅评估 VP 点位和 Regime，不模拟交易
+python -m src.hk.backtest -d 20 --no-sim
+
+# JSON/CSV 输出、详细交易日志
+python -m src.hk.backtest -d 30 -o json -v
+```

@@ -32,6 +32,7 @@ logs/
 # 数据缓存
 data/cache/
 data/backtest_cache/
+data/hk_backtest_cache/
 *.pkl
 
 # 数据库文件（运行时生成）
