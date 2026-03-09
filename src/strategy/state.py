@@ -26,6 +26,7 @@ class PositionInfo:
     entry_timestamp: float = 0.0
     contract_symbol: str = ""
     highest_price: float = 0.0
+    lowest_price: float = 0.0
 
 
 @dataclass
@@ -48,6 +49,7 @@ class StateEntry:
                 "entry_timestamp": self.position.entry_timestamp,
                 "contract_symbol": self.position.contract_symbol,
                 "highest_price": self.position.highest_price,
+                "lowest_price": self.position.lowest_price,
             },
             "triggered_at": self.triggered_at,
             "signal_id": self.signal_id,
@@ -66,6 +68,7 @@ class StateEntry:
                 entry_timestamp=pos_data.get("entry_timestamp", 0.0),
                 contract_symbol=pos_data.get("contract_symbol", ""),
                 highest_price=pos_data.get("highest_price", 0.0),
+                lowest_price=pos_data.get("lowest_price", 0.0),
             ),
             triggered_at=data.get("triggered_at", 0.0),
             signal_id=data.get("signal_id", ""),
@@ -137,6 +140,7 @@ class StrategyStateManager:
             entry_timestamp=time.time(),
             contract_symbol=contract_symbol,
             highest_price=entry_price,
+            lowest_price=entry_price,
         )
         logger.info(
             "Entry confirmed: %s:%s @ $%.2f",
@@ -178,8 +182,11 @@ class StrategyStateManager:
 
     def update_highest_price(self, strategy_id: str, symbol: str, price: float) -> None:
         entry = self.get_state(strategy_id, symbol)
-        if entry.state == StrategyState.HOLDING and price > entry.position.highest_price:
-            entry.position.highest_price = price
+        if entry.state == StrategyState.HOLDING:
+            if price > entry.position.highest_price:
+                entry.position.highest_price = price
+            if price < entry.position.lowest_price:
+                entry.position.lowest_price = price
 
     # ── Timeout handling ──
 

@@ -61,12 +61,21 @@ INDICATOR_FIELD_MAP = {
         "lower": "bb_lower",
         "width_pct": "bb_width_pct",
         "width_percentile": "bb_width_percentile",
+        "middle": "bb_middle",
+        "pct_b": "bb_pct_b",
+        "width_expansion": "bb_width_expansion",
+    },
+    "STOCHASTIC": {
+        "k": "stoch_k",
+        "d": "stoch_d",
     },
     "ADX": {"value": "adx"},
     "CANDLE": {
         "body_pct": "candle_body_pct",
         "range_pct": "candle_range_pct",
         "spread_pct": "candle_range_pct",
+        "upper_shadow_pct": "upper_shadow_pct",
+        "lower_shadow_pct": "lower_shadow_pct",
     },
     "PRICE": {
         "close": "close",
@@ -78,6 +87,8 @@ INDICATOR_FIELD_MAP = {
         "vwap_distance_pct": "vwap_distance_pct",
         "abs_vwap_distance_pct": "abs_vwap_distance_pct",
         "prev_bar_high": "prev_bar_high",
+        "prev_bar_close": "prev_bar_close",
+        "prev_bar_low": "prev_bar_low",
         "volume_ratio": "volume_ratio",
         "volume_spike": "volume_spike",
         "range_percentile": "range_percentile",
@@ -146,6 +157,10 @@ class RuleMatcher:
 
         if operator == "AND":
             triggered = all(r[0] for r in results)
+        elif operator == "MIN_MATCH":
+            min_count = entry.get("min_count", len(rules))
+            passed_count = sum(1 for r in results if r[0])
+            triggered = passed_count >= min_count
         else:
             triggered = any(r[0] for r in results)
 
@@ -176,12 +191,16 @@ class RuleMatcher:
         entry_price: float,
         minutes_to_close: int,
         highest_price: float | None = None,
+        lowest_price: float | None = None,
+        direction: str = "call",
+        indicators_by_tf: dict[str, IndicatorResult | None] | None = None,
     ) -> Signal | None:
         exit_conds = strategy.exit_conditions
         if not exit_conds or not exit_conds.get("rules"):
             return None
 
-        pnl_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0.0
+        raw_pnl_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0.0
+        pnl_pct = -raw_pnl_pct if direction == "put" else raw_pnl_pct
 
         for rule in exit_conds["rules"]:
             rule_type = rule.get("type", "")
@@ -219,25 +238,57 @@ class RuleMatcher:
                         priority="medium",
                     )
 
+            if rule_type == "indicator_target" and indicators_by_tf is not None:
+                tf = rule.get("timeframe", "15m")
+                ind = indicators_by_tf.get(tf)
+                if ind is not None:
+                    ind_name = rule.get("indicator", "")
+                    ind_field = rule.get("field", "")
+                    target_value = _get_indicator_value(ind, ind_name, ind_field)
+                    if target_value is not None:
+                        hit = False
+                        if direction == "call" and current_price >= target_value:
+                            hit = True
+                        elif direction == "put" and current_price <= target_value:
+                            hit = True
+                        if hit:
+                            return Signal(
+                                strategy_id=strategy.strategy_id,
+                                strategy_name=strategy.name,
+                                signal_type="exit",
+                                symbol=symbol,
+                                exit_reason=(
+                                    f"指标止盈: 到达 {ind_name}.{ind_field} "
+                                    f"({target_value:.2f})"
+                                ),
+                                priority="medium",
+                            )
+
             if rule_type == "trailing_stop":
                 activation_pct = rule.get("activation_pct", 0.50)
                 trail_pct = rule.get("trail_pct", 0.20)
-                hp = highest_price if highest_price is not None else current_price
-                peak_pnl = (hp - entry_price) / entry_price if entry_price > 0 else 0.0
-                if peak_pnl >= activation_pct:
+
+                if direction == "put":
+                    lp = lowest_price if lowest_price and lowest_price > 0 else current_price
+                    peak_pnl = (entry_price - lp) / entry_price if entry_price > 0 else 0.0
+                    drawdown_from_peak = (current_price - lp) / lp if lp > 0 else 0.0
+                else:
+                    hp = highest_price if highest_price is not None else current_price
+                    peak_pnl = (hp - entry_price) / entry_price if entry_price > 0 else 0.0
                     drawdown_from_peak = (hp - current_price) / hp if hp > 0 else 0.0
-                    if drawdown_from_peak >= trail_pct:
-                        return Signal(
-                            strategy_id=strategy.strategy_id,
-                            strategy_name=strategy.name,
-                            signal_type="exit",
-                            symbol=symbol,
-                            exit_reason=(
-                                f"追踪止盈 (峰值收益={peak_pnl:+.1%}, "
-                                f"回撤={drawdown_from_peak:.1%})"
-                            ),
-                            priority="medium",
-                        )
+
+                if peak_pnl >= activation_pct and drawdown_from_peak >= trail_pct:
+                    return Signal(
+                        strategy_id=strategy.strategy_id,
+                        strategy_name=strategy.name,
+                        signal_type="exit",
+                        symbol=symbol,
+                        exit_reason=(
+                            f"追踪止盈 (峰值收益={peak_pnl:+.1%}, "
+                            f"回撤={drawdown_from_peak:.1%})"
+                        ),
+                        priority="medium",
+                    )
 
         return None
 
@@ -273,10 +324,19 @@ class RuleMatcher:
 
         if sub_operator == "AND":
             triggered = all(r[0] for r in results)
+        elif sub_operator == "MIN_MATCH":
+            min_count = group.get("min_count", len(sub_rules))
+            passed_count = sum(1 for r in results if r[0])
+            triggered = passed_count >= min_count
         else:
             triggered = any(r[0] for r in results)
 
-        group_detail = f"[{sub_operator}: {' | '.join(r[1] for r in results)}]"
+        if sub_operator == "MIN_MATCH":
+            min_count = group.get("min_count", len(sub_rules))
+            passed_count = sum(1 for r in results if r[0])
+            group_detail = f"[MIN_MATCH {passed_count}/{min_count}: {' | '.join(r[1] for r in results)}]"
+        else:
+            group_detail = f"[{sub_operator}: {' | '.join(r[1] for r in results)}]"
         return triggered, f"{'✅' if triggered else '❌'} {group_detail}"
 
     def _evaluate_rule(
@@ -447,16 +507,19 @@ class RuleMatcher:
         if ind is None:
             return EntryQuality(score=50, grade="C", reasons=["指标数据不足"])
 
-        score = 100
+        score = filters.get("base_score", 100)
         reasons: list[str] = []
 
         score = self._quality_vwap_proximity(filters, ind, score, reasons)
         score = self._quality_volume(filters, ind, score, reasons)
         score = self._quality_candle_body(filters, ind, score, reasons)
         score = self._quality_bb_width(filters, ind, score, reasons)
+        score = self._quality_bb_pct_b(filters, ind, score, reasons)
         score = self._quality_ema200_position(filters, ind, score, reasons)
         score = self._quality_rsi_extreme(filters, ind_15m or ind, score, reasons)
         score = self._quality_vwap_deviation(filters, ind, score, reasons)
+        score = self._quality_adx_environment(filters, ind_15m or ind, score, reasons)
+        score = self._quality_reversal_strength(filters, ind, ind_15m, score, reasons)
 
         score = self._quality_time_of_day(strategy, score, reasons)
 
@@ -567,6 +630,26 @@ class RuleMatcher:
         return score
 
     @staticmethod
+    def _quality_bb_pct_b(
+        filters: dict, ind: IndicatorResult, score: int, reasons: list[str]
+    ) -> int:
+        """Reward extreme %B values (deep piercing of BB band)."""
+        if not filters.get("prefer_extreme_pct_b"):
+            return score
+        if ind.bb_pct_b is None:
+            return score
+        # %B < 0 or > 1 means outside bands — more extreme = better for reversion
+        extremity = max(0.0, -ind.bb_pct_b, ind.bb_pct_b - 1.0)
+        if extremity > 0.1:
+            bonus = min(15, int(extremity * 50))
+            score += bonus
+            reasons.append(f"BB %B极端 ={ind.bb_pct_b:.2f} ✓")
+        elif 0 <= ind.bb_pct_b <= 1:
+            score -= 5
+            reasons.append(f"BB %B在通道内 ={ind.bb_pct_b:.2f}")
+        return score
+
+    @staticmethod
     def _quality_ema200_position(
         filters: dict, ind: IndicatorResult, score: int, reasons: list[str]
     ) -> int:
@@ -642,6 +725,55 @@ class RuleMatcher:
         elif t >= 945:  # after 15:45
             score -= 20
             reasons.append("尾盘0DTE时间价值急剧衰减 (-20)")
+        return score
+
+    @staticmethod
+    def _quality_adx_environment(
+        filters: dict, ind: IndicatorResult, score: int, reasons: list[str]
+    ) -> int:
+        """Reward low ADX (range-bound, good for mean reversion); penalize trending."""
+        if not filters.get("prefer_low_adx"):
+            return score
+        if ind.adx is None:
+            return score
+        max_adx = filters.get("ideal_max_adx", 25)
+        if ind.adx < max_adx:
+            bonus = min(15, int((max_adx - ind.adx) / max_adx * 15))
+            score += bonus
+            reasons.append(f"ADX低(震荡) ={ind.adx:.1f} +{bonus}")
+        elif ind.adx < 35:
+            score -= 5
+            reasons.append(f"ADX中等 ={ind.adx:.1f} -5")
+        else:
+            penalty = min(20, int((ind.adx - 35) / 5 * 5))
+            score -= penalty
+            reasons.append(f"ADX高(趋势强) ={ind.adx:.1f} -{penalty}")
+        return score
+
+    @staticmethod
+    def _quality_reversal_strength(
+        filters: dict, ind: IndicatorResult, ind_15m: IndicatorResult | None,
+        score: int, reasons: list[str],
+    ) -> int:
+        """Score reversal strength: how far price recovered from BB band piercing."""
+        if not filters.get("prefer_reversal_strength"):
+            return score
+        target = ind_15m or ind
+        if target is None or target.bb_pct_b is None:
+            return score
+        pct_b = target.bb_pct_b
+        # For call (lower band piercing): %B closer to 0.5 = stronger reversal
+        # For put (upper band piercing): %B closer to 0.5 = stronger reversal
+        # Measure distance from midpoint (0.5)
+        distance_from_mid = abs(pct_b - 0.5)
+        if distance_from_mid < 0.3:
+            bonus = min(10, int((0.5 - distance_from_mid) * 20))
+            score += bonus
+            reasons.append(f"回扑力度强 %B={pct_b:.2f} +{bonus}")
+        elif distance_from_mid > 0.6:
+            penalty = min(10, int((distance_from_mid - 0.6) * 15))
+            score -= penalty
+            reasons.append(f"回扑力度弱 %B={pct_b:.2f} -{penalty}")
         return score
 
     @staticmethod
