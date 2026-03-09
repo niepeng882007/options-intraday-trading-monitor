@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
+
+import yaml
 
 from src.backtest.data_loader import DataLoader
 from src.backtest.engine import BacktestEngine
@@ -10,6 +13,21 @@ from src.strategy.loader import StrategyLoader
 from src.utils.logger import setup_logger
 
 logger = setup_logger("backtest_cli")
+
+
+def _load_settings(settings_path: str = "config/settings.yaml") -> dict:
+    """Load full settings from settings.yaml."""
+    path = Path(settings_path)
+    if not path.exists():
+        logger.warning("Settings file not found: %s, using defaults", settings_path)
+        return {}
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _load_risk_config(settings_path: str = "config/settings.yaml") -> dict:
+    """Load risk management config from settings.yaml."""
+    return _load_settings(settings_path).get("risk_management", {})
 
 
 def main() -> None:
@@ -25,6 +43,10 @@ def main() -> None:
     parser.add_argument("-v", "--verbose", action="store_true", help="Print trade log")
     parser.add_argument("-o", "--output", choices=["table", "csv", "json"], default="table")
     parser.add_argument("--strategies-dir", default="config/strategies")
+    parser.add_argument("--data-source", choices=["futu", "yahoo"], default=None,
+                        help="Data source (default: from settings.yaml or futu)")
+    parser.add_argument("--futu-host", help="FutuOpenD host (overrides settings.yaml)")
+    parser.add_argument("--futu-port", type=int, help="FutuOpenD port (overrides settings.yaml)")
 
     args = parser.parse_args()
 
@@ -63,8 +85,14 @@ def main() -> None:
     print(f"Strategies: {', '.join(s.strategy_id for s in strategies)}")
     print(f"Symbols: {', '.join(symbols)}")
 
+    # Resolve data source and Futu config from settings.yaml + CLI overrides
+    settings = _load_settings()
+    futu_cfg = settings.get("futu", {})
+    data_source = args.data_source or settings.get("data_source", "futu")
+    futu_host = args.futu_host or futu_cfg.get("host", "127.0.0.1")
+    futu_port = args.futu_port or futu_cfg.get("port", 11111)
+
     # Load data
-    data_loader = DataLoader()
     load_kwargs = {}
     if args.start_date and args.end_date:
         load_kwargs["start_date"] = args.start_date
@@ -72,13 +100,34 @@ def main() -> None:
     else:
         load_kwargs["days"] = args.days
 
-    bars = data_loader.load_all(symbols, strategies=strategies, **load_kwargs)
+    with DataLoader(
+        data_source=data_source, futu_host=futu_host, futu_port=futu_port
+    ) as data_loader:
+        bars = data_loader.load_all(symbols, strategies=strategies, **load_kwargs)
+
     if not bars:
         print("Failed to load market data.")
         sys.exit(1)
 
+    # Load risk management config from settings.yaml
+    risk_cfg = settings.get("risk_management", {})
+    midday_cfg = risk_cfg.get("midday_no_trade", {})
+    midday_no_trade = midday_cfg.get("enabled", True)
+    midday_start_str = midday_cfg.get("start", "11:00")
+    midday_end_str = midday_cfg.get("end", "13:00")
+    sh, sm = map(int, midday_start_str.split(":"))
+    eh, em = map(int, midday_end_str.split(":"))
+    max_daily_loss_pct = risk_cfg.get("max_daily_loss_pct", -1.5)
+
     # Run backtest
-    engine = BacktestEngine(strategies, list(bars.keys()))
+    engine = BacktestEngine(
+        strategies,
+        list(bars.keys()),
+        midday_no_trade=midday_no_trade,
+        midday_start=sh * 60 + sm,
+        midday_end=eh * 60 + em,
+        max_daily_loss_pct=max_daily_loss_pct,
+    )
     result = engine.run(bars)
 
     # Build period string

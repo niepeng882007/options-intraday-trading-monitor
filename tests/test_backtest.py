@@ -6,7 +6,9 @@ import pytest
 
 from src.backtest.engine import BacktestEngine
 from src.backtest.trade_tracker import BacktestResult, Trade, TradeTracker
-from src.strategy.loader import StrategyConfig
+from src.indicator.engine import IndicatorResult
+from src.strategy.loader import StrategyConfig, load_strategy_file
+from src.strategy.matcher import RuleMatcher
 
 ET = timezone(timedelta(hours=-5))
 
@@ -324,3 +326,389 @@ class TestBacktestEngine:
         engine = BacktestEngine([s1, s2], ["SPY"])
         result = engine.run({"SPY": bars})
         assert isinstance(result, BacktestResult)
+
+
+# ── Fix B: New tests for intra-bar, PUT exit, trailing stop, cooldown ──
+
+ALWAYS_ENTRY_CALL = {
+    "strategy_id": "test-always-call",
+    "name": "Always Entry Call",
+    "enabled": True,
+    "watchlist": {
+        "underlyings": ["SPY"],
+        "option_filter": {"type": "call"},
+    },
+    "entry_conditions": {
+        "operator": "AND",
+        "rules": [
+            {
+                "indicator": "RSI",
+                "field": "value",
+                "comparator": "<",
+                "threshold": 100,
+                "timeframe": "1m",
+            },
+        ],
+    },
+    "exit_conditions": {
+        "operator": "OR",
+        "rules": [
+            {"type": "take_profit_pct", "threshold": 0.005},
+            {"type": "stop_loss_pct", "threshold": -0.003},
+        ],
+    },
+}
+
+
+class TestIntraBarEntry:
+    def test_intra_bar_entry_triggers(self):
+        """Intra-bar simulation should produce trades via partial-candle indicators."""
+        # Use a strategy that always enters (RSI < 100)
+        strategy = StrategyConfig(ALWAYS_ENTRY_CALL)
+        bars = _make_bars(300, base_price=500.0)
+        engine = BacktestEngine([strategy], ["SPY"], midday_no_trade=False)
+        result = engine.run({"SPY": bars})
+        # With intra-bar simulation + always-true entry, we expect trades
+        assert result.total_trades > 0
+
+
+class TestPutExitDirection:
+    def test_put_take_profit_on_price_drop(self):
+        """PUT: stock price drop should trigger take-profit (positive pnl)."""
+        strategy = StrategyConfig(SIMPLE_PUT_STRATEGY)
+        matcher = RuleMatcher()
+        # Entry at $500, stock drops to $495 → +1% for PUT
+        signal = matcher.evaluate_exit(
+            strategy, "SPY",
+            current_price=495.0,
+            entry_price=500.0,
+            minutes_to_close=120,
+            direction="put",
+        )
+        assert signal is not None
+        assert "止盈" in signal.exit_reason
+
+    def test_put_stop_loss_on_price_rise(self):
+        """PUT: stock price rise should trigger stop-loss (negative pnl)."""
+        strategy = StrategyConfig(SIMPLE_PUT_STRATEGY)
+        matcher = RuleMatcher()
+        # Entry at $500, stock rises to $502 → -0.4% for PUT (exceeds -0.3% SL)
+        signal = matcher.evaluate_exit(
+            strategy, "SPY",
+            current_price=502.0,
+            entry_price=500.0,
+            minutes_to_close=120,
+            direction="put",
+        )
+        assert signal is not None
+        assert "止损" in signal.exit_reason
+
+    def test_call_take_profit_on_price_rise(self):
+        """CALL: stock price rise should trigger take-profit (sanity check)."""
+        strategy = StrategyConfig(SIMPLE_CALL_STRATEGY)
+        matcher = RuleMatcher()
+        signal = matcher.evaluate_exit(
+            strategy, "SPY",
+            current_price=505.0,
+            entry_price=500.0,
+            minutes_to_close=120,
+            direction="call",
+        )
+        assert signal is not None
+        assert "止盈" in signal.exit_reason
+
+
+class TestPutTrailingStop:
+    def _make_trailing_put_strategy(self):
+        return StrategyConfig({
+            "strategy_id": "test-trailing-put",
+            "name": "Trailing Put",
+            "enabled": True,
+            "watchlist": {
+                "underlyings": ["SPY"],
+                "option_filter": {"type": "put"},
+            },
+            "entry_conditions": {
+                "operator": "AND",
+                "rules": [
+                    {"indicator": "RSI", "field": "value", "comparator": ">",
+                     "threshold": 50, "timeframe": "1m"},
+                ],
+            },
+            "exit_conditions": {
+                "operator": "OR",
+                "rules": [
+                    {"type": "trailing_stop", "activation_pct": 0.01,
+                     "trail_pct": 0.005},
+                ],
+            },
+        })
+
+    def test_put_trailing_stop_triggers(self):
+        """PUT trailing stop: price drops (profit), then bounces → should trigger."""
+        strategy = self._make_trailing_put_strategy()
+        matcher = RuleMatcher()
+        # Entry $500, lowest $490 (PUT profit 2%), current $495 (bounce from low)
+        # peak_pnl = (500-490)/500 = 2% >= 1% activation
+        # drawdown_from_peak = (495-490)/490 ≈ 1.02% >= 0.5% trail
+        signal = matcher.evaluate_exit(
+            strategy, "SPY",
+            current_price=495.0,
+            entry_price=500.0,
+            minutes_to_close=120,
+            lowest_price=490.0,
+            direction="put",
+        )
+        assert signal is not None
+        assert "追踪止盈" in signal.exit_reason
+
+    def test_put_trailing_stop_not_activated(self):
+        """PUT trailing stop: price hasn't dropped enough to activate."""
+        strategy = self._make_trailing_put_strategy()
+        matcher = RuleMatcher()
+        # Entry $500, lowest $499 (PUT profit 0.2%), current $499.5
+        # peak_pnl = (500-499)/500 = 0.2% < 1% activation → no trigger
+        signal = matcher.evaluate_exit(
+            strategy, "SPY",
+            current_price=499.5,
+            entry_price=500.0,
+            minutes_to_close=120,
+            lowest_price=499.0,
+            direction="put",
+        )
+        assert signal is None
+
+
+class TestCooldownPreventsReentry:
+    def test_cooldown_prevents_reentry(self):
+        """Cooldown should prevent same (strategy, symbol) from re-entering too soon."""
+        strat_data = {
+            **ALWAYS_ENTRY_CALL,
+            "strategy_id": "test-cooldown",
+            "notification": {"cooldown_seconds": 600},
+            "exit_conditions": {
+                "operator": "OR",
+                "rules": [
+                    # Very tight stop loss to force quick exit
+                    {"type": "stop_loss_pct", "threshold": -0.0001},
+                ],
+            },
+        }
+        strategy = StrategyConfig(strat_data)
+        bars = _make_bars(300, base_price=500.0)
+        engine = BacktestEngine([strategy], ["SPY"], midday_no_trade=False)
+        result = engine.run({"SPY": bars})
+
+        if result.total_trades >= 2:
+            # Check that entries are at least 600 seconds (10 min) apart
+            entries = sorted(t.entry_time for t in result.trades)
+            for i in range(1, len(entries)):
+                gap = (entries[i] - entries[i - 1]).total_seconds()
+                assert gap >= 600, (
+                    f"Trade {i} re-entered after only {gap}s, cooldown is 600s"
+                )
+
+
+class TestMinMatch:
+    def test_3_of_4_passes(self):
+        """MIN_MATCH with 3/4 required: 3 passing rules should trigger."""
+        matcher = RuleMatcher()
+        strat_data = {
+            "strategy_id": "test-min-match",
+            "name": "Min Match Test",
+            "enabled": True,
+            "watchlist": {"underlyings": ["SPY"], "option_filter": {"type": "call"}},
+            "entry_conditions": {
+                "operator": "MIN_MATCH",
+                "min_count": 3,
+                "rules": [
+                    {"indicator": "RSI", "field": "value", "comparator": "<",
+                     "threshold": 50, "timeframe": "1m"},    # likely passes
+                    {"indicator": "RSI", "field": "value", "comparator": "<",
+                     "threshold": 80, "timeframe": "1m"},    # passes
+                    {"indicator": "RSI", "field": "value", "comparator": "<",
+                     "threshold": 90, "timeframe": "1m"},    # passes
+                    {"indicator": "RSI", "field": "value", "comparator": "<",
+                     "threshold": 5, "timeframe": "1m"},     # fails (RSI unlikely < 5)
+                ],
+            },
+        }
+        strategy = StrategyConfig(strat_data)
+        ind = IndicatorResult(symbol="SPY", timeframe="1m", timestamp=0.0, rsi=40.0)
+        indicators = {"1m": ind, "5m": None, "15m": None}
+        signal = matcher.evaluate_entry(strategy, "SPY", indicators)
+        assert signal is not None
+
+    def test_2_of_4_fails(self):
+        """MIN_MATCH with 3/4 required: only 2 passing should not trigger."""
+        matcher = RuleMatcher()
+        strat_data = {
+            "strategy_id": "test-min-match-fail",
+            "name": "Min Match Fail",
+            "enabled": True,
+            "watchlist": {"underlyings": ["SPY"], "option_filter": {"type": "call"}},
+            "entry_conditions": {
+                "operator": "MIN_MATCH",
+                "min_count": 3,
+                "rules": [
+                    {"indicator": "RSI", "field": "value", "comparator": "<",
+                     "threshold": 80, "timeframe": "1m"},    # passes
+                    {"indicator": "RSI", "field": "value", "comparator": "<",
+                     "threshold": 90, "timeframe": "1m"},    # passes
+                    {"indicator": "RSI", "field": "value", "comparator": "<",
+                     "threshold": 5, "timeframe": "1m"},     # fails
+                    {"indicator": "RSI", "field": "value", "comparator": "<",
+                     "threshold": 3, "timeframe": "1m"},     # fails
+                ],
+            },
+        }
+        strategy = StrategyConfig(strat_data)
+        ind = IndicatorResult(symbol="SPY", timeframe="1m", timestamp=0.0, rsi=40.0)
+        indicators = {"1m": ind, "5m": None, "15m": None}
+        signal = matcher.evaluate_entry(strategy, "SPY", indicators)
+        assert signal is None
+
+
+class TestIndicatorExit:
+    def test_bb_middle_target_call(self):
+        """indicator_target exit: call hits BB middle → take profit."""
+        strat_data = {
+            "strategy_id": "test-ind-exit",
+            "name": "Indicator Exit Test",
+            "enabled": True,
+            "watchlist": {"underlyings": ["SPY"], "option_filter": {"type": "call"}},
+            "entry_conditions": {"operator": "AND", "rules": []},
+            "exit_conditions": {
+                "operator": "OR",
+                "rules": [
+                    {"type": "indicator_target", "indicator": "BOLLINGER",
+                     "field": "middle", "timeframe": "15m"},
+                ],
+            },
+        }
+        strategy = StrategyConfig(strat_data)
+        matcher = RuleMatcher()
+        ind_15m = IndicatorResult(
+            symbol="SPY", timeframe="15m", timestamp=0.0,
+            bb_middle=505.0,
+        )
+        # Price above BB middle → should trigger for call
+        signal = matcher.evaluate_exit(
+            strategy, "SPY",
+            current_price=506.0, entry_price=500.0,
+            minutes_to_close=120, direction="call",
+            indicators_by_tf={"1m": None, "5m": None, "15m": ind_15m},
+        )
+        assert signal is not None
+        assert "指标止盈" in signal.exit_reason
+
+    def test_bb_middle_target_put(self):
+        """indicator_target exit: put price below BB middle → take profit."""
+        strat_data = {
+            "strategy_id": "test-ind-exit-put",
+            "name": "Indicator Exit Put Test",
+            "enabled": True,
+            "watchlist": {"underlyings": ["SPY"], "option_filter": {"type": "put"}},
+            "entry_conditions": {"operator": "AND", "rules": []},
+            "exit_conditions": {
+                "operator": "OR",
+                "rules": [
+                    {"type": "indicator_target", "indicator": "BOLLINGER",
+                     "field": "middle", "timeframe": "15m"},
+                ],
+            },
+        }
+        strategy = StrategyConfig(strat_data)
+        matcher = RuleMatcher()
+        ind_15m = IndicatorResult(
+            symbol="SPY", timeframe="15m", timestamp=0.0,
+            bb_middle=505.0,
+        )
+        # Price below BB middle → should trigger for put
+        signal = matcher.evaluate_exit(
+            strategy, "SPY",
+            current_price=504.0, entry_price=510.0,
+            minutes_to_close=120, direction="put",
+            indicators_by_tf={"1m": None, "5m": None, "15m": ind_15m},
+        )
+        assert signal is not None
+        assert "指标止盈" in signal.exit_reason
+
+    def test_indicator_target_no_trigger(self):
+        """indicator_target exit: price not yet at target → no signal."""
+        strat_data = {
+            "strategy_id": "test-ind-exit-no",
+            "name": "Indicator Exit No Trigger",
+            "enabled": True,
+            "watchlist": {"underlyings": ["SPY"], "option_filter": {"type": "call"}},
+            "entry_conditions": {"operator": "AND", "rules": []},
+            "exit_conditions": {
+                "operator": "OR",
+                "rules": [
+                    {"type": "indicator_target", "indicator": "BOLLINGER",
+                     "field": "middle", "timeframe": "15m"},
+                ],
+            },
+        }
+        strategy = StrategyConfig(strat_data)
+        matcher = RuleMatcher()
+        ind_15m = IndicatorResult(
+            symbol="SPY", timeframe="15m", timestamp=0.0,
+            bb_middle=510.0,
+        )
+        # Price below BB middle → should not trigger for call
+        signal = matcher.evaluate_exit(
+            strategy, "SPY",
+            current_price=505.0, entry_price=500.0,
+            minutes_to_close=120, direction="call",
+            indicators_by_tf={"1m": None, "5m": None, "15m": ind_15m},
+        )
+        assert signal is None
+
+
+class TestMinAdxFilter:
+    """Test min_adx market context filter."""
+
+    def _make_strategy_with_min_adx(self, min_adx: float):
+        return StrategyConfig({
+            **ALWAYS_ENTRY_CALL,
+            "strategy_id": "test-min-adx",
+            "market_context_filters": {"min_adx": min_adx},
+        })
+
+    def test_min_adx_filter_blocks_entry(self):
+        """ADX=20 + min_adx=25 → entry blocked."""
+        strategy = self._make_strategy_with_min_adx(25)
+        engine = BacktestEngine([strategy], ["SPY"], midday_no_trade=False)
+        # Manually test _check_market_context
+        ind = IndicatorResult(symbol="SPY", timeframe="5m", timestamp=0.0, adx=20.0)
+        indicators = {"1m": None, "5m": ind, "15m": None}
+        result = engine._check_market_context(strategy, "SPY", indicators)
+        assert result is False
+
+    def test_min_adx_filter_allows_entry(self):
+        """ADX=30 + min_adx=25 → entry allowed."""
+        strategy = self._make_strategy_with_min_adx(25)
+        engine = BacktestEngine([strategy], ["SPY"], midday_no_trade=False)
+        ind = IndicatorResult(symbol="SPY", timeframe="5m", timestamp=0.0, adx=30.0)
+        indicators = {"1m": None, "5m": ind, "15m": None}
+        result = engine._check_market_context(strategy, "SPY", indicators)
+        assert result is True
+
+
+class TestBBPiercing:
+    def test_yaml_loads_call(self):
+        """Verify call YAML loads without errors."""
+        config = load_strategy_file("config/strategies/bb_piercing_reversion_call.yaml")
+        assert config is not None
+        assert config.strategy_id == "bb-piercing-reversion-call"
+        assert config.option_filter.get("type") == "call"
+        assert config.enabled is True
+
+    def test_yaml_loads_put(self):
+        """Verify put YAML loads without errors."""
+        config = load_strategy_file("config/strategies/bb_piercing_reversion_put.yaml")
+        assert config is not None
+        assert config.strategy_id == "bb-piercing-reversion-put"
+        assert config.option_filter.get("type") == "put"
+        assert config.enabled is True

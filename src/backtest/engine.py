@@ -19,20 +19,20 @@ ET = timezone(timedelta(hours=-5))
 class BacktestEngine:
     """Replays historical bars through the live pipeline to simulate trading."""
 
-    # Default midday no-trade window (11:00-13:00 ET)
-    MIDDAY_START = 11 * 60  # 11:00
-    MIDDAY_END = 13 * 60    # 13:00
-
     def __init__(
         self,
         strategies: list[StrategyConfig],
         symbols: list[str] | None = None,
         midday_no_trade: bool = True,
+        midday_start: int = 11 * 60,
+        midday_end: int = 13 * 60,
         max_daily_loss_pct: float | None = -1.5,
     ) -> None:
         self.strategies = strategies
         self.symbols = symbols or self._collect_symbols(strategies)
         self.midday_no_trade = midday_no_trade
+        self.midday_start = midday_start
+        self.midday_end = midday_end
         self.max_daily_loss_pct = max_daily_loss_pct
 
         self.indicator_engine = IndicatorEngine()
@@ -40,6 +40,7 @@ class BacktestEngine:
         self.state_manager = StrategyStateManager()
         self.trade_tracker = TradeTracker()
         self._daily_pnl: float = 0.0
+        self._cooldowns: dict[str, datetime] = {}  # Fix 3: in-memory cooldowns
 
     @staticmethod
     def _collect_symbols(strategies: list[StrategyConfig]) -> list[str]:
@@ -126,6 +127,8 @@ class BacktestEngine:
             sym_data.bbw_history.clear()
         # Reset daily PnL tracker
         self._daily_pnl = 0.0
+        # Reset cooldowns per day
+        self._cooldowns.clear()
         # Do NOT reset _prev_values (crosses_above needs continuity)
         # Do NOT reset indicator_engine bar data (EMA/RSI need history)
 
@@ -136,76 +139,100 @@ class BacktestEngine:
         row: pd.Series,
         day,
     ) -> None:
-        # Build single-bar DataFrame
-        single_bar = pd.DataFrame(
-            {
-                "Open": [float(row["Open"])],
-                "High": [float(row["High"])],
-                "Low": [float(row["Low"])],
-                "Close": [float(row["Close"])],
-                "Volume": [float(row["Volume"])],
-            },
-            index=[ts],
-        )
+        open_p = float(row["Open"])
+        high_p = float(row["High"])
+        low_p = float(row["Low"])
+        close_p = float(row["Close"])
+        volume = float(row["Volume"])
 
-        # Feed into indicator engine
-        self.indicator_engine.update_bars(symbol, single_bar)
-
-        # Skip warmup period
-        if self.indicator_engine.needs_warmup(symbol, MIN_BARS_WARMUP):
-            return
-
-        # Calculate indicators for all timeframes
-        indicators = self.indicator_engine.calculate_all(symbol)
-
-        # Set simulated time for quality scoring
         bar_dt = ts.to_pydatetime() if hasattr(ts, 'to_pydatetime') else ts
         if bar_dt.tzinfo is None:
             bar_dt = bar_dt.replace(tzinfo=ET)
         RuleMatcher._simulated_time = bar_dt
 
-        current_price = float(row["Close"])
+        # Phase 1: Intra-bar simulation (partial candle effect)
+        # Simulates update_live_price() calls that happen in live trading,
+        # which create partial-candle indicators (small body, close≈open near VWAP).
+        if not self.indicator_engine.needs_warmup(symbol, MIN_BARS_WARMUP):
+            stub = pd.DataFrame(
+                {"Open": [open_p], "High": [open_p], "Low": [open_p],
+                 "Close": [open_p], "Volume": [volume]},
+                index=[ts],
+            )
+            self.indicator_engine.update_bars(symbol, stub)
 
+            for sim_price in [open_p, high_p, low_p]:
+                indicators = self.indicator_engine.update_live_price(
+                    symbol, sim_price, ts.timestamp()
+                )
+                if any(v is not None for v in indicators.values()):
+                    self._evaluate_at_price(symbol, sim_price, bar_dt, indicators)
+
+        # Phase 2: Final bar with complete OHLCV
+        final_bar = pd.DataFrame(
+            {"Open": [open_p], "High": [high_p], "Low": [low_p],
+             "Close": [close_p], "Volume": [volume]},
+            index=[ts],
+        )
+        self.indicator_engine.update_bars(symbol, final_bar)
+
+        if self.indicator_engine.needs_warmup(symbol, MIN_BARS_WARMUP):
+            return
+
+        indicators = self.indicator_engine.calculate_all(symbol)
+        self._evaluate_at_price(symbol, close_p, bar_dt, indicators)
+
+    def _evaluate_at_price(
+        self,
+        symbol: str,
+        price: float,
+        bar_dt: datetime,
+        indicators: dict,
+    ) -> None:
+        """Check exits and entries at a given price point."""
         # 1. Check exits for HOLDING positions
         for strategy in self.strategies:
             if symbol not in strategy.underlyings:
                 continue
 
             state = self.state_manager.get_state(strategy.strategy_id, symbol)
-            if state.state == StrategyState.HOLDING:
-                # Update highest price for trailing stop
-                self.state_manager.update_highest_price(
-                    strategy.strategy_id, symbol, current_price
+            if state.state != StrategyState.HOLDING:
+                continue
+
+            direction = strategy.option_filter.get("type", "call")
+            self.state_manager.update_highest_price(
+                strategy.strategy_id, symbol, price
+            )
+
+            entry_price = state.position.entry_price
+            minutes_to_close = self._minutes_to_close(bar_dt)
+
+            exit_signal = self.rule_matcher.evaluate_exit(
+                strategy, symbol, price, entry_price,
+                minutes_to_close,
+                highest_price=state.position.highest_price,
+                lowest_price=state.position.lowest_price,
+                direction=direction,
+                indicators_by_tf=indicators,
+            )
+
+            if exit_signal:
+                self.state_manager.trigger_exit(strategy.strategy_id, symbol)
+                self.state_manager.confirm_exit(strategy.strategy_id, symbol)
+                closed = self.trade_tracker.close_trade(
+                    strategy.strategy_id, symbol,
+                    price, bar_dt,
+                    exit_signal.exit_reason,
                 )
-
-                entry_price = state.position.entry_price
-                minutes_to_close = self._minutes_to_close(bar_dt)
-
-                exit_signal = self.rule_matcher.evaluate_exit(
-                    strategy, symbol, current_price, entry_price,
-                    minutes_to_close,
-                    highest_price=state.position.highest_price,
-                )
-
-                if exit_signal:
-                    self.state_manager.trigger_exit(strategy.strategy_id, symbol)
-                    self.state_manager.confirm_exit(strategy.strategy_id, symbol)
-                    closed = self.trade_tracker.close_trade(
-                        strategy.strategy_id, symbol,
-                        current_price, bar_dt,
-                        exit_signal.exit_reason,
-                    )
-                    if closed:
-                        self._daily_pnl += closed.direction_pnl_pct
+                if closed:
+                    self._daily_pnl += closed.direction_pnl_pct
 
         # 2. Check entries for WATCHING strategies
-        # Midday no-trade filter
         if self.midday_no_trade:
             t = bar_dt.hour * 60 + bar_dt.minute
-            if self.MIDDAY_START <= t < self.MIDDAY_END:
+            if self.midday_start <= t < self.midday_end:
                 return
 
-        # Daily loss circuit breaker
         if self.max_daily_loss_pct is not None and self._daily_pnl <= self.max_daily_loss_pct:
             return
 
@@ -217,35 +244,34 @@ class BacktestEngine:
             if state.state != StrategyState.WATCHING:
                 continue
 
-            # Trading window check
             if not self._is_in_trading_window(strategy, bar_dt):
                 continue
 
-            # Market context filters
             if not self._check_market_context(strategy, symbol, indicators):
                 continue
 
-            # Evaluate entry
+            # Cooldown check
+            cd_key = f"{strategy.strategy_id}:{symbol}"
+            if cd_key in self._cooldowns and bar_dt < self._cooldowns[cd_key]:
+                continue
+
             entry_signal = self.rule_matcher.evaluate_entry(
                 strategy, symbol, indicators,
             )
             if entry_signal is None:
                 continue
 
-            # Quality check
             quality = self.rule_matcher.evaluate_entry_quality(strategy, indicators)
             min_score = strategy.entry_quality_filters.get("min_score", 0)
             if quality.score < min_score:
                 continue
 
-            # Auto-confirm entry (no human confirmation in backtest)
             signal_id = self.state_manager.trigger_entry(strategy.strategy_id, symbol)
             if signal_id is None:
                 continue
 
-            self.state_manager.confirm_entry(signal_id, current_price)
+            self.state_manager.confirm_entry(signal_id, price)
 
-            # Determine direction from option_filter
             direction = strategy.option_filter.get("type", "call")
 
             self.trade_tracker.open_trade(
@@ -253,15 +279,20 @@ class BacktestEngine:
                 name=strategy.name,
                 symbol=symbol,
                 direction=direction,
-                price=current_price,
+                price=price,
                 time=bar_dt,
                 quality_score=quality.score,
                 quality_grade=quality.grade,
             )
 
+            # Set cooldown after successful entry
+            self._cooldowns[cd_key] = bar_dt + timedelta(
+                seconds=strategy.cooldown_seconds
+            )
+
             logger.debug(
                 "Entry: %s %s @ $%.2f [%s] quality=%s(%d)",
-                strategy.strategy_id, symbol, current_price,
+                strategy.strategy_id, symbol, price,
                 direction, quality.grade, quality.score,
             )
 
@@ -286,6 +317,12 @@ class BacktestEngine:
         if max_adx is not None:
             sym_ind = indicators.get("5m")
             if sym_ind and sym_ind.adx is not None and sym_ind.adx > max_adx:
+                return False
+
+        min_adx = mcf.get("min_adx")
+        if min_adx is not None:
+            sym_ind = indicators.get("5m")
+            if sym_ind and sym_ind.adx is not None and sym_ind.adx < min_adx:
                 return False
 
         return True
