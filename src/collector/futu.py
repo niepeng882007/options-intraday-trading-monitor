@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Callable
 
 import pandas as pd
 from futu import (
+    CurKlineHandlerBase,
     KLType,
     OpenQuoteContext,
     RET_OK,
@@ -26,6 +27,7 @@ logger = setup_logger("futu_collector")
 BACKOFF_BASE_SECONDS = 1
 BACKOFF_MAX_SECONDS = 60
 MAX_RETRIES = 3
+CALL_TIMEOUT_SECONDS = 30
 
 # Futu protocol requires serial access — use a single-thread pool.
 _thread_pool = ThreadPoolExecutor(max_workers=1)
@@ -55,6 +57,26 @@ INTERVAL_MAP = {
     "5m": KLType.K_5M,
     "15m": KLType.K_15M,
 }
+
+
+def normalize_futu_kline(data: pd.DataFrame) -> pd.DataFrame:
+    """Normalize Futu K-line DataFrame to standard OHLCV format.
+
+    Shared by FutuCollector._fetch_history and backtest DataLoader.
+    """
+    df = data.rename(columns={
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "volume": "Volume",
+        "time_key": "Datetime",
+    })
+    df["Datetime"] = pd.to_datetime(df["Datetime"])
+    df = df.set_index("Datetime")
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("America/New_York")
+    return df[["Open", "High", "Low", "Close", "Volume"]]
 
 
 def _period_to_dates(period: str) -> tuple[str, str]:
@@ -91,6 +113,7 @@ class FutuCollector(BaseCollector):
         self._subscription_count = 0
         self._ctx: OpenQuoteContext | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._quote_cache: dict[str, StockQuote] = {}
 
     # ── Lifecycle ──
 
@@ -105,6 +128,48 @@ class FutuCollector(BaseCollector):
             self._ctx = None
             logger.info("Disconnected from FutuOpenD")
 
+    async def health_check(self) -> None:
+        """Check if the Futu connection is alive."""
+        await self._run_sync(self._check_connection)
+
+    def _check_connection(self) -> dict:
+        ctx = self._ensure_connected()
+        ret, data = ctx.get_global_state()
+        if ret != RET_OK:
+            raise RuntimeError(f"Futu health check failed: {data}")
+        return data
+
+    async def get_connection_info(self) -> dict:
+        """Return detailed Futu connection status."""
+        info: dict = {
+            "source": "futu",
+            "host": self._host,
+            "port": self._port,
+            "connected": self._ctx is not None,
+            "subscription_used": self._subscription_count,
+            "subscription_quota": self._subscription_quota,
+            "cached_quotes": len(self._quote_cache),
+        }
+
+        # Quote cache freshness
+        if self._quote_cache:
+            now = time.time()
+            ages = {s: now - q.timestamp for s, q in self._quote_cache.items()}
+            info["quote_ages"] = {s: round(a, 1) for s, a in sorted(ages.items())}
+
+        # Try to get global state from FutuOpenD
+        try:
+            data = await self._run_sync(self._check_connection)
+            info["server_ver"] = data.get("server_ver", "N/A")
+            info["qot_logined"] = data.get("qot_logined", "N/A")
+            info["trd_logined"] = data.get("trd_logined", "N/A")
+            info["market_us"] = data.get("market_us", "N/A")
+            info["global_state"] = "OK"
+        except Exception as exc:
+            info["global_state"] = f"ERROR: {exc}"
+
+        return info
+
     def _create_ctx(self) -> OpenQuoteContext:
         return OpenQuoteContext(host=self._host, port=self._port)
 
@@ -115,11 +180,27 @@ class FutuCollector(BaseCollector):
             logger.info("Reconnected to FutuOpenD")
         return self._ctx
 
+    def _reset_thread_pool(self) -> None:
+        """Replace the thread pool — the old thread may still be blocked."""
+        global _thread_pool
+        _thread_pool = ThreadPoolExecutor(max_workers=1)
+        logger.info("Thread pool reset")
+
     # ── Helpers ──
 
-    def _run_sync(self, fn, *args):
+    async def _run_sync(self, fn, *args):
         loop = asyncio.get_running_loop()
-        return loop.run_in_executor(_thread_pool, fn, *args)
+        fut = loop.run_in_executor(_thread_pool, fn, *args)
+        try:
+            return await asyncio.wait_for(fut, timeout=CALL_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.error(
+                "Futu call timed out after %ds, resetting thread pool",
+                CALL_TIMEOUT_SECONDS,
+            )
+            self._ctx = None
+            self._reset_thread_pool()
+            raise
 
     async def _retry(self, fn, *args, retries: int = MAX_RETRIES):
         backoff = BACKOFF_BASE_SECONDS
@@ -143,6 +224,19 @@ class FutuCollector(BaseCollector):
             f"Futu request failed after {retries} retries"
         ) from last_exc
 
+    # ── Quote cache ──
+
+    def _cache_quote(self, quote: StockQuote) -> None:
+        self._quote_cache[quote.symbol] = quote
+
+    def get_cached_quote(self, symbol: str, max_age: float = 60.0) -> StockQuote | None:
+        quote = self._quote_cache.get(symbol)
+        if quote is None:
+            return None
+        if time.time() - quote.timestamp > max_age:
+            return None
+        return quote
+
     # ── Stock quotes ──
 
     def _fetch_stock_quote(self, symbol: str) -> StockQuote:
@@ -160,10 +254,19 @@ class FutuCollector(BaseCollector):
             ask=float(row.get("ask_price", 0) or 0),
             volume=int(row.get("volume", 0) or 0),
             timestamp=time.time(),
+            open_price=float(row["open_price"]) if row.get("open_price") else None,
+            high_price=float(row["high_price"]) if row.get("high_price") else None,
+            low_price=float(row["low_price"]) if row.get("low_price") else None,
+            prev_close_price=float(row["prev_close_price"]) if row.get("prev_close_price") else None,
+            change_pct=float(row["change_rate"]) if row.get("change_rate") is not None else None,
+            turnover=float(row["turnover"]) if row.get("turnover") else None,
+            turnover_rate=float(row["turnover_rate"]) if row.get("turnover_rate") is not None else None,
+            amplitude=float(row["amplitude"]) if row.get("amplitude") is not None else None,
         )
 
     async def get_stock_quote(self, symbol: str) -> StockQuote:
         quote: StockQuote = await self._retry(self._fetch_stock_quote, symbol)
+        self._cache_quote(quote)
         logger.debug("Quote %s: $%.2f", symbol, quote.price)
         return quote
 
@@ -277,7 +380,7 @@ class FutuCollector(BaseCollector):
         kl_type = INTERVAL_MAP.get(interval, KLType.K_1M)
         start, end = _period_to_dates(period)
 
-        ret, data, _ = ctx.request_history_kline(
+        ret, data, _page_req_key = ctx.request_history_kline(
             futu_code,
             start=start,
             end=end,
@@ -290,24 +393,7 @@ class FutuCollector(BaseCollector):
         if data.empty:
             return pd.DataFrame()
 
-        # Rename columns to match expected format
-        df = data.rename(columns={
-            "open": "Open",
-            "high": "High",
-            "low": "Low",
-            "close": "Close",
-            "volume": "Volume",
-            "time_key": "Datetime",
-        })
-
-        # Set DatetimeIndex
-        df["Datetime"] = pd.to_datetime(df["Datetime"])
-        df = df.set_index("Datetime")
-        df.index = df.index.tz_localize("America/New_York") if df.index.tz is None else df.index
-
-        # Keep only OHLCV columns
-        df = df[["Open", "High", "Low", "Close", "Volume"]]
-        return df
+        return normalize_futu_kline(data)
 
     async def get_history(
         self,
@@ -358,20 +444,77 @@ class FutuCollector(BaseCollector):
                         ask=float(row.get("ask_price", 0) or 0),
                         volume=int(row.get("volume", 0) or 0),
                         timestamp=time.time(),
+                        open_price=float(row["open_price"]) if row.get("open_price") else None,
+                        high_price=float(row["high_price"]) if row.get("high_price") else None,
+                        low_price=float(row["low_price"]) if row.get("low_price") else None,
+                        prev_close_price=float(row["prev_close_price"]) if row.get("prev_close_price") else None,
+                        change_pct=float(row["change_rate"]) if row.get("change_rate") is not None else None,
+                        turnover=float(row["turnover"]) if row.get("turnover") else None,
+                        turnover_rate=float(row["turnover_rate"]) if row.get("turnover_rate") is not None else None,
+                        amplitude=float(row["amplitude"]) if row.get("amplitude") is not None else None,
                     )
+                    self._cache_quote(quote)
                     if self._loop is not None:
                         asyncio.run_coroutine_threadsafe(callback(quote), self._loop)
                 return ret, data
 
         ctx.set_handler(_QuoteHandler())
-        ret, data = ctx.subscribe(futu_codes, [SubType.QUOTE])
+        ret, data = ctx.subscribe(futu_codes, [SubType.QUOTE, SubType.K_1M])
         if ret != RET_OK:
             raise RuntimeError(f"subscribe failed: {data}")
 
-        self._subscription_count += len(futu_codes)
+        # Each symbol × 2 sub types counts toward quota
+        self._subscription_count += len(futu_codes) * 2
         logger.info(
-            "Subscribed to %d symbols (%d/%d quota used)",
+            "Subscribed to %d symbols (QUOTE+K_1M, %d/%d quota used)",
             len(futu_codes),
             self._subscription_count,
             self._subscription_quota,
         )
+
+    def subscribe_kline(self, symbols: list[str], callback: Callable) -> None:
+        """Register a handler for real-time 1-minute K-line push.
+
+        Must be called after subscribe_quotes (which already subscribes K_1M).
+        This only sets the handler callback — no additional subscription needed.
+        """
+        ctx = self._ensure_connected()
+
+        collector_self = self
+
+        class _KlineHandler(CurKlineHandlerBase):
+            def on_recv_rsp(self_, rsp_pb):
+                ret, data = super(_KlineHandler, self_).on_recv_rsp(rsp_pb)
+                if ret != RET_OK:
+                    return ret, data
+                for _, row in data.iterrows():
+                    try:
+                        symbol = from_futu(row["code"])
+                        kline_df = pd.DataFrame(
+                            [{
+                                "Open": float(row["open"]),
+                                "High": float(row["high"]),
+                                "Low": float(row["low"]),
+                                "Close": float(row["close"]),
+                                "Volume": int(row.get("volume", 0) or 0),
+                            }],
+                            index=pd.DatetimeIndex(
+                                [pd.to_datetime(row["time_key"])],
+                                name="Datetime",
+                            ).tz_localize("America/New_York")
+                            if pd.to_datetime(row["time_key"]).tzinfo is None
+                            else pd.DatetimeIndex(
+                                [pd.to_datetime(row["time_key"])],
+                                name="Datetime",
+                            ),
+                        )
+                        if collector_self._loop is not None:
+                            asyncio.run_coroutine_threadsafe(
+                                callback(symbol, kline_df), collector_self._loop
+                            )
+                    except Exception:
+                        logger.exception("Error processing kline push for %s", row.get("code"))
+                return ret, data
+
+        ctx.set_handler(_KlineHandler())
+        logger.info("K-line push handler registered for %d symbols", len(symbols))

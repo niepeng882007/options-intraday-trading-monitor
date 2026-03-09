@@ -16,6 +16,15 @@ class StockQuote:
     ask: float
     volume: int
     timestamp: float
+    # Extended fields (populated by Futu, optional for Yahoo)
+    open_price: float | None = None
+    high_price: float | None = None
+    low_price: float | None = None
+    prev_close_price: float | None = None
+    change_pct: float | None = None          # day change %
+    turnover: float | None = None            # turnover amount ($)
+    turnover_rate: float | None = None       # turnover rate %
+    amplitude: float | None = None           # day amplitude %
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -78,5 +87,19 @@ class BaseCollector(ABC):
     async def close(self) -> None:
         """Close connection. No-op by default."""
 
+    async def health_check(self) -> None:
+        """Check connection health. No-op by default."""
+
+    def get_cached_quote(self, symbol: str, max_age: float = 60.0) -> StockQuote | None:
+        """Return a recently cached quote if available. Default: None."""
+        return None
+
+    async def get_connection_info(self) -> dict:
+        """Return connection status details. Override in subclasses."""
+        return {"status": "unknown", "source": "base"}
+
     def subscribe_quotes(self, symbols: list[str], callback) -> None:
         """Subscribe to real-time push. No-op by default."""
+
+    def subscribe_kline(self, symbols: list[str], callback) -> None:
+        """Subscribe to real-time K-line push. No-op by default."""
