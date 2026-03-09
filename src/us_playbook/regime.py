@@ -24,6 +24,7 @@ def classify_us_regime(
     min_vp_trading_days: int = 3,
     rvol_profile: RvolProfile | None = None,
     gap_significance_threshold: float = 0.3,
+    pm_source: str = "futu",
 ) -> USRegimeResult:
     """Classify US intraday regime into 4 styles.
 
@@ -154,5 +155,11 @@ def classify_us_regime(
         result.confidence = max(0.0, result.confidence - 0.15)
         thin_note = f"VP thin ({vp_trading_days}d)"
         result.details = f"{result.details}; {thin_note}" if result.details else thin_note
+
+    # ── PM estimated penalty ──
+    if pm_source == "gap_estimate" and result.regime == USRegimeType.GAP_AND_GO:
+        result.confidence = max(0.1, result.confidence - 0.15)
+        pm_note = "PM estimated (gap range)"
+        result.details = f"{result.details}; {pm_note}" if result.details else pm_note
 
     return result

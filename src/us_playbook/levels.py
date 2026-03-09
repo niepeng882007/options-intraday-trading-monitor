@@ -103,6 +103,7 @@ def build_key_levels(
     pml: float,
     vwap: float,
     gamma: GammaWallResult | None = None,
+    pm_source: str = "futu",
 ) -> KeyLevels:
     """Assemble all key levels into a single object."""
     kl = KeyLevels(
@@ -114,6 +115,7 @@ def build_key_levels(
         pmh=pmh,
         pml=pml,
         vwap=vwap,
+        pm_source=pm_source,
     )
     if gamma:
         kl.gamma_call_wall = gamma.call_wall_strike

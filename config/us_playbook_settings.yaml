@@ -41,3 +41,11 @@ filters:
 gamma_wall:
   enabled: true
   use_weekly_expiry: true
+
+regime_monitor:
+  enabled: true
+  check_interval_seconds: 300
+  start_after_morning_minutes: 5
+  end_before_confirm_minutes: 2
+  confidence_change_threshold: 0.2
+  max_flips_in_window: 2

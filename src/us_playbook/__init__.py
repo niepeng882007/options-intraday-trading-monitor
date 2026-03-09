@@ -27,6 +27,7 @@ class KeyLevels:
     gamma_call_wall: float = 0.0
     gamma_put_wall: float = 0.0
     gamma_max_pain: float = 0.0
+    pm_source: str = "futu"  # "futu" | "yahoo" | "gap_estimate"
 
 
 @dataclass

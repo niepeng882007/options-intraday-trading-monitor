@@ -53,6 +53,13 @@ class OptionQuote:
         return asdict(self)
 
 
+@dataclass
+class PremarketData:
+    pmh: float
+    pml: float
+    source: str  # "futu" | "yahoo" | "gap_estimate"
+
+
 class BaseCollector(ABC):
     """Abstract interface for all market data sources.
 

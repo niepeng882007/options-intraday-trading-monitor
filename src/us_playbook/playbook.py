@@ -161,7 +161,12 @@ def _collect_levels(
     if kl.pdh > 0:
         items.append(("PDH", kl.pdh, ""))
     if kl.pmh > 0:
-        items.append(("PMH", kl.pmh, ""))
+        pm_tag = ""
+        if kl.pm_source == "yahoo":
+            pm_tag = " (Yahoo)"
+        elif kl.pm_source == "gap_estimate":
+            pm_tag = " (估)"
+        items.append(("PMH", kl.pmh, pm_tag))
     if kl.vah > 0:
         items.append(("VAH", kl.vah, ""))
     if kl.vwap > 0:
@@ -173,7 +178,12 @@ def _collect_levels(
     if kl.pdl > 0:
         items.append(("PDL", kl.pdl, ""))
     if kl.pml > 0:
-        items.append(("PML", kl.pml, ""))
+        pm_tag_l = ""
+        if kl.pm_source == "yahoo":
+            pm_tag_l = " (Yahoo)"
+        elif kl.pm_source == "gap_estimate":
+            pm_tag_l = " (估)"
+        items.append(("PML", kl.pml, pm_tag_l))
     if kl.gamma_put_wall > 0:
         items.append(("Put Wall", kl.gamma_put_wall, ""))
     if kl.gamma_max_pain > 0:
@@ -187,3 +197,55 @@ def _collect_levels(
             items[closest_idx] = (name, val, "current")
 
     return items
+
+
+def format_regime_change_alert(
+    symbol: str,
+    name: str,
+    old_regime: USRegimeResult,
+    new_regime: USRegimeResult,
+    key_levels: KeyLevels | None = None,
+) -> str:
+    """Format regime change alert as Telegram HTML message."""
+    now = datetime.now(ET)
+    old_emoji = REGIME_EMOJI.get(old_regime.regime, "❓")
+    old_name = REGIME_NAME_CN.get(old_regime.regime, "未知")
+    new_emoji = REGIME_EMOJI.get(new_regime.regime, "❓")
+    new_name = REGIME_NAME_CN.get(new_regime.regime, "未知")
+
+    lines = [
+        f"⚠️🔄 <b>REGIME 变更 — {html.escape(name)}</b>",
+        "━" * 22,
+        f"❌ 旧: {old_emoji} {old_name} ({old_regime.confidence:.0%})",
+        f"✅ 新: {new_emoji} {new_name} ({new_regime.confidence:.0%})",
+        "",
+        "📊 <b>变化原因</b>",
+        f"• RVOL: {old_regime.rvol:.2f} → {new_regime.rvol:.2f}",
+        f"• 价格: ${old_regime.price:,.2f} → ${new_regime.price:,.2f}",
+    ]
+
+    # Compact key levels
+    if key_levels:
+        lines.append("")
+        lines.append("📍 <b>关键位 (简)</b>")
+        compact = [
+            ("VAH", key_levels.vah),
+            ("VWAP", key_levels.vwap),
+            ("POC", key_levels.poc),
+            ("VAL", key_levels.val),
+        ]
+        for lbl, val in compact:
+            if val > 0:
+                marker = " ← current" if abs(val - new_regime.price) / new_regime.price < 0.005 else ""
+                lines.append(f"  {lbl:6s} {val:>10,.2f}{marker}")
+
+    # Strategy for new regime
+    strategy = REGIME_STRATEGY.get(new_regime.regime, "")
+    if strategy:
+        lines.append("")
+        lines.append(f"📋 <b>新策略</b>: {strategy.split(chr(10))[0]}")
+
+    lines.append("")
+    lines.append(f"⏱ {now.strftime('%H:%M')} ET")
+
+    return "\n".join(lines)

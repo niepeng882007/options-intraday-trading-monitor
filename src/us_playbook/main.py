@@ -27,7 +27,7 @@ from src.us_playbook.levels import (
     get_history_bars,
     get_today_bars,
 )
-from src.us_playbook.playbook import REGIME_STRATEGY, format_us_playbook_message
+from src.us_playbook.playbook import REGIME_STRATEGY, format_regime_change_alert, format_us_playbook_message
 from src.us_playbook.regime import classify_us_regime
 from src.utils.logger import setup_logger
 
@@ -58,6 +58,8 @@ class USPlaybook:
         self._collector = collector
         self._send_fn = None  # async TG callback
         self._last_playbooks: dict[str, USPlaybookResult] = {}
+        self._cached_context: dict[str, dict] = {}
+        self._regime_flip_timestamps: dict[str, list[datetime]] = {}
 
     def set_send_fn(self, fn) -> None:
         """Set async callback for Telegram message sending: fn(text, parse_mode)."""
@@ -160,21 +162,22 @@ class USPlaybook:
         # 4. PDH/PDL
         pdh, pdl = extract_previous_day_hl(bars)
 
-        # 5. Pre-market HL
-        pmh, pml = await self._collector.get_premarket_hl(symbol)
+        # 5. Current price (via snapshot — no subscription needed)
+        snap = await self._collector.get_snapshot(symbol)
+        price = snap["last_price"]
+        prev_close = snap["prev_close_price"] or 0.0
 
-        # 6. VWAP + RVOL (RVOL uses full history for better coverage)
+        # 6. Pre-market HL (reuse snapshot to avoid duplicate API call)
+        pm_data = await self._collector.get_premarket_hl(symbol, snapshot=snap)
+        pmh, pml, pm_source = pm_data.pmh, pm_data.pml, pm_data.source
+
+        # 7. VWAP + RVOL (RVOL uses full history for better coverage)
         vwap = calculate_vwap(today)
         rvol = calculate_us_rvol(
             today, history_all,
             skip_open_minutes=rvol_cfg.get("skip_open_minutes", 3),
             lookback_days=rvol_cfg.get("lookback_days", 10),
         )
-
-        # 7. Current price (via snapshot — no subscription needed)
-        snap = await self._collector.get_snapshot(symbol)
-        price = snap["last_price"]
-        prev_close = snap["prev_close_price"] or 0.0
 
         # 8. Gamma Wall (graceful fallback, 10s hard timeout)
         gamma_wall: GammaWallResult | None = None
@@ -243,12 +246,24 @@ class USPlaybook:
             min_vp_trading_days=min_td,
             rvol_profile=rvol_profile,
             gap_significance_threshold=adaptive_cfg.get("gap_significance_threshold", 0.3),
+            pm_source=pm_source,
         )
 
         # 12. Build key levels
-        key_levels = build_key_levels(vp, pdh, pdl, pmh, pml, vwap, gamma_wall)
+        key_levels = build_key_levels(vp, pdh, pdl, pmh, pml, vwap, gamma_wall, pm_source=pm_source)
 
-        # 13. Strategy text
+        # 13. Cache intermediate data for lightweight regime monitor
+        self._cached_context[symbol] = {
+            "history_all": history_all,
+            "vp": vp,
+            "pdh": pdh, "pdl": pdl,
+            "pmh": pmh, "pml": pml,
+            "prev_close": prev_close,
+            "rvol_profile": rvol_profile,
+            "gamma_wall": gamma_wall,
+        }
+
+        # 14. Strategy text
         strategy_text = REGIME_STRATEGY.get(regime.regime, "")
 
         return USPlaybookResult(
@@ -262,6 +277,190 @@ class USPlaybook:
             strategy_text=strategy_text,
             generated_at=datetime.now(ET),
         )
+
+    # ── Regime Monitor ──
+
+    async def run_regime_monitor_cycle(self) -> None:
+        """Lightweight regime check between morning/confirm pushes.
+
+        Runs only in the 09:50-10:13 ET window. Compares current regime
+        against cached playbook regime; pushes alert only on change.
+        """
+        now = datetime.now(ET)
+        if not self._is_in_monitor_window(now):
+            return
+
+        if not self._last_playbooks:
+            return
+
+        monitor_cfg = self._cfg.get("regime_monitor", {})
+        conf_threshold = monitor_cfg.get("confidence_change_threshold", 0.2)
+        max_flips = monitor_cfg.get("max_flips_in_window", 2)
+
+        watchlist = self._cfg.get("watchlist", [])
+        context_symbols = self._cfg.get("regime", {}).get("market_context_symbols", ["SPY", "QQQ"])
+
+        # Phase 1: Check context symbols first to get spy_regime
+        spy_regime: USRegimeType | None = None
+        for ctx_sym in context_symbols:
+            changed, new_regime, old_regime = await self._check_regime_change(
+                ctx_sym, None, conf_threshold,
+            )
+            if new_regime and ctx_sym == "SPY":
+                spy_regime = new_regime.regime
+            if changed and new_regime and old_regime:
+                if self._should_suppress_flip(ctx_sym, now, max_flips):
+                    continue
+                await self._send_regime_alert(ctx_sym, old_regime, new_regime)
+
+        # Phase 2: Check remaining symbols
+        for entry in watchlist:
+            symbol = entry["symbol"]
+            if symbol in context_symbols:
+                continue
+            changed, new_regime, old_regime = await self._check_regime_change(
+                symbol, spy_regime, conf_threshold,
+            )
+            if changed and new_regime and old_regime:
+                if self._should_suppress_flip(symbol, now, max_flips):
+                    continue
+                await self._send_regime_alert(symbol, old_regime, new_regime)
+            await asyncio.sleep(1)  # rate limit
+
+    async def _check_regime_change(
+        self,
+        symbol: str,
+        spy_regime: USRegimeType | None,
+        conf_threshold: float,
+    ) -> tuple[bool, USRegimeResult | None, USRegimeResult | None]:
+        """Lightweight regime re-check using cached VP/PDH/PDL/PMH/PML.
+
+        Returns (changed, new_regime, old_regime).
+        """
+        cached = self._cached_context.get(symbol)
+        old_pb = self._last_playbooks.get(symbol)
+        if not cached or not old_pb:
+            return False, None, None
+
+        old_regime = old_pb.regime
+        cfg = self._cfg
+        rvol_cfg = cfg.get("rvol", {})
+        regime_cfg = cfg.get("regime", {})
+        adaptive_cfg = regime_cfg.get("adaptive", {})
+
+        try:
+            # Fresh data: snapshot + today bars
+            vp_target = cfg.get("volume_profile", {}).get("lookback_trading_days", 5)
+            rvol_td = rvol_cfg.get("lookback_days", 10)
+            fetch_days = calc_fetch_calendar_days(vp_target, rvol_td)
+            bars = await self._collector.get_history_bars(symbol, days=fetch_days)
+            if bars.empty:
+                return False, None, None
+
+            today = get_today_bars(bars)
+            history_all = get_history_bars(bars)
+
+            snap = await self._collector.get_snapshot(symbol)
+            price = snap["last_price"]
+
+            # Fresh VWAP + RVOL
+            vwap = calculate_vwap(today)
+            rvol = calculate_us_rvol(
+                today, history_all,
+                skip_open_minutes=rvol_cfg.get("skip_open_minutes", 3),
+                lookback_days=rvol_cfg.get("lookback_days", 10),
+            )
+
+            # Reuse cached: VP, PDH/PDL, PMH/PML, prev_close, rvol_profile, gamma_wall
+            new_regime = classify_us_regime(
+                price=price,
+                prev_close=cached["prev_close"],
+                rvol=rvol,
+                pmh=cached["pmh"],
+                pml=cached["pml"],
+                vp=cached["vp"],
+                gamma_wall=cached["gamma_wall"],
+                spy_regime=spy_regime,
+                gap_and_go_rvol=regime_cfg.get("gap_and_go_rvol", 1.5),
+                trend_day_rvol=regime_cfg.get("trend_day_rvol", 1.2),
+                fade_chop_rvol=regime_cfg.get("fade_chop_rvol", 1.0),
+                vp_trading_days=cached["vp"].trading_days,
+                min_vp_trading_days=cfg.get("volume_profile", {}).get("min_trading_days", 3),
+                rvol_profile=cached["rvol_profile"],
+                gap_significance_threshold=adaptive_cfg.get("gap_significance_threshold", 0.3),
+            )
+        except Exception:
+            logger.exception("Regime check failed for %s", symbol)
+            return False, None, None
+
+        # Detect change: regime flip or large confidence shift
+        regime_changed = new_regime.regime != old_regime.regime
+        conf_changed = abs(new_regime.confidence - old_regime.confidence) >= conf_threshold
+        changed = regime_changed or conf_changed
+
+        if changed:
+            # Update cached playbook with new regime and key levels
+            old_pb.regime = new_regime
+            old_pb.key_levels = build_key_levels(
+                cached["vp"], cached["pdh"], cached["pdl"],
+                cached["pmh"], cached["pml"], vwap, cached["gamma_wall"],
+            )
+            old_pb.generated_at = datetime.now(ET)
+            logger.info(
+                "Regime change detected for %s: %s→%s (conf %.0f%%→%.0f%%, RVOL %.2f→%.2f)",
+                symbol, old_regime.regime.value, new_regime.regime.value,
+                old_regime.confidence * 100, new_regime.confidence * 100,
+                old_regime.rvol, new_regime.rvol,
+            )
+
+        return changed, new_regime, old_regime
+
+    async def _send_regime_alert(
+        self,
+        symbol: str,
+        old_regime: USRegimeResult,
+        new_regime: USRegimeResult,
+    ) -> None:
+        pb = self._last_playbooks.get(symbol)
+        name = pb.name if pb else symbol
+        key_levels = pb.key_levels if pb else None
+        msg = format_regime_change_alert(symbol, name, old_regime, new_regime, key_levels)
+        await self._send_tg(msg)
+
+    def _is_in_monitor_window(self, now: datetime) -> bool:
+        """Check if current time falls in the regime monitor window."""
+        if now.weekday() >= 5:
+            return False
+        monitor_cfg = self._cfg.get("regime_monitor", {})
+        if not monitor_cfg.get("enabled", True):
+            return False
+        push_times = self._cfg.get("playbook", {}).get("push_times", ["09:45", "10:15"])
+        morning_h, morning_m = map(int, push_times[0].split(":"))
+        confirm_h, confirm_m = map(int, push_times[1].split(":"))
+        start_offset = monitor_cfg.get("start_after_morning_minutes", 5)
+        end_offset = monitor_cfg.get("end_before_confirm_minutes", 2)
+        window_start = now.replace(
+            hour=morning_h, minute=morning_m, second=0, microsecond=0,
+        ) + timedelta(minutes=start_offset)
+        window_end = now.replace(
+            hour=confirm_h, minute=confirm_m, second=0, microsecond=0,
+        ) - timedelta(minutes=end_offset)
+        return window_start <= now <= window_end
+
+    def _should_suppress_flip(self, symbol: str, now: datetime, max_flips: int) -> bool:
+        """Suppress alerts if regime has flipped too many times in the monitor window."""
+        timestamps = self._regime_flip_timestamps.setdefault(symbol, [])
+        # Prune timestamps older than 10 minutes
+        cutoff = now - timedelta(minutes=10)
+        timestamps[:] = [ts for ts in timestamps if ts > cutoff]
+        timestamps.append(now)
+        if len(timestamps) > max_flips:
+            logger.warning(
+                "Regime flip suppressed for %s: %d flips in 10min (unstable)",
+                symbol, len(timestamps),
+            )
+            return True
+        return False
 
     # ── Helpers ──
 

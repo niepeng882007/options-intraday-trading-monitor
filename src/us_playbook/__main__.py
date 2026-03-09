@@ -69,9 +69,19 @@ async def main() -> None:
         CronTrigger(hour=10, minute=15, day_of_week="mon-fri", timezone="America/New_York"),
         kwargs={"update_type": "confirm"}, id="us_playbook_confirm",
     )
+    # Regime monitor: interval job
+    monitor_cfg = cfg.get("regime_monitor", {})
+    if monitor_cfg.get("enabled", True):
+        interval = monitor_cfg.get("check_interval_seconds", 300)
+        scheduler.add_job(
+            playbook.run_regime_monitor_cycle,
+            "interval", seconds=interval,
+            id="us_regime_monitor", max_instances=1,
+        )
+
     scheduler.start()
 
-    logger.info("US Playbook started — scheduled 09:45/10:15 ET pushes")
+    logger.info("US Playbook started — scheduled 09:45/10:15 ET pushes + regime monitor")
 
     # Run initial cycle if during market hours
     # await playbook.run_playbook_cycle(update_type="morning")

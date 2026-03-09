@@ -16,7 +16,7 @@ from futu import (
     SubType,
 )
 
-from src.collector.base import BaseCollector, OptionQuote, StockQuote
+from src.collector.base import BaseCollector, OptionQuote, PremarketData, StockQuote
 from src.utils.logger import setup_logger
 
 if TYPE_CHECKING:
@@ -452,34 +452,65 @@ class FutuCollector(BaseCollector):
             "prev_close_price": float(row.get("prev_close_price", 0) or 0),
             "volume": int(row.get("volume", 0) or 0),
             "turnover": float(row.get("turnover", 0) or 0),
+            "pre_high_price": float(row.get("pre_high_price", 0) or 0),
+            "pre_low_price": float(row.get("pre_low_price", 0) or 0),
         }
 
     async def get_snapshot(self, symbol: str) -> dict:
         return await self._retry(self._fetch_snapshot, symbol)
 
-    def _fetch_premarket_hl(self, symbol: str) -> tuple[float, float]:
-        """Get pre-market high/low via snapshot; fallback to gap range."""
-        ctx = self._ensure_connected()
-        futu_code = to_futu(symbol)
-        ret, data = ctx.get_market_snapshot([futu_code])
-        if ret != RET_OK:
-            raise RuntimeError(f"get_market_snapshot failed: {data}")
+    @staticmethod
+    def _fetch_yahoo_premarket(symbol: str) -> tuple[float, float]:
+        """Fetch PMH/PML from Yahoo Finance extended-hours 1m bars."""
+        try:
+            import yfinance as yf
+            from datetime import time as dt_time
+            df = yf.Ticker(symbol).history(period="1d", interval="1m", prepost=True)
+            if df.empty:
+                return 0.0, 0.0
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("America/New_York")
+            else:
+                df.index = df.index.tz_convert("America/New_York")
+            pre = df[df.index.time < dt_time(9, 30)]
+            if pre.empty:
+                return 0.0, 0.0
+            return float(pre["High"].max()), float(pre["Low"].min())
+        except Exception as e:
+            logger.debug("Yahoo premarket failed for %s: %s", symbol, e)
+            return 0.0, 0.0
 
-        row = data.iloc[0]
-        pmh = float(row.get("pre_high_price", 0) or 0)
-        pml = float(row.get("pre_low_price", 0) or 0)
+    def _build_premarket_data(self, symbol: str, snapshot: dict | None = None) -> PremarketData:
+        """Build PremarketData with 3-tier fallback: Futu → Yahoo → gap estimate."""
+        # Tier 1: Futu snapshot
+        if snapshot is None:
+            snapshot = self._fetch_snapshot(symbol)
+
+        pmh = snapshot.get("pre_high_price", 0.0)
+        pml = snapshot.get("pre_low_price", 0.0)
         if pmh > 0 and pml > 0:
-            return pmh, pml
+            return PremarketData(pmh=pmh, pml=pml, source="futu")
 
-        # Fallback: gap range from open vs prev_close
-        open_p = float(row.get("open_price", 0) or 0)
-        prev_c = float(row.get("prev_close_price", 0) or 0)
+        # Tier 2: Yahoo Finance
+        plain = from_futu(symbol) if "." in symbol else symbol
+        y_pmh, y_pml = self._fetch_yahoo_premarket(plain)
+        if y_pmh > 0 and y_pml > 0:
+            return PremarketData(pmh=y_pmh, pml=y_pml, source="yahoo")
+
+        # Tier 3: gap estimate from open vs prev_close
+        open_p = snapshot.get("open_price", 0.0)
+        prev_c = snapshot.get("prev_close_price", 0.0)
         if open_p > 0 and prev_c > 0:
-            return max(open_p, prev_c), min(open_p, prev_c)
-        return open_p or prev_c, open_p or prev_c
+            return PremarketData(
+                pmh=max(open_p, prev_c),
+                pml=min(open_p, prev_c),
+                source="gap_estimate",
+            )
+        fallback = open_p or prev_c
+        return PremarketData(pmh=fallback, pml=fallback, source="gap_estimate")
 
-    async def get_premarket_hl(self, symbol: str) -> tuple[float, float]:
-        return await self._retry(self._fetch_premarket_hl, symbol)
+    async def get_premarket_hl(self, symbol: str, snapshot: dict | None = None) -> PremarketData:
+        return await self._run_sync(self._build_premarket_data, symbol, snapshot)
 
     # ── Real-time push subscription ──
 

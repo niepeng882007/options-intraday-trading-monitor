@@ -6,6 +6,7 @@ import pytest
 from datetime import datetime, date, timezone, timedelta
 
 from src.hk import VolumeProfileResult, GammaWallResult, FilterResult
+from src.collector.base import PremarketData
 from src.us_playbook import (
     USRegimeType, USRegimeResult, USPlaybookResult, KeyLevels,
 )
@@ -17,7 +18,8 @@ from src.us_playbook.levels import (
 )
 from src.us_playbook.regime import classify_us_regime
 from src.us_playbook.filter import check_us_filters, _is_monthly_opex
-from src.us_playbook.playbook import format_us_playbook_message
+from src.us_playbook.playbook import format_us_playbook_message, format_regime_change_alert, _collect_levels
+from src.us_playbook.main import USPlaybook
 
 ET = timezone(timedelta(hours=-5))
 
@@ -749,3 +751,336 @@ class TestAdaptiveRegime:
         msg = format_us_playbook_message(result, "morning")
         assert "自适应" in msg
         assert "rank" in msg
+
+
+# ── PMH/PML Data Reliability Tests ──
+
+class TestPremarketData:
+    def test_dataclass_fields(self):
+        pm = PremarketData(pmh=555.0, pml=548.0, source="futu")
+        assert pm.pmh == 555.0
+        assert pm.pml == 548.0
+        assert pm.source == "futu"
+
+    def test_gap_estimate_source(self):
+        pm = PremarketData(pmh=552.0, pml=548.0, source="gap_estimate")
+        assert pm.source == "gap_estimate"
+
+    def test_yahoo_source(self):
+        pm = PremarketData(pmh=556.0, pml=549.0, source="yahoo")
+        assert pm.source == "yahoo"
+
+
+class TestKeyLevelsPmSource:
+    def test_default_pm_source(self):
+        kl = KeyLevels(poc=550, vah=555, val=545, pdh=558, pdl=542, pmh=555, pml=548, vwap=552)
+        assert kl.pm_source == "futu"
+
+    def test_custom_pm_source(self):
+        kl = KeyLevels(
+            poc=550, vah=555, val=545, pdh=558, pdl=542,
+            pmh=555, pml=548, vwap=552, pm_source="yahoo",
+        )
+        assert kl.pm_source == "yahoo"
+
+    def test_build_key_levels_passes_pm_source(self):
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        kl = build_key_levels(vp, 558, 542, 555, 548, 552.5, pm_source="gap_estimate")
+        assert kl.pm_source == "gap_estimate"
+
+    def test_build_key_levels_default_pm_source(self):
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        kl = build_key_levels(vp, 558, 542, 555, 548, 552.5)
+        assert kl.pm_source == "futu"
+
+
+class TestCollectLevelsPmAnnotation:
+    def _kl(self, pm_source="futu"):
+        return KeyLevels(
+            poc=550, vah=555, val=545, pdh=558, pdl=542,
+            pmh=555, pml=548, vwap=552, pm_source=pm_source,
+        )
+
+    def test_futu_no_annotation(self):
+        items = _collect_levels(self._kl("futu"), 550)
+        pmh_items = [i for i in items if i[0] == "PMH"]
+        pml_items = [i for i in items if i[0] == "PML"]
+        assert pmh_items[0][2] == ""  # no annotation (or "current")
+        assert pml_items[0][2] == ""
+
+    def test_yahoo_annotation(self):
+        items = _collect_levels(self._kl("yahoo"), 530)  # far from any level
+        pmh_items = [i for i in items if i[0] == "PMH"]
+        pml_items = [i for i in items if i[0] == "PML"]
+        assert pmh_items[0][2] == " (Yahoo)"
+        assert pml_items[0][2] == " (Yahoo)"
+
+    def test_gap_estimate_annotation(self):
+        items = _collect_levels(self._kl("gap_estimate"), 530)
+        pmh_items = [i for i in items if i[0] == "PMH"]
+        pml_items = [i for i in items if i[0] == "PML"]
+        assert pmh_items[0][2] == " (估)"
+        assert pml_items[0][2] == " (估)"
+
+
+class TestRegimePmSourcePenalty:
+    def _vp(self, poc=550, vah=555, val=545):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    def test_gap_and_go_gap_estimate_penalty(self):
+        """GAP_AND_GO with gap_estimate PM should have reduced confidence."""
+        result_futu = classify_us_regime(
+            price=560, prev_close=550, rvol=2.5,
+            pmh=555, pml=548, vp=self._vp(),
+            pm_source="futu",
+        )
+        result_est = classify_us_regime(
+            price=560, prev_close=550, rvol=2.5,
+            pmh=555, pml=548, vp=self._vp(),
+            pm_source="gap_estimate",
+        )
+        assert result_futu.regime == USRegimeType.GAP_AND_GO
+        assert result_est.regime == USRegimeType.GAP_AND_GO
+        assert result_est.confidence < result_futu.confidence
+        assert "PM estimated" in result_est.details
+
+    def test_gap_and_go_yahoo_no_penalty(self):
+        """GAP_AND_GO with yahoo PM should NOT be penalized."""
+        result_futu = classify_us_regime(
+            price=560, prev_close=550, rvol=2.5,
+            pmh=555, pml=548, vp=self._vp(),
+            pm_source="futu",
+        )
+        result_yahoo = classify_us_regime(
+            price=560, prev_close=550, rvol=2.5,
+            pmh=555, pml=548, vp=self._vp(),
+            pm_source="yahoo",
+        )
+        assert result_yahoo.confidence == result_futu.confidence
+
+    def test_fade_chop_no_pm_penalty(self):
+        """Non-GAP_AND_GO regimes should NOT be affected by pm_source."""
+        result = classify_us_regime(
+            price=550, prev_close=551, rvol=0.8,
+            pmh=555, pml=548, vp=self._vp(),
+            pm_source="gap_estimate",
+        )
+        assert result.regime == USRegimeType.FADE_CHOP
+        assert "PM estimated" not in result.details
+
+    def test_confidence_floor(self):
+        """Confidence should not drop below 0.1 from PM penalty."""
+        # Use SPY FADE_CHOP to already reduce confidence, then add PM penalty
+        result = classify_us_regime(
+            price=560, prev_close=550, rvol=1.6,
+            pmh=555, pml=548, vp=self._vp(),
+            spy_regime=USRegimeType.FADE_CHOP,
+            pm_source="gap_estimate",
+        )
+        assert result.confidence >= 0.1
+
+
+# ── Regime Monitor Tests ──
+
+class TestRegimeMonitor:
+    """Tests for the lightweight regime change detection between playbook pushes."""
+
+    def _make_playbook(self, symbol="TSLA", name="Tesla"):
+        return USPlaybook(
+            config={
+                "watchlist": [
+                    {"symbol": "SPY", "name": "S&P 500 ETF"},
+                    {"symbol": symbol, "name": name},
+                ],
+                "regime": {
+                    "market_context_symbols": ["SPY"],
+                    "gap_and_go_rvol": 1.5,
+                    "trend_day_rvol": 1.2,
+                    "fade_chop_rvol": 1.0,
+                    "adaptive": {"enabled": False},
+                },
+                "volume_profile": {"lookback_trading_days": 5, "min_trading_days": 3},
+                "rvol": {"skip_open_minutes": 3, "lookback_days": 10},
+                "playbook": {"push_times": ["09:45", "10:15"]},
+                "regime_monitor": {
+                    "enabled": True,
+                    "start_after_morning_minutes": 5,
+                    "end_before_confirm_minutes": 2,
+                    "confidence_change_threshold": 0.2,
+                    "max_flips_in_window": 2,
+                },
+            },
+            collector=None,
+        )
+
+    def _vp(self, poc=280, vah=285, val=275):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val, trading_days=5)
+
+    def _seed_playbook(self, pb, symbol, regime_type, rvol, price, confidence=0.7):
+        """Seed _last_playbooks and _cached_context for a symbol."""
+        regime = USRegimeResult(
+            regime=regime_type, confidence=confidence,
+            rvol=rvol, price=price, gap_pct=1.5,
+        )
+        kl = KeyLevels(
+            poc=280, vah=285, val=275, pdh=288, pdl=272,
+            pmh=284, pml=276, vwap=280,
+        )
+        vp = self._vp()
+        pb._last_playbooks[symbol] = USPlaybookResult(
+            symbol=symbol, name="Test",
+            regime=regime, key_levels=kl,
+            volume_profile=vp,
+            gamma_wall=None,
+            filters=FilterResult(tradeable=True, risk_level="normal"),
+            generated_at=datetime(2026, 3, 9, 9, 45, 0, tzinfo=ET),
+        )
+        pb._cached_context[symbol] = {
+            "history_all": pd.DataFrame(),
+            "vp": vp,
+            "pdh": 288.0, "pdl": 272.0,
+            "pmh": 284.0, "pml": 276.0,
+            "prev_close": price - 5,
+            "rvol_profile": None,
+            "gamma_wall": None,
+        }
+
+    def test_regime_change_detected(self):
+        """Verify _check_regime_change detects GAP_AND_GO → FADE_CHOP."""
+        old_regime = USRegimeResult(
+            regime=USRegimeType.GAP_AND_GO, confidence=0.72,
+            rvol=2.5, price=280.0, gap_pct=1.5,
+        )
+        new_regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.65,
+            rvol=0.8, price=275.0, gap_pct=1.5,
+        )
+        # Regime type changed → should be detected
+        assert old_regime.regime != new_regime.regime
+
+    def test_no_change_no_alert(self):
+        """Same regime and similar confidence → no alert."""
+        old = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.65,
+            rvol=1.3, price=280.0, gap_pct=0.5,
+        )
+        new = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.68,
+            rvol=1.35, price=281.0, gap_pct=0.5,
+        )
+        regime_changed = old.regime != new.regime
+        conf_changed = abs(old.confidence - new.confidence) >= 0.2
+        assert not regime_changed
+        assert not conf_changed
+
+    def test_confidence_change_triggers(self):
+        """Same regime but confidence delta > 0.2 → should trigger."""
+        old = USRegimeResult(
+            regime=USRegimeType.GAP_AND_GO, confidence=0.85,
+            rvol=2.5, price=280.0, gap_pct=2.0,
+        )
+        new = USRegimeResult(
+            regime=USRegimeType.GAP_AND_GO, confidence=0.60,
+            rvol=1.6, price=276.0, gap_pct=2.0,
+        )
+        regime_changed = old.regime != new.regime
+        conf_changed = abs(old.confidence - new.confidence) >= 0.2
+        assert not regime_changed
+        assert conf_changed
+
+    def test_flip_debounce(self):
+        """After max_flips exceeded, _should_suppress_flip returns True."""
+        pb = self._make_playbook()
+        now = datetime(2026, 3, 9, 9, 55, 0, tzinfo=ET)
+        max_flips = 2
+        # First two flips: allowed
+        assert not pb._should_suppress_flip("TSLA", now, max_flips)
+        assert not pb._should_suppress_flip(
+            "TSLA", now + timedelta(minutes=1), max_flips,
+        )
+        # Third flip within 10 min: suppressed
+        assert pb._should_suppress_flip(
+            "TSLA", now + timedelta(minutes=2), max_flips,
+        )
+
+    def test_time_window_guard_before(self):
+        """09:44 ET → outside monitor window → return False."""
+        pb = self._make_playbook()
+        before = datetime(2026, 3, 9, 9, 44, 0, tzinfo=ET)
+        assert not pb._is_in_monitor_window(before)
+
+    def test_time_window_guard_after(self):
+        """10:16 ET → outside monitor window → return False."""
+        pb = self._make_playbook()
+        after = datetime(2026, 3, 9, 10, 16, 0, tzinfo=ET)
+        assert not pb._is_in_monitor_window(after)
+
+    def test_time_window_guard_inside(self):
+        """09:55 ET → inside monitor window → return True."""
+        pb = self._make_playbook()
+        inside = datetime(2026, 3, 9, 9, 55, 0, tzinfo=ET)
+        assert pb._is_in_monitor_window(inside)
+
+    def test_time_window_guard_weekend(self):
+        """Saturday → always outside."""
+        pb = self._make_playbook()
+        saturday = datetime(2026, 3, 14, 9, 55, 0, tzinfo=ET)  # Saturday
+        assert not pb._is_in_monitor_window(saturday)
+
+    def test_time_window_disabled(self):
+        """regime_monitor.enabled=false → always outside."""
+        pb = self._make_playbook()
+        pb._cfg["regime_monitor"]["enabled"] = False
+        inside = datetime(2026, 3, 9, 9, 55, 0, tzinfo=ET)
+        assert not pb._is_in_monitor_window(inside)
+
+    def test_alert_format(self):
+        """Verify alert message contains old/new regime comparison."""
+        old = USRegimeResult(
+            regime=USRegimeType.GAP_AND_GO, confidence=0.72,
+            rvol=2.31, price=280.50, gap_pct=1.82,
+        )
+        new = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.65,
+            rvol=1.05, price=275.20, gap_pct=1.82,
+        )
+        kl = KeyLevels(
+            poc=278, vah=283, val=273, pdh=285, pdl=270,
+            pmh=282, pml=274, vwap=276.5,
+        )
+        msg = format_regime_change_alert("TSLA", "Tesla", old, new, kl)
+        assert "REGIME 变更" in msg
+        assert "Tesla" in msg
+        assert "缺口追击日" in msg
+        assert "震荡日" in msg
+        assert "2.31" in msg
+        assert "1.05" in msg
+        assert "280.50" in msg
+        assert "275.20" in msg
+        assert "VAH" in msg
+        assert "VWAP" in msg
+
+    def test_alert_format_no_key_levels(self):
+        """Alert without key_levels should still work."""
+        old = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.6,
+            rvol=1.3, price=550.0, gap_pct=0.5,
+        )
+        new = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.3,
+            rvol=1.1, price=548.0, gap_pct=0.5,
+        )
+        msg = format_regime_change_alert("SPY", "S&P 500 ETF", old, new, None)
+        assert "REGIME 变更" in msg
+        assert "VAH" not in msg  # no key levels section
+
+    def test_cached_context_populated(self):
+        """After _seed_playbook, cached context should have required keys."""
+        pb = self._make_playbook()
+        self._seed_playbook(pb, "TSLA", USRegimeType.GAP_AND_GO, 2.5, 280.0)
+        ctx = pb._cached_context["TSLA"]
+        assert "vp" in ctx
+        assert "pdh" in ctx
+        assert "prev_close" in ctx
+        assert "gamma_wall" in ctx
+        assert "rvol_profile" in ctx

@@ -242,6 +242,17 @@ class OptionsMonitor:
             )
             logger.info("US Playbook scheduled: 09:45/10:15 ET")
 
+            # Regime monitor: interval job (window guard is inside the method)
+            monitor_cfg = self.us_playbook._cfg.get("regime_monitor", {})
+            if monitor_cfg.get("enabled", True):
+                interval = monitor_cfg.get("check_interval_seconds", 300)
+                self.scheduler.add_job(
+                    self.us_playbook.run_regime_monitor_cycle,
+                    "interval", seconds=interval,
+                    id="us_regime_monitor", max_instances=1,
+                )
+                logger.info("US Regime monitor scheduled: every %ds", interval)
+
     def _is_trading_hours(self) -> bool:
         now = datetime.now(ET)
         hours = self.config.get("trading_hours", {})
