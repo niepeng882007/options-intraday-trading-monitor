@@ -345,7 +345,7 @@ class FutuCollector(BaseCollector):
                     ask=float(q.get("ask_price", 0) or 0),
                     last=float(q.get("last_price", 0) or 0),
                     volume=int(q.get("volume", 0) or 0),
-                    open_interest=int(row.get("option_area_type", 0) or 0),
+                    open_interest=int(g.get("option_open_interest", 0) or 0),
                     implied_volatility=iv / 100 if iv > 1 else iv,
                     delta=float(delta) if delta is not None else None,
                     gamma=float(gamma) if gamma is not None else None,
@@ -408,6 +408,78 @@ class FutuCollector(BaseCollector):
             "History %s (%s/%s): %d bars", symbol, interval, period, len(df)
         )
         return df
+
+    # ── Extended history (for US Playbook) ──
+
+    def _fetch_history_bars(self, symbol: str, days: int, interval: str = "1m") -> pd.DataFrame:
+        """Fetch history K-lines by day count with sufficient max_count."""
+        ctx = self._ensure_connected()
+        futu_code = to_futu(symbol)
+        kl_type = INTERVAL_MAP.get(interval, KLType.K_1M)
+
+        today = datetime.now(ET).date()
+        start = (today - timedelta(days=days + 3)).strftime("%Y-%m-%d")  # buffer for weekends
+        end = today.strftime("%Y-%m-%d")
+        max_count = min(days * 400 + 100, 5000)
+
+        ret, data, _ = ctx.request_history_kline(
+            futu_code, start=start, end=end, ktype=kl_type, max_count=max_count,
+        )
+        if ret != RET_OK:
+            raise RuntimeError(f"request_history_kline failed: {data}")
+        if data.empty:
+            return pd.DataFrame()
+        return normalize_futu_kline(data)
+
+    async def get_history_bars(self, symbol: str, days: int = 5, interval: str = "1m") -> pd.DataFrame:
+        df = await self._retry(self._fetch_history_bars, symbol, days, interval)
+        logger.debug("History bars %s (%dd %s): %d bars", symbol, days, interval, len(df))
+        return df
+
+    def _fetch_snapshot(self, symbol: str) -> dict:
+        """Get full market snapshot (no subscription needed)."""
+        ctx = self._ensure_connected()
+        futu_code = to_futu(symbol)
+        ret, data = ctx.get_market_snapshot([futu_code])
+        if ret != RET_OK:
+            raise RuntimeError(f"get_market_snapshot failed: {data}")
+        row = data.iloc[0]
+        return {
+            "last_price": float(row.get("last_price", 0) or 0),
+            "open_price": float(row.get("open_price", 0) or 0),
+            "high_price": float(row.get("high_price", 0) or 0),
+            "low_price": float(row.get("low_price", 0) or 0),
+            "prev_close_price": float(row.get("prev_close_price", 0) or 0),
+            "volume": int(row.get("volume", 0) or 0),
+            "turnover": float(row.get("turnover", 0) or 0),
+        }
+
+    async def get_snapshot(self, symbol: str) -> dict:
+        return await self._retry(self._fetch_snapshot, symbol)
+
+    def _fetch_premarket_hl(self, symbol: str) -> tuple[float, float]:
+        """Get pre-market high/low via snapshot; fallback to gap range."""
+        ctx = self._ensure_connected()
+        futu_code = to_futu(symbol)
+        ret, data = ctx.get_market_snapshot([futu_code])
+        if ret != RET_OK:
+            raise RuntimeError(f"get_market_snapshot failed: {data}")
+
+        row = data.iloc[0]
+        pmh = float(row.get("pre_high_price", 0) or 0)
+        pml = float(row.get("pre_low_price", 0) or 0)
+        if pmh > 0 and pml > 0:
+            return pmh, pml
+
+        # Fallback: gap range from open vs prev_close
+        open_p = float(row.get("open_price", 0) or 0)
+        prev_c = float(row.get("prev_close_price", 0) or 0)
+        if open_p > 0 and prev_c > 0:
+            return max(open_p, prev_c), min(open_p, prev_c)
+        return open_p or prev_c, open_p or prev_c
+
+    async def get_premarket_hl(self, symbol: str) -> tuple[float, float]:
+        return await self._retry(self._fetch_premarket_hl, symbol)
 
     # ── Real-time push subscription ──
 

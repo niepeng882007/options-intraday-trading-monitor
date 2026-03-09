@@ -1,0 +1,54 @@
+# US Macro Economic Calendar
+# risk_level: high (FOMC/NFP/CPI → blocked), medium (other → elevated)
+# Monthly OpEx (3rd Friday) is auto-calculated, not listed here
+
+events:
+  # 2026 FOMC Meetings (high risk)
+  - {date: "2026-01-28", name: "FOMC Meeting", risk_level: high}
+  - {date: "2026-03-18", name: "FOMC Meeting", risk_level: high}
+  - {date: "2026-05-06", name: "FOMC Meeting", risk_level: high}
+  - {date: "2026-06-17", name: "FOMC Meeting", risk_level: high}
+  - {date: "2026-07-29", name: "FOMC Meeting", risk_level: high}
+  - {date: "2026-09-16", name: "FOMC Meeting", risk_level: high}
+  - {date: "2026-11-04", name: "FOMC Meeting", risk_level: high}
+  - {date: "2026-12-16", name: "FOMC Meeting", risk_level: high}
+
+  # 2026 Non-Farm Payroll (high risk — usually 1st Friday)
+  - {date: "2026-01-09", name: "Non-Farm Payroll", risk_level: high}
+  - {date: "2026-02-06", name: "Non-Farm Payroll", risk_level: high}
+  - {date: "2026-03-06", name: "Non-Farm Payroll", risk_level: high}
+  - {date: "2026-04-03", name: "Non-Farm Payroll", risk_level: high}
+  - {date: "2026-05-08", name: "Non-Farm Payroll", risk_level: high}
+  - {date: "2026-06-05", name: "Non-Farm Payroll", risk_level: high}
+  - {date: "2026-07-02", name: "Non-Farm Payroll", risk_level: high}
+  - {date: "2026-08-07", name: "Non-Farm Payroll", risk_level: high}
+  - {date: "2026-09-04", name: "Non-Farm Payroll", risk_level: high}
+  - {date: "2026-10-02", name: "Non-Farm Payroll", risk_level: high}
+  - {date: "2026-11-06", name: "Non-Farm Payroll", risk_level: high}
+  - {date: "2026-12-04", name: "Non-Farm Payroll", risk_level: high}
+
+  # 2026 CPI Releases (high risk — usually 10th-15th)
+  - {date: "2026-01-14", name: "CPI Release", risk_level: high}
+  - {date: "2026-02-11", name: "CPI Release", risk_level: high}
+  - {date: "2026-03-11", name: "CPI Release", risk_level: high}
+  - {date: "2026-04-10", name: "CPI Release", risk_level: high}
+  - {date: "2026-05-12", name: "CPI Release", risk_level: high}
+  - {date: "2026-06-10", name: "CPI Release", risk_level: high}
+  - {date: "2026-07-14", name: "CPI Release", risk_level: high}
+  - {date: "2026-08-12", name: "CPI Release", risk_level: high}
+  - {date: "2026-09-11", name: "CPI Release", risk_level: high}
+  - {date: "2026-10-13", name: "CPI Release", risk_level: high}
+  - {date: "2026-11-10", name: "CPI Release", risk_level: high}
+  - {date: "2026-12-10", name: "CPI Release", risk_level: high}
+
+  # US Market Holidays
+  - {date: "2026-01-01", name: "New Year's Day", risk_level: high}
+  - {date: "2026-01-19", name: "MLK Day", risk_level: high}
+  - {date: "2026-02-16", name: "Presidents' Day", risk_level: high}
+  - {date: "2026-04-03", name: "Good Friday", risk_level: high}
+  - {date: "2026-05-25", name: "Memorial Day", risk_level: high}
+  - {date: "2026-06-19", name: "Juneteenth", risk_level: high}
+  - {date: "2026-07-03", name: "Independence Day (observed)", risk_level: high}
+  - {date: "2026-09-07", name: "Labor Day", risk_level: high}
+  - {date: "2026-11-26", name: "Thanksgiving", risk_level: high}
+  - {date: "2026-12-25", name: "Christmas", risk_level: high}

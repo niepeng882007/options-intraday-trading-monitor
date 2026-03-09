@@ -78,6 +78,19 @@ class OptionsMonitor:
         self._last_entry_eval: dict[str, float] = {}  # P5.1 dedup timestamps
         self._daily_pnl: float = 0.0  # cumulative daily stock PnL %
         self._daily_pnl_date: str = ""  # current tracking date
+        self.us_playbook = self._build_us_playbook()
+
+    def _build_us_playbook(self):
+        """Build US Playbook module if config exists."""
+        config_path = "config/us_playbook_settings.yaml"
+        try:
+            with open(config_path) as f:
+                pb_cfg = yaml.safe_load(f)
+            if pb_cfg:
+                return pb_cfg  # store config; instantiate after collector is ready
+        except FileNotFoundError:
+            pass
+        return None
 
     def _build_collector(self) -> BaseCollector:
         source = self.config.get("data_source", "yahoo")
@@ -111,6 +124,16 @@ class OptionsMonitor:
 
         self.notifier.build_app()
         await self.notifier.start_polling()
+
+        # US Playbook integration
+        if self.us_playbook and isinstance(self.us_playbook, dict):
+            from src.us_playbook.main import USPlaybook as USPlaybookCls
+            pb_cfg = self.us_playbook
+            self.us_playbook = USPlaybookCls(pb_cfg, self.collector)
+            self.us_playbook.set_send_fn(self.notifier.send_text)
+            from src.us_playbook.telegram import register_us_playbook_commands
+            register_us_playbook_commands(self.notifier._app, self.us_playbook)
+            logger.info("US Playbook module initialized")
 
         self._register_jobs()
         self.scheduler.start()
@@ -203,6 +226,21 @@ class OptionsMonitor:
             id="heartbeat",
             max_instances=1,
         )
+
+        # US Playbook scheduled pushes
+        if self.us_playbook and not isinstance(self.us_playbook, dict):
+            from apscheduler.triggers.cron import CronTrigger
+            self.scheduler.add_job(
+                self.us_playbook.run_playbook_cycle,
+                CronTrigger(hour=9, minute=45, day_of_week="mon-fri", timezone="America/New_York"),
+                kwargs={"update_type": "morning"}, id="us_playbook_morning",
+            )
+            self.scheduler.add_job(
+                self.us_playbook.run_playbook_cycle,
+                CronTrigger(hour=10, minute=15, day_of_week="mon-fri", timezone="America/New_York"),
+                kwargs={"update_type": "confirm"}, id="us_playbook_confirm",
+            )
+            logger.info("US Playbook scheduled: 09:45/10:15 ET")
 
     def _is_trading_hours(self) -> bool:
         now = datetime.now(ET)

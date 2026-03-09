@@ -391,3 +391,212 @@ class TestTradingTime:
         from datetime import time as dt_time
         assert is_trading_time(dt_time(13, 0))
         assert is_trading_time(dt_time(15, 59))
+
+
+# ── Order Book Dedup Tests ──
+
+class TestOrderBookDedup:
+    """Test order book alert dedup logic in HKPredictor."""
+
+    def _make_predictor(self) -> "HKPredictor":
+        """Create a minimal HKPredictor with mocked collector."""
+        from unittest.mock import MagicMock, AsyncMock
+        from src.hk.main import HKPredictor, _SeenOrder
+
+        p = object.__new__(HKPredictor)
+        p._cfg = {
+            "watchlist": {"stocks": [{"symbol": "HK.00700", "name": "Tencent"}]},
+            "order_book": {
+                "large_order_ratio": 3.0,
+                "monitor_depth": 10,
+                "alert_cooldown_minutes": 15,
+                "volume_change_threshold": 0.5,
+                "seen_order_expiry_minutes": 60,
+            },
+        }
+        p._collector = MagicMock()
+        p._send_fn = AsyncMock()
+        p._seen_orders = {}
+        p._last_playbooks = {}
+        p._connected = True
+        return p
+
+    def _make_book(self, ask_price: float = 513.0, ask_vol: int = 30000) -> dict:
+        return {
+            "code": "HK.00700",
+            "Ask": [
+                (511.0, 1000, 5, {}),
+                (511.5, 800, 3, {}),
+                (512.0, 1200, 4, {}),
+                (512.5, 900, 3, {}),
+                (ask_price, ask_vol, 2, {}),
+            ],
+            "Bid": [(510.5, 900, 4, {})],
+        }
+
+    @pytest.mark.asyncio
+    async def test_first_alert_passes(self):
+        """First time seeing a large order → alert with 🆕 tag."""
+        p = self._make_predictor()
+        p._collector.get_order_book = lambda *a, **k: self._make_book()
+
+        sent_messages = []
+        async def capture(text, **kw):
+            sent_messages.append(text)
+        p._send_fn = capture
+
+        # Patch _run_sync to call function directly
+        async def _run_sync(fn, *args):
+            return fn(*args)
+        p._run_sync = _run_sync
+
+        await p.check_orderbook_alerts()
+        assert len(sent_messages) == 1
+        assert "🆕" in sent_messages[0]
+        assert len(p._seen_orders) == 1
+
+    @pytest.mark.asyncio
+    async def test_duplicate_suppressed(self):
+        """Same order within cooldown → no alert."""
+        p = self._make_predictor()
+        p._collector.get_order_book = lambda *a, **k: self._make_book()
+
+        sent_messages = []
+        async def capture(text, **kw):
+            sent_messages.append(text)
+        p._send_fn = capture
+
+        async def _run_sync(fn, *args):
+            return fn(*args)
+        p._run_sync = _run_sync
+
+        await p.check_orderbook_alerts()
+        assert len(sent_messages) == 1  # first alert
+
+        await p.check_orderbook_alerts()
+        assert len(sent_messages) == 1  # no second alert
+
+    @pytest.mark.asyncio
+    async def test_volume_increase_realerts(self):
+        """Volume increase ≥50% → re-alert with 📈 tag."""
+        from src.hk.main import _SeenOrder
+
+        p = self._make_predictor()
+        now = datetime.now(timezone(timedelta(hours=8)))
+
+        # Pre-seed a seen order with volume=20000
+        key = ("HK.00700", "ask", 513.0)
+        p._seen_orders[key] = _SeenOrder(volume=20000, alerted_at=now)
+
+        # New book has 30000 → +50% increase
+        p._collector.get_order_book = lambda *a, **k: self._make_book(ask_vol=30000)
+
+        sent_messages = []
+        async def capture(text, **kw):
+            sent_messages.append(text)
+        p._send_fn = capture
+
+        async def _run_sync(fn, *args):
+            return fn(*args)
+        p._run_sync = _run_sync
+
+        await p.check_orderbook_alerts()
+        assert len(sent_messages) == 1
+        assert "📈" in sent_messages[0]
+
+    @pytest.mark.asyncio
+    async def test_cooldown_expiry_realerts(self):
+        """After cooldown expires, still-present order → re-alert with ⏰ tag."""
+        from src.hk.main import _SeenOrder
+
+        p = self._make_predictor()
+        now = datetime.now(timezone(timedelta(hours=8)))
+
+        # Pre-seed order alerted 20 minutes ago (cooldown=15min)
+        key = ("HK.00700", "ask", 513.0)
+        p._seen_orders[key] = _SeenOrder(
+            volume=30000,
+            alerted_at=now - timedelta(minutes=20),
+        )
+
+        p._collector.get_order_book = lambda *a, **k: self._make_book(ask_vol=30000)
+
+        sent_messages = []
+        async def capture(text, **kw):
+            sent_messages.append(text)
+        p._send_fn = capture
+
+        async def _run_sync(fn, *args):
+            return fn(*args)
+        p._run_sync = _run_sync
+
+        await p.check_orderbook_alerts()
+        assert len(sent_messages) == 1
+        assert "⏰" in sent_messages[0]
+
+    def test_cleanup_expired(self):
+        """Expired entries are removed from _seen_orders."""
+        from src.hk.main import _SeenOrder
+
+        p = self._make_predictor()
+        now = datetime.now(timezone(timedelta(hours=8)))
+
+        # Add an entry that's 90 minutes old (expiry=60min)
+        key_old = ("HK.00700", "ask", 513.0)
+        p._seen_orders[key_old] = _SeenOrder(
+            volume=30000,
+            alerted_at=now - timedelta(minutes=90),
+        )
+
+        # Add a recent entry
+        key_new = ("HK.00700", "bid", 510.0)
+        p._seen_orders[key_new] = _SeenOrder(
+            volume=5000,
+            alerted_at=now - timedelta(minutes=5),
+        )
+
+        p._cleanup_seen_orders(now, expiry_minutes=60)
+        assert key_old not in p._seen_orders
+        assert key_new in p._seen_orders
+
+    @pytest.mark.asyncio
+    async def test_different_prices_independent(self):
+        """Different price levels are tracked independently."""
+        from src.hk.main import _SeenOrder
+
+        p = self._make_predictor()
+        now = datetime.now(timezone(timedelta(hours=8)))
+
+        # Pre-seed order at 513.0
+        key = ("HK.00700", "ask", 513.0)
+        p._seen_orders[key] = _SeenOrder(volume=30000, alerted_at=now)
+
+        # New book has large order at DIFFERENT price 514.0
+        book = {
+            "code": "HK.00700",
+            "Ask": [
+                (511.0, 1000, 5, {}),
+                (511.5, 800, 3, {}),
+                (512.0, 1200, 4, {}),
+                (512.5, 900, 3, {}),
+                (514.0, 25000, 2, {}),  # Different price
+            ],
+            "Bid": [(510.5, 900, 4, {})],
+        }
+        p._collector.get_order_book = lambda *a, **k: book
+
+        sent_messages = []
+        async def capture(text, **kw):
+            sent_messages.append(text)
+        p._send_fn = capture
+
+        async def _run_sync(fn, *args):
+            return fn(*args)
+        p._run_sync = _run_sync
+
+        await p.check_orderbook_alerts()
+        assert len(sent_messages) == 1
+        assert "🆕" in sent_messages[0]
+        # Both keys should exist
+        assert ("HK.00700", "ask", 513.0) in p._seen_orders
+        assert ("HK.00700", "ask", 514.0) in p._seen_orders

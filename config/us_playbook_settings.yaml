@@ -1,0 +1,36 @@
+watchlist:
+  - {symbol: SPY, name: "S&P 500 ETF"}
+  - {symbol: QQQ, name: "Nasdaq 100 ETF"}
+  - {symbol: AAPL, name: Apple}
+  - {symbol: TSLA, name: Tesla}
+  - {symbol: NVDA, name: NVIDIA}
+  - {symbol: META, name: Meta}
+  - {symbol: AMD, name: AMD}
+  - {symbol: AMZN, name: Amazon}
+
+volume_profile:
+  lookback_days: 3
+  value_area_pct: 0.70
+
+rvol:
+  window_minutes: 15
+  lookback_days: 10
+
+regime:
+  gap_and_go_rvol: 1.5
+  gap_and_go_rvol_preliminary: 2.0
+  trend_day_rvol: 1.2
+  fade_chop_rvol: 1.0
+  market_context_symbols: [SPY, QQQ]
+
+playbook:
+  push_times: ["09:45", "10:15"]
+  timezone: "America/New_York"
+
+filters:
+  calendar_file: "config/us_calendar.yaml"
+  inside_day_rvol_threshold: 0.8
+
+gamma_wall:
+  enabled: true
+  use_weekly_expiry: true

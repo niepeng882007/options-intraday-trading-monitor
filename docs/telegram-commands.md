@@ -91,6 +91,42 @@ HK 模块会在交易日自动推送以下内容：
 
 ---
 
+## US Playbook Commands
+
+US 每日交易剧本命令，由 `register_us_playbook_commands()` 注册（`src/us_playbook/telegram.py`）。所有命令支持短别名。
+
+### Playbook 与分析
+
+| 命令 | 短别名 | 参数 | 说明 |
+|------|--------|------|------|
+| `/us_playbook` | `/uspb` | `[symbol]` | 生成 US Playbook（Regime + VP 关键点位 + Gamma Wall + 策略建议） |
+| `/us_levels` | `/usl` | `[symbol]` | 关键点位：POC / VAH / VAL / VWAP / PDH / PDL / Gamma Wall |
+| `/us_regime` | `/usr` | `[symbol]` | Regime 分类（GAP_AND_GO / TREND_DAY / FADE_CHOP / UNCLEAR） |
+| `/us_filters` | `/usf` | — | 风险过滤状态（FOMC / NFP / CPI / OpEx / Inside Day） |
+| `/us_gamma` | `/usg` | `[symbol]` | Gamma Wall：Call Wall / Put Wall / Max Pain |
+
+### 帮助
+
+| 命令 | 短别名 | 参数 | 说明 |
+|------|--------|------|------|
+| `/us_help` | `/ush` | — | 显示 US Playbook 全部指令列表与别名 |
+
+### 参数说明
+
+- `[symbol]` — 可选参数，默认为 `SPY`
+- Watchlist 标的：SPY, QQQ, AAPL, TSLA, NVDA, META, AMD, AMZN
+
+### 自动推送
+
+US Playbook 模块会在交易日自动推送以下内容：
+
+| 时间 (ET) | 类型 | 内容 |
+|------------|------|------|
+| 09:45 | ⚠️ 初步 Playbook | 开盘 15 分钟后首份 Playbook（RVOL 阈值更高） |
+| 10:15 | ✅ 确认 Playbook | 开盘 45 分钟确认更新（标准 RVOL 阈值） |
+
+---
+
 ## Quick Reference
 
 ### US 命令速查
@@ -109,6 +145,17 @@ HK 模块会在交易日自动推送以下内容：
 /chain   AAPL 230 C 0321  期权链
 /conn            连接诊断
 /test            推送测试
+```
+
+### US Playbook 命令速查
+
+```
+/uspb [symbol]   Playbook        = /us_playbook
+/usl  [symbol]   关键点位        = /us_levels
+/usr  [symbol]   Regime 分类     = /us_regime
+/usf             过滤状态        = /us_filters
+/usg  [symbol]   Gamma Wall      = /us_gamma
+/ush             帮助            = /us_help
 ```
 
 ### HK 命令速查

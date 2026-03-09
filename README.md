@@ -16,6 +16,19 @@
 - **双轨策略体系**: 6 个左侧埋伏策略 + 4 个右侧突破策略（10 个策略，8 活跃 + 2 禁用）
 - **回测框架**: 基于历史数据验证策略参数，输出胜率、盈亏比、利润因子、权益曲线
 
+### 美股 Playbook (`src/us_playbook/`)
+
+每日交易剧本生成模块，集成于 `OptionsMonitor`。
+
+- **Volume Profile**: 基于 3 天 1m K 线计算 POC/VAH/VAL，US 专用 tick_size
+- **RVOL**: 窗口 RVOL（前 15 分钟对比历史同窗口均量）
+- **Regime 分类**: 4 种风格 — 缺口追击(GAP_AND_GO) / 趋势日(TREND_DAY) / 震荡日(FADE_CHOP) / 不明确(UNCLEAR)
+- **SPY 市场背景**: SPY 先分类，结果影响个股置信度
+- **Playbook 推送**: 每日 09:45 ET（初步，15min RVOL） / 10:15 ET（确认，45min RVOL）
+- **Gamma Wall**: 期权链 OI 分析 Call Wall / Put Wall / Max Pain，10s 超时降级
+- **关键点位**: VP (POC/VAH/VAL) + PDH/PDL + PMH/PML + VWAP + Gamma Wall 统一展示
+- **风险过滤**: FOMC/NFP/CPI 日历、Monthly OpEx 自动检测、Inside Day + 低 RVOL
+
 ### 港股预测 (`src/hk/`)
 
 与美股完全解耦的独立模块，面向恒指/恒科期权日内交易。
@@ -54,6 +67,9 @@ python -m src.main
 
 # 启动港股预测（独立运行）
 python -m src.hk
+
+# 启动美股 Playbook（独立运行）
+python -m src.us_playbook
 ```
 
 ### 4. 运行测试
@@ -99,6 +115,17 @@ python scripts/hk_data_probe.py
 | `/confirm <signal_id> <price>` | 确认建仓 |
 | `/test` | 发送测试入场/出场提醒，验证推送链路 |
 | `/skip <signal_id>` | 跳过信号 |
+
+### 美股 Playbook
+
+| 命令 | 功能 |
+|------|------|
+| `/us_playbook [symbol]` | 生成 US Playbook（别名: `/uspb`） |
+| `/us_levels [symbol]` | 关键点位 VP/PDH/PDL/Gamma（别名: `/usl`） |
+| `/us_regime [symbol]` | Regime 分类 + 交易建议（别名: `/usr`） |
+| `/us_filters` | 风险过滤状态 FOMC/OpEx/Inside Day（别名: `/usf`） |
+| `/us_gamma [symbol]` | Gamma Wall + Max Pain（别名: `/usg`） |
+| `/us_help` | US Playbook 指令列表（别名: `/ush`） |
 
 ### 港股
 

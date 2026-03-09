@@ -85,6 +85,9 @@ filters:
 order_book:
   large_order_ratio: 3.0             # 3x average size = large order
   monitor_depth: 10                  # monitor top 10 levels
+  alert_cooldown_minutes: 15         # re-alert after cooldown if still present
+  volume_change_threshold: 0.5       # re-alert if volume changes ≥50%
+  seen_order_expiry_minutes: 60      # forget order after gone for 60min
 
 gamma_wall:
   enabled_for_index_only: true

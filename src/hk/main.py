@@ -10,12 +10,13 @@ from __future__ import annotations
 import asyncio
 import html
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
 
-from src.hk import FilterResult, GammaWallResult, Playbook
+from src.hk import FilterResult, GammaWallResult, OrderBookAlert, Playbook
 from src.hk.collector import HKCollector
 from src.hk.filter import check_filters
 from src.hk.gamma_wall import calculate_gamma_wall, format_gamma_wall_message
@@ -42,6 +43,13 @@ _executor = ThreadPoolExecutor(max_workers=1)
 _esc = html.escape
 
 DEFAULT_CONFIG_PATH = "config/hk_settings.yaml"
+
+
+@dataclass
+class _SeenOrder:
+    """Tracks a previously alerted large order for dedup."""
+    volume: int
+    alerted_at: datetime
 
 
 def _load_config(path: str = DEFAULT_CONFIG_PATH) -> dict:
@@ -72,6 +80,8 @@ class HKPredictor:
         self._send_fn: asyncio.coroutines | None = None  # TG send callback
         self._last_playbooks: dict[str, Playbook] = {}
         self._connected = False
+        # Order book dedup: key=(symbol, side, price) → _SeenOrder
+        self._seen_orders: dict[tuple[str, str, float], _SeenOrder] = {}
 
     # ── Lifecycle ──
 
@@ -224,24 +234,76 @@ class HKPredictor:
     # ── Order book monitoring ──
 
     async def check_orderbook_alerts(self, symbol: str | None = None) -> None:
-        """Check order book for anomalies and push alerts."""
+        """Check order book for anomalies with dedup and push aggregated alerts."""
         symbols = self._get_stock_symbols(symbol)
         ob_cfg = self._cfg.get("order_book", {})
         ratio = ob_cfg.get("large_order_ratio", 3.0)
         depth = ob_cfg.get("monitor_depth", 10)
+        cooldown_minutes = ob_cfg.get("alert_cooldown_minutes", 15)
+        vol_change_threshold = ob_cfg.get("volume_change_threshold", 0.5)
+        expiry_minutes = ob_cfg.get("seen_order_expiry_minutes", 60)
+
+        now = datetime.now(HKT)
+        pending: list[tuple[OrderBookAlert, str]] = []  # (alert, tag)
 
         for sym in symbols:
             try:
                 book = await self._run_sync(self._collector.get_order_book, sym, depth)
                 alerts = analyze_order_book(book, large_order_ratio=ratio)
-                if alerts:
-                    name = self.get_name(sym)
-                    for a in alerts:
-                        a.symbol = f"{name}({a.symbol})"
-                    msg = format_alerts_message(alerts)
-                    await self._send_tg(msg)
+                name = self.get_name(sym)
+                for a in alerts:
+                    a.symbol = f"{name}({a.symbol})"
+                    key = (sym, a.side, a.price)
+                    seen = self._seen_orders.get(key)
+
+                    if seen is None:
+                        # First time seeing this order
+                        self._seen_orders[key] = _SeenOrder(volume=a.volume, alerted_at=now)
+                        pending.append((a, "🆕"))
+                    else:
+                        # Check volume change
+                        vol_change = (a.volume - seen.volume) / seen.volume if seen.volume else 1.0
+                        elapsed = (now - seen.alerted_at).total_seconds() / 60
+
+                        if vol_change >= vol_change_threshold:
+                            # Significant volume increase → re-alert
+                            pct = int(vol_change * 100)
+                            pending.append((a, f"📈 +{pct}%"))
+                            self._seen_orders[key] = _SeenOrder(volume=a.volume, alerted_at=now)
+                        elif elapsed >= cooldown_minutes:
+                            # Cooldown expired, order still present → reminder
+                            pending.append((a, f"⏰ {int(elapsed)}min"))
+                            self._seen_orders[key] = _SeenOrder(volume=a.volume, alerted_at=now)
+                        # else: suppress duplicate
+
             except Exception:
                 logger.debug("Order book check failed for %s", sym, exc_info=True)
+
+        self._cleanup_seen_orders(now, expiry_minutes)
+
+        if pending:
+            msg = self._format_deduped_alerts(pending)
+            await self._send_tg(msg)
+
+    def _cleanup_seen_orders(self, now: datetime, expiry_minutes: int) -> None:
+        """Remove seen orders older than expiry_minutes."""
+        cutoff = now - timedelta(minutes=expiry_minutes)
+        expired = [k for k, v in self._seen_orders.items() if v.alerted_at < cutoff]
+        for k in expired:
+            del self._seen_orders[k]
+
+    @staticmethod
+    def _format_deduped_alerts(alerts_with_tags: list[tuple[OrderBookAlert, str]]) -> str:
+        """Format deduped alerts into a single aggregated Telegram message."""
+        lines = ["🚨 <b>盘口异常检测</b>"]
+        for a, tag in alerts_with_tags:
+            side_cn = "买盘" if a.side == "bid" else "卖盘"
+            emoji = "🟢" if a.side == "bid" else "🔴"
+            lines.append(
+                f"  {emoji} [{tag}] {a.symbol} {side_cn} {a.price:.2f}: "
+                f"{a.volume:,} 股 ({a.ratio:.1f}x 均量)"
+            )
+        return "\n".join(lines)
 
     # ── Bot command helpers (called from telegram.py handlers) ──
 

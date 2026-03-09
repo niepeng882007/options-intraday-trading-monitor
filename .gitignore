@@ -39,3 +39,4 @@ data/hk_backtest_cache/
 *.db
 *.db-shm
 *.db-wal
+data/
