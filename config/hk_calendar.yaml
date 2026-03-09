@@ -1,0 +1,169 @@
+# HK Predict - Economic Calendar & Risk Events
+# risk_level: high = avoid new entries / tighten stops
+#              medium = reduce size / widen filters
+
+events:
+  # ── FOMC Meetings 2026 ──
+  - date: "2026-03-19"
+    name: "FOMC Meeting"
+    risk_level: high
+  - date: "2026-05-07"
+    name: "FOMC Meeting"
+    risk_level: high
+  - date: "2026-06-18"
+    name: "FOMC Meeting"
+    risk_level: high
+  - date: "2026-07-30"
+    name: "FOMC Meeting"
+    risk_level: high
+  - date: "2026-09-17"
+    name: "FOMC Meeting"
+    risk_level: high
+  - date: "2026-11-05"
+    name: "FOMC Meeting"
+    risk_level: high
+  - date: "2026-12-17"
+    name: "FOMC Meeting"
+    risk_level: high
+
+  # ── HK Public Holidays 2026 ──
+  - date: "2026-01-01"
+    name: "New Year's Day"
+    risk_level: high
+  - date: "2026-02-17"
+    name: "Lunar New Year Day 1"
+    risk_level: high
+  - date: "2026-02-18"
+    name: "Lunar New Year Day 2"
+    risk_level: high
+  - date: "2026-02-19"
+    name: "Lunar New Year Day 3"
+    risk_level: high
+  - date: "2026-04-03"
+    name: "Good Friday"
+    risk_level: high
+  - date: "2026-04-06"
+    name: "Easter Monday"
+    risk_level: high
+  - date: "2026-04-05"
+    name: "Ching Ming Festival"
+    risk_level: high
+  - date: "2026-05-01"
+    name: "Labour Day"
+    risk_level: high
+  - date: "2026-05-24"
+    name: "Buddha's Birthday"
+    risk_level: high
+  - date: "2026-06-19"
+    name: "Tuen Ng Festival"
+    risk_level: high
+  - date: "2026-07-01"
+    name: "HKSAR Establishment Day"
+    risk_level: high
+  - date: "2026-10-01"
+    name: "National Day"
+    risk_level: high
+  - date: "2026-10-07"
+    name: "Chung Yeung Festival"
+    risk_level: high
+  - date: "2026-12-25"
+    name: "Christmas Day"
+    risk_level: high
+  - date: "2026-12-26"
+    name: "Boxing Day"
+    risk_level: high
+
+  # ── China PMI Releases (NBS, ~1st of each month) ──
+  - date: "2026-03-31"
+    name: "China PMI (Mar)"
+    risk_level: medium
+  - date: "2026-04-30"
+    name: "China PMI (Apr)"
+    risk_level: medium
+  - date: "2026-05-31"
+    name: "China PMI (May)"
+    risk_level: medium
+  - date: "2026-06-30"
+    name: "China PMI (Jun)"
+    risk_level: medium
+  - date: "2026-07-31"
+    name: "China PMI (Jul)"
+    risk_level: medium
+  - date: "2026-08-31"
+    name: "China PMI (Aug)"
+    risk_level: medium
+  - date: "2026-09-30"
+    name: "China PMI (Sep)"
+    risk_level: medium
+  - date: "2026-10-31"
+    name: "China PMI (Oct)"
+    risk_level: medium
+  - date: "2026-11-30"
+    name: "China PMI (Nov)"
+    risk_level: medium
+
+  # ── China GDP Releases (quarterly) ──
+  - date: "2026-04-17"
+    name: "China Q1 GDP"
+    risk_level: high
+  - date: "2026-07-17"
+    name: "China Q2 GDP"
+    risk_level: high
+  - date: "2026-10-19"
+    name: "China Q3 GDP"
+    risk_level: high
+
+  # ── HKMA Rate Decisions (typically follows Fed) ──
+  - date: "2026-03-20"
+    name: "HKMA Rate Decision (post-FOMC)"
+    risk_level: high
+  - date: "2026-05-08"
+    name: "HKMA Rate Decision (post-FOMC)"
+    risk_level: high
+  - date: "2026-06-19"
+    name: "HKMA Rate Decision (post-FOMC)"
+    risk_level: high
+  - date: "2026-07-31"
+    name: "HKMA Rate Decision (post-FOMC)"
+    risk_level: high
+  - date: "2026-09-18"
+    name: "HKMA Rate Decision (post-FOMC)"
+    risk_level: high
+  - date: "2026-11-06"
+    name: "HKMA Rate Decision (post-FOMC)"
+    risk_level: high
+  - date: "2026-12-18"
+    name: "HKMA Rate Decision (post-FOMC)"
+    risk_level: high
+
+  # ── HK Options Expiry (monthly, 3rd Thursday or last trading day) ──
+  - date: "2026-03-30"
+    name: "HSI Options Expiry (Mar)"
+    risk_level: medium
+  - date: "2026-04-29"
+    name: "HSI Options Expiry (Apr)"
+    risk_level: medium
+  - date: "2026-05-28"
+    name: "HSI Options Expiry (May)"
+    risk_level: medium
+  - date: "2026-06-29"
+    name: "HSI Options Expiry (Jun)"
+    risk_level: medium
+  - date: "2026-07-30"
+    name: "HSI Options Expiry (Jul)"
+    risk_level: medium
+  - date: "2026-08-28"
+    name: "HSI Options Expiry (Aug)"
+    risk_level: medium
+  - date: "2026-09-29"
+    name: "HSI Options Expiry (Sep)"
+    risk_level: medium
+  - date: "2026-10-29"
+    name: "HSI Options Expiry (Oct)"
+    risk_level: medium
+  - date: "2026-11-27"
+    name: "HSI Options Expiry (Nov)"
+    risk_level: medium
+  - date: "2026-12-30"
+    name: "HSI Options Expiry (Dec)"
+    risk_level: medium
