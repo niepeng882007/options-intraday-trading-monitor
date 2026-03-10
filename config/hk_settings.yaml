@@ -1,4 +1,4 @@
-# HK Predict Module Configuration
+# HK Playbook Module Configuration
 # Reuses Futu connection from main settings.yaml (same host/port)
 
 futu:

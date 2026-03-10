@@ -1,4 +1,4 @@
-"""HK Predict Backtest Framework.
+"""HK Playbook Backtest Framework.
 
 Validates Volume Profile levels (VAH/VAL bounce rates) and Regime classification
 accuracy using historical data. Optionally simulates trades based on signals.

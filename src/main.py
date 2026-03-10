@@ -17,6 +17,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from src.collector.base import BaseCollector
 from src.indicator.engine import IndicatorEngine
+from telegram import Update
+from telegram.ext import ContextTypes
+
 from src.notification.telegram import TelegramNotifier
 from src.store.redis_store import RedisStore
 from src.store.sqlite_store import SQLiteStore
@@ -78,10 +81,10 @@ class OptionsMonitor:
         self._daily_pnl: float = 0.0  # cumulative daily stock PnL %
         self._daily_pnl_date: str = ""  # current tracking date
         self.us_playbook = self._build_us_playbook()
-        self.hk_predictor = self._build_hk_predictor()
+        self.hk_playbook = self._build_hk_playbook()
 
-    def _build_hk_predictor(self):
-        """Build HK Predictor module if config exists."""
+    def _build_hk_playbook(self):
+        """Build HK Playbook module if config exists."""
         config_path = "config/hk_settings.yaml"
         try:
             from src.hk.main import HKPredictor
@@ -89,7 +92,7 @@ class OptionsMonitor:
         except FileNotFoundError:
             return None
         except Exception:
-            logger.warning("Failed to initialize HK Predictor", exc_info=True)
+            logger.warning("Failed to initialize HK Playbook", exc_info=True)
             return None
 
     def _build_us_playbook(self):
@@ -141,20 +144,25 @@ class OptionsMonitor:
             register_us_predictor_handlers(self.notifier._app, self.us_playbook)
             logger.info("US Predictor module initialized (on-demand + auto-scan)")
 
-        # HK Predictor integration (on-demand, no scheduled pushes)
-        if self.hk_predictor:
+        # HK Playbook integration (on-demand, no scheduled pushes)
+        if self.hk_playbook:
             try:
-                await self.hk_predictor.connect()
-                from src.hk.telegram import register_hk_commands
-                register_hk_commands(self.notifier._app, self.hk_predictor)
-                logger.info("HK Predictor module initialized (on-demand mode)")
+                await self.hk_playbook.connect()
+                from src.hk.telegram import register_hk_predictor_handlers
+                register_hk_predictor_handlers(self.notifier._app, self.hk_playbook)
+                logger.info("HK Playbook module initialized (on-demand mode)")
             except Exception:
-                logger.warning("Failed to connect HK Predictor", exc_info=True)
-                self.hk_predictor = None
+                logger.warning("Failed to connect HK Playbook", exc_info=True)
+                self.hk_playbook = None
 
         # /summary command — manual daily summary trigger
         from telegram.ext import CommandHandler
         self.notifier._app.add_handler(CommandHandler("summary", self._cmd_summary))
+
+        # Quick keyboard commands — /kb, /kboff, /start
+        self.notifier._app.add_handler(CommandHandler("kb", self._cmd_keyboard))
+        self.notifier._app.add_handler(CommandHandler("start", self._cmd_keyboard))
+        self.notifier._app.add_handler(CommandHandler("kboff", self._cmd_keyboard_off))
 
         self._register_jobs()
         self.scheduler.start()
@@ -178,9 +186,9 @@ class OptionsMonitor:
         self.strategy_loader.stop_watching()
         self._persist_states()
         await self.notifier.stop()
-        if self.hk_predictor:
+        if self.hk_playbook:
             try:
-                await self.hk_predictor.close()
+                await self.hk_playbook.close()
             except Exception:
                 pass
         await self.collector.close()
@@ -216,6 +224,8 @@ class OptionsMonitor:
             BotCommand("hk_help", "港股期权监控说明"),
             BotCommand("us_help", "美股期权监控说明"),
             BotCommand("conn", "检查Futu和Redis连接状态"),
+            BotCommand("kb", "显示快捷查询键盘"),
+            BotCommand("kboff", "关闭快捷键盘"),
         ]
         try:
             await app.bot.set_my_commands(commands)
@@ -304,8 +314,8 @@ class OptionsMonitor:
         )
 
         # HK Auto-scan: morning breakout scanner
-        if self.hk_predictor:
-            scan_cfg = self.hk_predictor._cfg.get("auto_scan", {})
+        if self.hk_playbook:
+            scan_cfg = self.hk_playbook._cfg.get("auto_scan", {})
             if scan_cfg.get("enabled", False):
                 interval = scan_cfg.get("interval_seconds", 300)
                 self.scheduler.add_job(
@@ -323,7 +333,7 @@ class OptionsMonitor:
 
     async def _hk_auto_scan(self) -> None:
         """Run HK auto-scan (window/weekday check is inside run_auto_scan)."""
-        await self.hk_predictor.run_auto_scan(self.notifier.send_text)
+        await self.hk_playbook.run_auto_scan(self.notifier.send_text)
 
     def _is_trading_hours(self) -> bool:
         now = datetime.now(ET)
@@ -779,6 +789,24 @@ class OptionsMonitor:
 
     async def _cmd_summary(self, update, context) -> None:
         await self._send_daily_summary()
+
+    async def _cmd_keyboard(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """/kb or /start — show combined quick-access keyboard."""
+        from src.common.telegram_handlers import build_combined_keyboard
+        text, markup = build_combined_keyboard(
+            us_predictor_key="us_predictor",
+            hk_predictor_key="hk_predictor",
+            bot_data=context.bot_data,
+        )
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+    async def _cmd_keyboard_off(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """/kboff — hide quick-access keyboard."""
+        from telegram import ReplyKeyboardRemove
+        await update.message.reply_text(
+            "⌨️ 快捷键盘已关闭。发送 /kb 重新开启。",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
     # ── Hot-reload callback ──
 

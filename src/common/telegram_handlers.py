@@ -7,7 +7,7 @@ import html
 import io
 from typing import Callable
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import ContextTypes
 
@@ -197,8 +197,66 @@ async def handle_watchlist_base(
     )
 
     await update.message.reply_text(
-        format_fn(items), 
+        format_fn(items),
         parse_mode="HTML",
         reply_markup=reply_markup
     )
+
+
+def build_combined_keyboard(
+    us_predictor_key: str = "",
+    hk_predictor_key: str = "",
+    bot_data: dict | None = None,
+) -> tuple[str, ReplyKeyboardMarkup | ReplyKeyboardRemove]:
+    """Build a combined US + HK quick-access keyboard.
+
+    Returns (message_text, reply_markup).
+    """
+    rows: list[list[KeyboardButton]] = []
+    sections: list[str] = []
+
+    # US symbols
+    us_pred = bot_data.get(us_predictor_key) if bot_data and us_predictor_key else None
+    if us_pred:
+        us_items = us_pred.watchlist.list_all()
+        if us_items:
+            sections.append(f"🇺🇸 US: {len(us_items)} 个标的")
+            row: list[KeyboardButton] = []
+            for item in us_items:
+                row.append(KeyboardButton(item["symbol"]))
+                if len(row) == 4:
+                    rows.append(row)
+                    row = []
+            if row:
+                rows.append(row)
+
+    # HK symbols
+    hk_pred = bot_data.get(hk_predictor_key) if bot_data and hk_predictor_key else None
+    if hk_pred:
+        hk_items = hk_pred.watchlist.list_all()
+        if hk_items:
+            sections.append(f"🇭🇰 HK: {len(hk_items)} 个标的")
+            row = []
+            for item in hk_items:
+                # Use numeric code for cleaner display (09988 instead of HK.09988)
+                symbol = item["symbol"]
+                display = symbol.replace("HK.", "") if symbol.startswith("HK.") else symbol
+                row.append(KeyboardButton(display))
+                if len(row) == 4:
+                    rows.append(row)
+                    row = []
+            if row:
+                rows.append(row)
+
+    if not rows:
+        return "监控列表为空，请先添加标的。", ReplyKeyboardRemove()
+
+    markup = ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False)
+    text = (
+        "⌨️ <b>快捷键盘已开启</b>\n"
+        + "\n".join(sections)
+        + "\n\n点击按钮直接查询，无需手动输入代码。\n"
+        "发送 /kboff 关闭键盘。"
+    )
+    return text, markup
 

@@ -1,4 +1,4 @@
-"""Tests for the HK Predict Backtest framework."""
+"""Tests for the HK Playbook Backtest framework."""
 
 import pandas as pd
 import numpy as np

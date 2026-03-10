@@ -41,7 +41,7 @@ US 市场监控命令，由 `TelegramNotifier` 注册（`src/notification/telegr
 
 ## HK Market Commands
 
-HK 市场预测命令，由 `register_hk_commands()` 注册（`src/hk/telegram.py`）。所有命令支持短别名，在 Telegram 中输入 `/` 可弹出命令菜单。
+HK 市场预测命令，由 `register_hk_predictor_handlers()` 注册（`src/hk/telegram.py`）。所有命令支持短别名，在 Telegram 中输入 `/` 可弹出命令菜单。
 
 ### 市场概览
 

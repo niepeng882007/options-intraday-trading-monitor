@@ -2,7 +2,7 @@
 """HK Futu API 数据可行性探测脚本 — 验证港股行情、K线、期权链、盘口等数据可用性。
 
 独立同步脚本，连接本地 FutuOpenD 执行 8 个探测（Probe 0-7），
-为 HK Predict 方案提供数据可行性证据。
+为 HK Playbook 方案提供数据可行性证据。
 
 Usage:
     python scripts/hk_data_probe.py [--host 127.0.0.1] [--port 11111]
@@ -632,7 +632,7 @@ def main():
 
     if results.get("P3 HK 1m K-line") == "FAIL":
         print("  ✗ CRITICAL: No HK K-line data — Volume Profile/VWAP impossible.")
-        print("    → HK Predict scheme NOT FEASIBLE with Futu alone.")
+        print("    → HK Playbook scheme NOT FEASIBLE with Futu alone.")
     elif results.get("P3 HK 1m K-line") == "PASS":
         print("  ✓ HK 1m K-line available — Volume Profile + VWAP feasible.")
 

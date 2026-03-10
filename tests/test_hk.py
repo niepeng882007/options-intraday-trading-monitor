@@ -1,4 +1,4 @@
-"""Tests for the HK Predict module."""
+"""Tests for the HK Playbook module."""
 
 import json
 import os

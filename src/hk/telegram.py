@@ -1,4 +1,4 @@
-"""HK Predict Telegram integration — text-triggered playbook and watchlist management."""
+"""HK Playbook Telegram integration — text-triggered playbook and watchlist management."""
 
 from __future__ import annotations
 
@@ -34,8 +34,8 @@ _RE_WATCHLIST = re.compile(r"^(?:hkwl|hk_watchlist)$", re.IGNORECASE)
 _PREDICTOR_KEY = "hk_predictor"
 
 
-def register_hk_commands(application, predictor: HKPredictor) -> None:
-    """Register HK handlers onto an existing Telegram Application."""
+def register_hk_predictor_handlers(application, predictor: HKPredictor) -> None:
+    """Register HK Predictor handlers onto an existing Telegram Application."""
     application.bot_data[_PREDICTOR_KEY] = predictor
 
     not_command = ~filters.COMMAND
@@ -59,7 +59,7 @@ def register_hk_commands(application, predictor: HKPredictor) -> None:
 
     application.add_handler(CommandHandler(["hk_help", "hkh"], _cmd_hk_help, block=False))
 
-    logger.info("HK Telegram handlers registered (text triggers + /hk_help)")
+    logger.info("HK Predictor handlers registered (text triggers + /hk_help)")
 
 
 def _format_watchlist_message(items: list[dict]) -> str:

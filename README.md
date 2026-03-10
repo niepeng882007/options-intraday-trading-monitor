@@ -1,6 +1,6 @@
 # Options Intraday Trading Monitor
 
-美股实时策略监控 + US Playbook + HK Predict 的 Telegram 交易辅助系统。
+美股实时策略监控 + US Playbook + HK Playbook 的 Telegram 交易辅助系统。
 
 ## 模块概览
 
@@ -22,7 +22,7 @@
 - `Gamma Wall` 带 10 秒超时降级
 - 输出期权建议时会过滤 `0DTE`，优先 `1-7 DTE`
 
-### HK Predict (`src/hk/`)
+### HK Playbook (`src/hk/`)
 
 - 港股期权日内分析模块，支持文本触发剧本查询
 - 使用多日 `1m` K 线计算 `Volume Profile / VWAP / RVOL`
@@ -35,11 +35,11 @@
 
 | 模式 | 命令 | 说明 |
 | ------ | ------ | ------ |
-| 集成模式 | `python -m src.main` | 启动美股实时监控，并集成 US Playbook 与 HK Predict Telegram 入口；US/HK 自动扫描也在这里调度 |
+| 集成模式 | `python -m src.main` | 启动美股实时监控，并集成 US Playbook 与 HK Playbook Telegram 入口；US/HK 自动扫描也在这里调度 |
 | US 独立模式 | `python -m src.us_playbook` | 启动 US Predictor，支持文本查询和自动扫描 |
-| HK 独立模式 | `python -m src.hk` | 启动 HK Predictor，当前实现为按需查询模式，不做定时推送 |
+| HK 独立模式 | `python -m src.hk` | 启动 HK Playbook，当前实现为按需查询模式，不做定时推送 |
 | 美股回测 | `python -m src.backtest` | 回测美股策略 |
-| HK 回测 | `python -m src.hk.backtest` | 回测 HK Predict 的 VP / Regime / 交易模拟 |
+| HK 回测 | `python -m src.hk.backtest` | 回测 HK Playbook 的 VP / Regime / 交易模拟 |
 
 ## 快速开始
 
@@ -133,7 +133,7 @@ US Playbook 当前以文本触发为主，公开入口如下：
 - 默认每 `180s` 扫描一次
 - 频控规则包括同信号 `30` 分钟冷却、单 session 最多 `2` 次、单日最多 `3` 次
 
-### HK Predict 触发词
+### HK Playbook 触发词
 
 HK 模块当前同样以文本触发为主，公开入口如下：
 
@@ -171,7 +171,7 @@ US 与 HK 的 watchlist 都不是只读 YAML 配置。
 - 若 Greeks 缺失，会降级为基于 moneyness 的选择
 - 若 Regime、过滤器、到期日或期权链条件不足，会返回 `wait`
 
-### HK Predict
+### HK Playbook
 
 - 过滤当日到期合约
 - `BREAKOUT` 场景偏向方向性单腿

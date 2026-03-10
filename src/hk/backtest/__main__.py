@@ -44,7 +44,7 @@ def _get_default_symbols(settings: dict) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="HK Predict Backtest — validate VP levels and regime classification"
+        description="HK Playbook Backtest — validate VP levels and regime classification"
     )
     parser.add_argument(
         "-y", "--symbol",

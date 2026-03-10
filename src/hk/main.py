@@ -1,4 +1,4 @@
-"""HK Predict orchestrator — on-demand playbook + auto-scan alert system.
+"""HK Playbook orchestrator — on-demand playbook + auto-scan alert system.
 
 Usage:
     python -m src.hk          # Run as standalone (dev/debug)
@@ -117,7 +117,7 @@ def _load_config(path: str = DEFAULT_CONFIG_PATH) -> dict:
 
 
 class HKPredictor:
-    """Orchestrates HK market prediction pipeline — on-demand + auto-scan.
+    """Orchestrates HK Playbook pipeline — on-demand + auto-scan.
 
     Data flow per query:
         1. Fetch 1m K-lines (5 days) → Volume Profile (POC/VAH/VAL)
@@ -914,11 +914,11 @@ async def _main() -> None:
     if bot_token and chat_id:
         from telegram.ext import Application
         from telegram.request import HTTPXRequest
-        from src.hk.telegram import register_hk_commands
+        from src.hk.telegram import register_hk_predictor_handlers
 
         request = HTTPXRequest(read_timeout=30, write_timeout=30, connect_timeout=15)
         app = Application.builder().token(bot_token).request(request).build()
-        register_hk_commands(app, predictor)
+        register_hk_predictor_handlers(app, predictor)
 
         logger.info("Starting Telegram bot polling (on-demand mode, no scheduled pushes)...")
         async with app:

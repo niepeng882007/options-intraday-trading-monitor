@@ -58,9 +58,9 @@ Shared utilities extracted from HK and US modules to eliminate cross-module depe
 
 **Backward compatibility:** `src/hk/__init__.py` re-exports shared types, `src/hk/volume_profile.py` and `src/hk/gamma_wall.py` are re-export shims. Old import paths (`from src.hk import VolumeProfileResult`) continue to work.
 
-### HK Predict Module (`src/hk/`)
+### HK Playbook Module (`src/hk/`)
 
-On-demand HK market prediction system, integrated into `OptionsMonitor` via shared Telegram Application. No scheduled pushes — pure text-triggered playbook generation.
+On-demand HK market playbook system, integrated into `OptionsMonitor` via shared Telegram Application. No scheduled pushes — pure text-triggered playbook generation.
 
 - **Core:** `HKPredictor` orchestrator (on-demand, no APScheduler). `HKCollector` sync Futu wrapper, `indicators` (RVOL, trading time checks), `regime` (BREAKOUT/RANGE/WHIPSAW/UNCLEAR with IV spike detection).
 - **Option Recommendation:** `option_recommend.py` — direction from regime + price position, expiry selection (filters DTE=0), delegates to `src.common.option_utils` for single-leg/spread/chase-risk, strict wait policy (must have concrete strike + expiry, otherwise observe).
@@ -73,7 +73,7 @@ On-demand HK market prediction system, integrated into `OptionsMonitor` via shar
 
 ### US Predictor Module (`src/us_playbook/`)
 
-On-demand US options trading predictor, mirroring HK Predictor design. Integrated into `OptionsMonitor` via shared Telegram Application. No scheduled pushes — text-triggered playbook generation + auto-scan strong signal alerts. Imports shared logic from `src/common/` (no dependency on `src/hk/`).
+On-demand US options trading predictor, mirroring HK Playbook design. Integrated into `OptionsMonitor` via shared Telegram Application. No scheduled pushes — text-triggered playbook generation + auto-scan strong signal alerts. Imports shared logic from `src/common/` (no dependency on `src/hk/`).
 
 - **Core:** `USPredictor` orchestrator (on-demand + auto-scan). Reuses `FutuCollector` from US pipeline. `get_snapshot()` for quotes (no subscription needed), `get_history_bars()` for multi-day 1m bars, `get_premarket_hl()` for PM range. Binary bar caching (history cached 120s TTL, today always fresh). SPY context with 300s TTL shared between on-demand and auto-scan.
 - **Analysis:** `levels` (PDH/PDL, PMH/PML, VP via `src.common.volume_profile`, Gamma Wall via `src.common.gamma_wall`), `indicators` (window-based RVOL, adaptive thresholds), `regime` (GAP_AND_GO/TREND_DAY/FADE_CHOP/UNCLEAR with SPY context).
