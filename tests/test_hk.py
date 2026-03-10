@@ -1,5 +1,9 @@
 """Tests for the HK Predict module."""
 
+import json
+import os
+import tempfile
+
 import pandas as pd
 import numpy as np
 import pytest
@@ -8,6 +12,7 @@ from datetime import datetime, date, timezone, timedelta
 from src.hk import (
     RegimeType, VolumeProfileResult, GammaWallResult,
     RegimeResult, FilterResult, Playbook,
+    OptionRecommendation, OptionLeg,
 )
 from src.hk.volume_profile import calculate_volume_profile
 from src.hk.indicators import (
@@ -19,6 +24,15 @@ from src.hk.playbook import generate_playbook, format_playbook_message
 from src.hk.filter import check_filters
 from src.hk.orderbook import analyze_order_book, format_order_book_summary, format_alerts_message
 from src.hk.gamma_wall import calculate_gamma_wall, format_gamma_wall_message
+from src.hk.watchlist import HKWatchlist, normalize_symbol
+from src.hk.option_recommend import (
+    select_expiry,
+    classify_moneyness,
+    recommend_single_leg,
+    recommend_spread,
+    should_wait,
+    recommend,
+)
 
 HKT = timezone(timedelta(hours=8))
 
@@ -39,6 +53,100 @@ def _make_bars(prices: list[tuple], tz: str = "Asia/Hong_Kong") -> pd.DataFrame:
     return pd.DataFrame(rows, index=idx)
 
 
+# ── normalize_symbol Tests ──
+
+class TestNormalizeSymbol:
+    def test_plain_code(self):
+        assert normalize_symbol("09988") == "HK.09988"
+
+    def test_hk_prefix(self):
+        assert normalize_symbol("HK09988") == "HK.09988"
+
+    def test_hk_dot_prefix(self):
+        assert normalize_symbol("HK.09988") == "HK.09988"
+
+    def test_lowercase(self):
+        assert normalize_symbol("hk09988") == "HK.09988"
+
+    def test_six_digit(self):
+        assert normalize_symbol("800000") == "HK.800000"
+
+    def test_short_code_padded(self):
+        assert normalize_symbol("0700") == "HK.00700"
+
+    def test_invalid_text(self):
+        assert normalize_symbol("AAPL") is None
+
+    def test_empty(self):
+        assert normalize_symbol("") is None
+
+    def test_slash_prefix(self):
+        assert normalize_symbol("/hk_help") is None
+
+
+# ── Watchlist Tests ──
+
+class TestWatchlist:
+    def _make_wl(self, tmpdir, initial=None):
+        path = os.path.join(tmpdir, "wl.json")
+        return HKWatchlist(path=path, initial_config=initial)
+
+    def test_add_and_contains(self, tmp_path):
+        wl = self._make_wl(tmp_path)
+        assert wl.add("HK.09988", "Alibaba")
+        assert wl.contains("HK.09988")
+
+    def test_add_duplicate(self, tmp_path):
+        wl = self._make_wl(tmp_path)
+        wl.add("HK.09988", "Alibaba")
+        assert not wl.add("HK.09988", "Alibaba")
+
+    def test_remove(self, tmp_path):
+        wl = self._make_wl(tmp_path)
+        wl.add("HK.09988", "Alibaba")
+        assert wl.remove("HK.09988")
+        assert not wl.contains("HK.09988")
+
+    def test_remove_nonexistent(self, tmp_path):
+        wl = self._make_wl(tmp_path)
+        assert not wl.remove("HK.99999")
+
+    def test_list_all(self, tmp_path):
+        wl = self._make_wl(tmp_path)
+        wl.add("HK.09988", "Alibaba")
+        wl.add("HK.00700", "Tencent")
+        items = wl.list_all()
+        assert len(items) == 2
+        assert items[0]["symbol"] == "HK.09988"
+
+    def test_get_name(self, tmp_path):
+        wl = self._make_wl(tmp_path)
+        wl.add("HK.09988", "Alibaba")
+        assert wl.get_name("HK.09988") == "Alibaba"
+        assert wl.get_name("HK.99999") == "HK.99999"
+
+    def test_persistence(self, tmp_path):
+        path = os.path.join(tmp_path, "wl.json")
+        wl1 = HKWatchlist(path=path)
+        wl1.add("HK.09988", "Alibaba")
+        # Create new instance from same file
+        wl2 = HKWatchlist(path=path)
+        assert wl2.contains("HK.09988")
+        assert wl2.get_name("HK.09988") == "Alibaba"
+
+    def test_init_from_config(self, tmp_path):
+        cfg = {
+            "watchlist": {
+                "indices": [{"symbol": "HK.800000", "name": "HSI"}],
+                "stocks": [{"symbol": "HK.00700", "name": "Tencent"}],
+            }
+        }
+        wl = self._make_wl(tmp_path, initial=cfg)
+        assert wl.contains("HK.800000")
+        assert wl.contains("HK.00700")
+        assert len(wl.list_all()) == 2
+
+
 # ── Volume Profile Tests ──
 
 class TestVolumeProfile:
@@ -57,20 +165,16 @@ class TestVolumeProfile:
         assert result.total_volume > 0
 
     def test_poc_at_highest_volume(self):
-        """POC should be at the price level with the most volume."""
         bars = _make_bars([
-            # Most volume concentrated around 500
             ("2026-03-09 09:30:00", 500, 501, 499, 500, 100000),
             ("2026-03-09 09:31:00", 500, 501, 499, 500, 100000),
             ("2026-03-09 09:32:00", 500, 501, 499, 500, 100000),
-            # Less volume at 510
             ("2026-03-09 09:33:00", 510, 511, 509, 510, 1000),
         ])
         result = calculate_volume_profile(bars, tick_size=1.0)
         assert 499 <= result.poc <= 501
 
     def test_value_area(self):
-        """VAH >= POC >= VAL."""
         bars = _make_bars([
             ("2026-03-09 09:30:00", 100, 110, 90, 100, 10000),
             ("2026-03-09 09:31:00", 100, 105, 95, 102, 20000),
@@ -80,13 +184,10 @@ class TestVolumeProfile:
         assert result.vah >= result.poc >= result.val
 
     def test_auto_tick_size(self):
-        """Tick size auto-detection based on price."""
-        # HSI-level prices should get tick_size=50
         bars = _make_bars([
             ("2026-03-09 09:30:00", 25000, 25100, 24900, 25050, 1000),
         ])
         result = calculate_volume_profile(bars)
-        # Should have bins at 50-point intervals
         assert all(p % 50 == 0 for p in result.volume_by_price.keys())
 
 
@@ -101,17 +202,15 @@ class TestVWAP:
             ("2026-03-09 09:30:00", 100, 102, 98, 100, 10000),
         ])
         vwap = calculate_vwap(bars)
-        # VWAP = (H+L+C)/3 for single bar
         assert abs(vwap - (102 + 98 + 100) / 3) < 0.01
 
     def test_volume_weighted(self):
-        """Higher volume bar should pull VWAP toward its price."""
         bars = _make_bars([
             ("2026-03-09 09:30:00", 100, 100, 100, 100, 1),
             ("2026-03-09 09:31:00", 200, 200, 200, 200, 1000000),
         ])
         vwap = calculate_vwap(bars)
-        assert vwap > 190  # Should be close to 200
+        assert vwap > 190
 
     def test_series_length(self):
         bars = _make_bars([
@@ -129,7 +228,6 @@ class TestRVOL:
         assert calculate_rvol(pd.DataFrame(), pd.DataFrame()) == 1.0
 
     def test_same_volume(self):
-        """Same volume as history → RVOL ≈ 1.0."""
         today = _make_bars([
             ("2026-03-09 09:30:00", 100, 101, 99, 100, 10000),
         ])
@@ -140,7 +238,6 @@ class TestRVOL:
         assert abs(rvol - 1.0) < 0.1
 
     def test_high_volume(self):
-        """2x volume → RVOL ≈ 2.0."""
         today = _make_bars([
             ("2026-03-09 09:30:00", 100, 101, 99, 100, 20000),
         ])
@@ -158,17 +255,14 @@ class TestRegime:
         return VolumeProfileResult(poc=poc, vah=vah, val=val)
 
     def test_breakout(self):
-        """High RVOL + price above VAH = BREAKOUT."""
         result = classify_regime(price=515, rvol=1.5, vp=self._vp())
         assert result.regime == RegimeType.BREAKOUT
 
     def test_range(self):
-        """Low RVOL + price in value area = RANGE."""
         result = classify_regime(price=500, rvol=0.6, vp=self._vp())
         assert result.regime == RegimeType.RANGE
 
     def test_whipsaw(self):
-        """IV spike + near gamma wall = WHIPSAW."""
         gw = GammaWallResult(call_wall_strike=502, put_wall_strike=498, max_pain=500)
         result = classify_regime(
             price=501, rvol=1.0, vp=self._vp(),
@@ -177,7 +271,6 @@ class TestRegime:
         assert result.regime == RegimeType.WHIPSAW
 
     def test_unclear_neutral_rvol(self):
-        """RVOL in neutral zone → UNCLEAR."""
         result = classify_regime(price=500, rvol=1.0, vp=self._vp())
         assert result.regime == RegimeType.UNCLEAR
 
@@ -188,7 +281,6 @@ class TestRegime:
         assert result.confidence == 0.0
 
     def test_breakout_below_val(self):
-        """Price below VAL with high RVOL = BREAKOUT."""
         result = classify_regime(price=480, rvol=1.5, vp=self._vp())
         assert result.regime == RegimeType.BREAKOUT
         assert "below VAL" in result.details
@@ -208,17 +300,47 @@ class TestPlaybook:
         assert "VWAP" in pb.key_levels
         assert pb.strategy_text
 
-    def test_format_message(self):
+    def test_format_message_5_sections(self):
+        """Formatted message should contain all 5 sections."""
         regime = RegimeResult(
             regime=RegimeType.RANGE, confidence=0.7,
             rvol=0.6, price=500, vah=510, val=490, poc=500,
         )
         vp = VolumeProfileResult(poc=500, vah=510, val=490)
-        pb = generate_playbook(regime, vp, vwap=502)
-        msg = format_playbook_message(pb, symbol="HK.00700", update_type="morning")
-        assert "Playbook" in msg
-        assert "HK.00700" in msg
+        rec = OptionRecommendation(
+            action="call", direction="bullish",
+            expiry="2026-03-18",
+            legs=[OptionLeg(side="buy", option_type="call", strike=505, pct_from_price=1.0, moneyness="OTM 1.0%")],
+            moneyness="OTM 1.0%",
+            rationale="test rationale",
+            risk_note="test risk note",
+        )
+        pb = generate_playbook(regime, vp, vwap=502, option_rec=rec)
+        msg = format_playbook_message(pb, symbol="Tencent (HK.00700)")
+        # Section checks
+        assert "Regime" in msg
         assert "RVOL" in msg
+        assert "POC" in msg
+        assert "Call" in msg
+        assert "505" in msg
+        assert "2026-03-18" in msg
+
+    def test_format_wait_recommendation(self):
+        regime = RegimeResult(
+            regime=RegimeType.UNCLEAR, confidence=0.3,
+            rvol=0.4, price=500, vah=510, val=490, poc=500,
+        )
+        vp = VolumeProfileResult(poc=500, vah=510, val=490)
+        rec = OptionRecommendation(
+            action="wait", direction="neutral",
+            rationale="观望",
+            risk_note="Regime UNCLEAR",
+            wait_conditions=["等待突破 VAH"],
+        )
+        pb = generate_playbook(regime, vp, vwap=502, option_rec=rec)
+        msg = format_playbook_message(pb, symbol="Test")
+        assert "观望" in msg
+        assert "VAH" in msg
 
 
 # ── Filter Tests ──
@@ -285,7 +407,7 @@ class TestOrderBook:
                 (511.5, 800, 3, {}),
                 (512.0, 1200, 4, {}),
                 (512.5, 900, 3, {}),
-                (513.0, 30000, 2, {}),  # Large order: 30000 / avg(~1180) ≈ 6.8x
+                (513.0, 30000, 2, {}),
             ],
             "Bid": [
                 (510.5, 900, 4, {}),
@@ -326,15 +448,15 @@ class TestGammaWall:
 
     def test_call_wall(self):
         gw = calculate_gamma_wall(self._chain(), current_price=25100)
-        assert gw.call_wall_strike == 25200  # Max call OI above price
+        assert gw.call_wall_strike == 25200
 
     def test_put_wall(self):
         gw = calculate_gamma_wall(self._chain(), current_price=25100)
-        assert gw.put_wall_strike == 24800  # Max put OI below price
+        assert gw.put_wall_strike == 24800
 
     def test_max_pain(self):
         gw = calculate_gamma_wall(self._chain(), current_price=25100)
-        assert gw.max_pain > 0  # Should find a valid max pain
+        assert gw.max_pain > 0
 
     def test_empty_chain(self):
         gw = calculate_gamma_wall(pd.DataFrame(), current_price=25000)
@@ -393,210 +515,303 @@ class TestTradingTime:
         assert is_trading_time(dt_time(15, 59))
 
 
-# ── Order Book Dedup Tests ──
+# ── Option Recommendation Tests ──
 
-class TestOrderBookDedup:
-    """Test order book alert dedup logic in HKPredictor."""
+class TestSelectExpiry:
+    def test_filters_dte_zero(self):
+        today = date(2026, 3, 10)
+        dates = [
+            {"strike_time": "2026-03-10"},  # DTE=0
+            {"strike_time": "2026-03-17"},  # DTE=7
+        ]
+        result = select_expiry(dates, today)
+        assert result == "2026-03-17"
 
-    def _make_predictor(self) -> "HKPredictor":
-        """Create a minimal HKPredictor with mocked collector."""
-        from unittest.mock import MagicMock, AsyncMock
-        from src.hk.main import HKPredictor, _SeenOrder
+    def test_prefers_nearest(self):
+        today = date(2026, 3, 10)
+        dates = [
+            {"strike_time": "2026-03-14"},  # DTE=4
+            {"strike_time": "2026-03-21"},  # DTE=11
+        ]
+        result = select_expiry(dates, today)
+        assert result == "2026-03-14"
 
-        p = object.__new__(HKPredictor)
-        p._cfg = {
-            "watchlist": {"stocks": [{"symbol": "HK.00700", "name": "Tencent"}]},
-            "order_book": {
-                "large_order_ratio": 3.0,
-                "monitor_depth": 10,
-                "alert_cooldown_minutes": 15,
-                "volume_change_threshold": 0.5,
-                "seen_order_expiry_minutes": 60,
-            },
-        }
-        p._collector = MagicMock()
-        p._send_fn = AsyncMock()
-        p._seen_orders = {}
-        p._last_playbooks = {}
-        p._connected = True
-        return p
+    def test_no_valid_expiry(self):
+        today = date(2026, 3, 10)
+        dates = [{"strike_time": "2026-03-10"}]  # only DTE=0
+        assert select_expiry(dates, today) is None
 
-    def _make_book(self, ask_price: float = 513.0, ask_vol: int = 30000) -> dict:
-        return {
-            "code": "HK.00700",
-            "Ask": [
-                (511.0, 1000, 5, {}),
-                (511.5, 800, 3, {}),
-                (512.0, 1200, 4, {}),
-                (512.5, 900, 3, {}),
-                (ask_price, ask_vol, 2, {}),
-            ],
-            "Bid": [(510.5, 900, 4, {})],
-        }
+    def test_empty_list(self):
+        assert select_expiry([]) is None
 
-    @pytest.mark.asyncio
-    async def test_first_alert_passes(self):
-        """First time seeing a large order → alert with 🆕 tag."""
-        p = self._make_predictor()
-        p._collector.get_order_book = lambda *a, **k: self._make_book()
 
-        sent_messages = []
-        async def capture(text, **kw):
-            sent_messages.append(text)
-        p._send_fn = capture
+class TestClassifyMoneyness:
+    def test_atm(self):
+        assert classify_moneyness(100.2, 100.0, "call") == "ATM"
 
-        # Patch _run_sync to call function directly
-        async def _run_sync(fn, *args):
-            return fn(*args)
-        p._run_sync = _run_sync
+    def test_call_otm(self):
+        result = classify_moneyness(105, 100, "call")
+        assert result.startswith("OTM")
 
-        await p.check_orderbook_alerts()
-        assert len(sent_messages) == 1
-        assert "🆕" in sent_messages[0]
-        assert len(p._seen_orders) == 1
+    def test_call_itm(self):
+        result = classify_moneyness(95, 100, "call")
+        assert result.startswith("ITM")
 
-    @pytest.mark.asyncio
-    async def test_duplicate_suppressed(self):
-        """Same order within cooldown → no alert."""
-        p = self._make_predictor()
-        p._collector.get_order_book = lambda *a, **k: self._make_book()
+    def test_put_otm(self):
+        result = classify_moneyness(95, 100, "put")
+        assert result.startswith("OTM")
 
-        sent_messages = []
-        async def capture(text, **kw):
-            sent_messages.append(text)
-        p._send_fn = capture
+    def test_put_itm(self):
+        result = classify_moneyness(105, 100, "put")
+        assert result.startswith("ITM")
 
-        async def _run_sync(fn, *args):
-            return fn(*args)
-        p._run_sync = _run_sync
 
-        await p.check_orderbook_alerts()
-        assert len(sent_messages) == 1  # first alert
+class TestRecommendSingleLeg:
+    def _chain(self, expiry="2026-03-17"):
+        return pd.DataFrame([
+            {"code": "C1", "option_type": "CALL", "strike_price": 98, "strike_time": expiry,
+             "open_interest": 100, "delta": 0.6, "implied_volatility": 30},
+            {"code": "C2", "option_type": "CALL", "strike_price": 100, "strike_time": expiry,
+             "open_interest": 200, "delta": 0.5, "implied_volatility": 28},
+            {"code": "C3", "option_type": "CALL", "strike_price": 102, "strike_time": expiry,
+             "open_interest": 150, "delta": 0.35, "implied_volatility": 26},
+            {"code": "P1", "option_type": "PUT", "strike_price": 98, "strike_time": expiry,
+             "open_interest": 180, "delta": -0.4, "implied_volatility": 30},
+            {"code": "P2", "option_type": "PUT", "strike_price": 100, "strike_time": expiry,
+             "open_interest": 250, "delta": -0.5, "implied_volatility": 28},
+            {"code": "P3", "option_type": "PUT", "strike_price": 102, "strike_time": expiry,
+             "open_interest": 120, "delta": -0.6, "implied_volatility": 26},
+        ])
 
-        await p.check_orderbook_alerts()
-        assert len(sent_messages) == 1  # no second alert
+    def test_bullish_picks_call(self):
+        leg = recommend_single_leg("bullish", self._chain(), price=100, expiry="2026-03-17")
+        assert leg is not None
+        assert leg.option_type == "call"
+        assert leg.side == "buy"
 
-    @pytest.mark.asyncio
-    async def test_volume_increase_realerts(self):
-        """Volume increase ≥50% → re-alert with 📈 tag."""
-        from src.hk.main import _SeenOrder
+    def test_bearish_picks_put(self):
+        leg = recommend_single_leg("bearish", self._chain(), price=100, expiry="2026-03-17")
+        assert leg is not None
+        assert leg.option_type == "put"
+        assert leg.side == "buy"
 
-        p = self._make_predictor()
-        now = datetime.now(timezone(timedelta(hours=8)))
+    def test_empty_chain(self):
+        leg = recommend_single_leg("bullish", pd.DataFrame(), price=100, expiry="2026-03-17")
+        assert leg is None
 
-        # Pre-seed a seen order with volume=20000
-        key = ("HK.00700", "ask", 513.0)
-        p._seen_orders[key] = _SeenOrder(volume=20000, alerted_at=now)
 
-        # New book has 30000 → +50% increase
-        p._collector.get_order_book = lambda *a, **k: self._make_book(ask_vol=30000)
+class TestRecommendSpread:
+    def _chain(self, expiry="2026-03-17"):
+        return pd.DataFrame([
+            {"code": f"C{i}", "option_type": "CALL", "strike_price": 95 + i * 2,
+             "strike_time": expiry, "open_interest": 100 + i * 50, "delta": 0.5 - i * 0.1}
+            for i in range(5)
+        ] + [
+            {"code": f"P{i}", "option_type": "PUT", "strike_price": 95 + i * 2,
+             "strike_time": expiry, "open_interest": 100 + i * 50, "delta": -0.5 + i * 0.1}
+            for i in range(5)
+        ])
 
-        sent_messages = []
-        async def capture(text, **kw):
-            sent_messages.append(text)
-        p._send_fn = capture
+    def test_bullish_spread(self):
+        legs = recommend_spread("bullish", self._chain(), price=101, expiry="2026-03-17")
+        assert legs is not None
+        assert len(legs) == 2
+        assert any(l.side == "sell" and l.option_type == "put" for l in legs)
+        assert any(l.side == "buy" and l.option_type == "put" for l in legs)
 
-        async def _run_sync(fn, *args):
-            return fn(*args)
-        p._run_sync = _run_sync
+    def test_bearish_spread(self):
+        legs = recommend_spread("bearish", self._chain(), price=101, expiry="2026-03-17")
+        assert legs is not None
+        assert len(legs) == 2
+        assert any(l.side == "sell" and l.option_type == "call" for l in legs)
 
-        await p.check_orderbook_alerts()
-        assert len(sent_messages) == 1
-        assert "📈" in sent_messages[0]
+    def test_empty_chain(self):
+        assert recommend_spread("bullish", pd.DataFrame(), price=100, expiry="2026-03-17") is None
 
-    @pytest.mark.asyncio
-    async def test_cooldown_expiry_realerts(self):
-        """After cooldown expires, still-present order → re-alert with ⏰ tag."""
-        from src.hk.main import _SeenOrder
 
-        p = self._make_predictor()
-        now = datetime.now(timezone(timedelta(hours=8)))
-
-        # Pre-seed order alerted 20 minutes ago (cooldown=15min)
-        key = ("HK.00700", "ask", 513.0)
-        p._seen_orders[key] = _SeenOrder(
-            volume=30000,
-            alerted_at=now - timedelta(minutes=20),
+class TestShouldWait:
+    def _regime(self, regime_type=RegimeType.BREAKOUT, confidence=0.8, rvol=1.5):
+        return RegimeResult(
+            regime=regime_type, confidence=confidence,
+            rvol=rvol, price=100, vah=105, val=95, poc=100,
         )
 
-        p._collector.get_order_book = lambda *a, **k: self._make_book(ask_vol=30000)
+    def _vp(self):
+        return VolumeProfileResult(poc=100, vah=105, val=95)
 
-        sent_messages = []
-        async def capture(text, **kw):
-            sent_messages.append(text)
-        p._send_fn = capture
+    def _filters(self, tradeable=True):
+        return FilterResult(tradeable=tradeable)
 
-        async def _run_sync(fn, *args):
-            return fn(*args)
-        p._run_sync = _run_sync
-
-        await p.check_orderbook_alerts()
-        assert len(sent_messages) == 1
-        assert "⏰" in sent_messages[0]
-
-    def test_cleanup_expired(self):
-        """Expired entries are removed from _seen_orders."""
-        from src.hk.main import _SeenOrder
-
-        p = self._make_predictor()
-        now = datetime.now(timezone(timedelta(hours=8)))
-
-        # Add an entry that's 90 minutes old (expiry=60min)
-        key_old = ("HK.00700", "ask", 513.0)
-        p._seen_orders[key_old] = _SeenOrder(
-            volume=30000,
-            alerted_at=now - timedelta(minutes=90),
+    def test_no_wait_breakout(self):
+        wait, reasons, _ = should_wait(
+            self._regime(), self._filters(), self._vp(),
+            chain_available=True, expiry_available=True,
         )
+        assert not wait
 
-        # Add a recent entry
-        key_new = ("HK.00700", "bid", 510.0)
-        p._seen_orders[key_new] = _SeenOrder(
-            volume=5000,
-            alerted_at=now - timedelta(minutes=5),
+    def test_wait_filter_blocked(self):
+        wait, reasons, _ = should_wait(
+            self._regime(), self._filters(tradeable=False), self._vp(),
+            chain_available=True, expiry_available=True,
         )
+        assert wait
 
-        p._cleanup_seen_orders(now, expiry_minutes=60)
-        assert key_old not in p._seen_orders
-        assert key_new in p._seen_orders
+    def test_wait_unclear_low_confidence(self):
+        wait, reasons, _ = should_wait(
+            self._regime(RegimeType.UNCLEAR, confidence=0.3),
+            self._filters(), self._vp(),
+            chain_available=True, expiry_available=True,
+        )
+        assert wait
 
-    @pytest.mark.asyncio
-    async def test_different_prices_independent(self):
-        """Different price levels are tracked independently."""
-        from src.hk.main import _SeenOrder
+    def test_wait_whipsaw(self):
+        wait, reasons, _ = should_wait(
+            self._regime(RegimeType.WHIPSAW),
+            self._filters(), self._vp(),
+            chain_available=True, expiry_available=True,
+        )
+        assert wait
 
-        p = self._make_predictor()
-        now = datetime.now(timezone(timedelta(hours=8)))
+    def test_wait_low_rvol(self):
+        wait, reasons, _ = should_wait(
+            self._regime(rvol=0.3),
+            self._filters(), self._vp(),
+            chain_available=True, expiry_available=True,
+        )
+        assert wait
 
-        # Pre-seed order at 513.0
-        key = ("HK.00700", "ask", 513.0)
-        p._seen_orders[key] = _SeenOrder(volume=30000, alerted_at=now)
+    def test_wait_no_chain(self):
+        wait, reasons, _ = should_wait(
+            self._regime(), self._filters(), self._vp(),
+            chain_available=False, expiry_available=False,
+        )
+        assert wait
 
-        # New book has large order at DIFFERENT price 514.0
-        book = {
-            "code": "HK.00700",
-            "Ask": [
-                (511.0, 1000, 5, {}),
-                (511.5, 800, 3, {}),
-                (512.0, 1200, 4, {}),
-                (512.5, 900, 3, {}),
-                (514.0, 25000, 2, {}),  # Different price
-            ],
-            "Bid": [(510.5, 900, 4, {})],
-        }
-        p._collector.get_order_book = lambda *a, **k: book
 
-        sent_messages = []
-        async def capture(text, **kw):
-            sent_messages.append(text)
-        p._send_fn = capture
+class TestRecommend:
+    def _vp(self):
+        return VolumeProfileResult(poc=100, vah=105, val=95)
 
-        async def _run_sync(fn, *args):
-            return fn(*args)
-        p._run_sync = _run_sync
+    def _filters(self):
+        return FilterResult(tradeable=True)
 
-        await p.check_orderbook_alerts()
-        assert len(sent_messages) == 1
-        assert "🆕" in sent_messages[0]
-        # Both keys should exist
-        assert ("HK.00700", "ask", 513.0) in p._seen_orders
-        assert ("HK.00700", "ask", 514.0) in p._seen_orders
+    def test_wait_when_unclear(self):
+        regime = RegimeResult(
+            regime=RegimeType.UNCLEAR, confidence=0.3,
+            rvol=0.8, price=100, vah=105, val=95, poc=100,
+        )
+        rec = recommend(regime, self._vp(), self._filters())
+        assert rec.action == "wait"
+
+    def test_bullish_call_breakout(self):
+        regime = RegimeResult(
+            regime=RegimeType.BREAKOUT, confidence=0.8,
+            rvol=1.5, price=108, vah=105, val=95, poc=100,
+        )
+        chain = pd.DataFrame([
+            {"code": "C1", "option_type": "CALL", "strike_price": 108,
+             "strike_time": "2026-03-17", "open_interest": 200, "delta": 0.5},
+            {"code": "C2", "option_type": "CALL", "strike_price": 110,
+             "strike_time": "2026-03-17", "open_interest": 150, "delta": 0.35},
+        ])
+        dates = [{"strike_time": "2026-03-17"}]
+        rec = recommend(regime, self._vp(), self._filters(),
+                        chain_df=chain, expiry_dates=dates)
+        assert rec.action == "call"
+        assert rec.direction == "bullish"
+
+    def test_no_chain_waits(self):
+        """No chain data → must return wait (not degraded call/put)."""
+        regime = RegimeResult(
+            regime=RegimeType.BREAKOUT, confidence=0.8,
+            rvol=1.5, price=108, vah=105, val=95, poc=100,
+        )
+        dates = [{"strike_time": "2026-03-17"}]
+        rec = recommend(regime, self._vp(), self._filters(), expiry_dates=dates)
+        assert rec.action == "wait"
+        assert rec.direction == "bullish"  # direction hint preserved
+        assert rec.liquidity_warning is not None
+
+    def test_no_expiry_waits(self):
+        """No valid expiry → must return wait."""
+        regime = RegimeResult(
+            regime=RegimeType.BREAKOUT, confidence=0.8,
+            rvol=1.5, price=108, vah=105, val=95, poc=100,
+        )
+        chain = pd.DataFrame({
+            "strike_price": [105, 110],
+            "option_type": ["CALL", "CALL"],
+            "strike_time": ["2026-03-17", "2026-03-17"],
+            "open_interest": [100, 200],
+        })
+        rec = recommend(regime, self._vp(), self._filters(), chain_df=chain, expiry_dates=[])
+        assert rec.action == "wait"
+
+    def test_no_suitable_strike_waits(self):
+        """Chain exists but no strike meets OI threshold → must return wait."""
+        regime = RegimeResult(
+            regime=RegimeType.BREAKOUT, confidence=0.8,
+            rvol=1.5, price=108, vah=105, val=95, poc=100,
+        )
+        # All OI below threshold (10)
+        chain = pd.DataFrame({
+            "strike_price": [105, 110],
+            "option_type": ["CALL", "CALL"],
+            "strike_time": ["2026-03-17", "2026-03-17"],
+            "open_interest": [1, 2],
+        })
+        dates = [{"strike_time": "2026-03-17"}]
+        rec = recommend(regime, self._vp(), self._filters(), chain_df=chain, expiry_dates=dates)
+        assert rec.action == "wait"
+        assert rec.liquidity_warning is not None
+
+
+# ── Telegram Handler Regex Tests ──
+
+class TestTelegramRegex:
+    """Test regex patterns for handler routing."""
+
+    def test_query_plain_code(self):
+        from src.hk.telegram import _RE_QUERY
+        assert _RE_QUERY.match("09988")
+        assert _RE_QUERY.match("00700")
+        assert _RE_QUERY.match("800000")
+
+    def test_query_hk_prefix(self):
+        from src.hk.telegram import _RE_QUERY
+        assert _RE_QUERY.match("HK09988")
+        assert _RE_QUERY.match("HK.09988")
+        assert _RE_QUERY.match("hk09988")
+
+    def test_query_no_match_commands(self):
+        from src.hk.telegram import _RE_QUERY
+        assert not _RE_QUERY.match("/hk_help")
+        assert not _RE_QUERY.match("AAPL")
+        assert not _RE_QUERY.match("+09988")
+
+    def test_add_pattern(self):
+        from src.hk.telegram import _RE_ADD
+        m = _RE_ADD.match("+09988 Alibaba")
+        assert m
+        assert m.group(1) == "09988"
+        assert m.group(2) == "Alibaba"
+
+    def test_add_no_name(self):
+        from src.hk.telegram import _RE_ADD
+        m = _RE_ADD.match("+09988")
+        assert m
+        assert m.group(2) == ""
+
+    def test_remove_pattern(self):
+        from src.hk.telegram import _RE_REMOVE
+        m = _RE_REMOVE.match("-09988")
+        assert m
+        assert m.group(1) == "09988"
+
+    def test_watchlist_pattern(self):
+        from src.hk.telegram import _RE_WATCHLIST
+        assert _RE_WATCHLIST.match("wl")
+        assert _RE_WATCHLIST.match("WL")
+        assert _RE_WATCHLIST.match("watchlist")
+        assert _RE_WATCHLIST.match("Watchlist")
+        assert not _RE_WATCHLIST.match("wl ")  # trailing space

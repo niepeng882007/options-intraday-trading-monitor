@@ -113,8 +113,18 @@ class HKCollector:
             df["Volume"] = df["Turnover"]
         return df[["Open", "High", "Low", "Close", "Volume"]]
 
-    def get_option_chain_with_oi(self, symbol: str, index_option_type: str = "NORMAL") -> pd.DataFrame:
+    def get_option_chain_with_oi(
+        self,
+        symbol: str,
+        index_option_type: str = "NORMAL",
+        strike_time: str | None = None,
+    ) -> pd.DataFrame:
         """Get option chain with real OI from snapshot.
+
+        Args:
+            symbol: underlying symbol
+            index_option_type: NORMAL or MINI
+            strike_time: optional expiry date filter (e.g. "2026-03-18") to reduce API calls
 
         Returns DataFrame with columns: code, option_type, strike_price, strike_time,
         open_interest, implied_volatility, delta, gamma, theta, vega, last_price, volume.
@@ -123,7 +133,10 @@ class HKCollector:
         idx_type = getattr(IndexOptionType, index_option_type, IndexOptionType.NORMAL)
 
         # Get chain structure
-        ret, chain = ctx.get_option_chain(symbol, index_option_type=idx_type)
+        kwargs = {"index_option_type": idx_type}
+        if strike_time:
+            kwargs["strike_time"] = strike_time
+        ret, chain = ctx.get_option_chain(symbol, **kwargs)
         if ret != RET_OK:
             raise RuntimeError(f"get_option_chain failed: {chain}")
         if chain is None or chain.empty:

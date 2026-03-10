@@ -62,6 +62,28 @@ class FilterResult:
 
 
 @dataclass
+class OptionLeg:
+    side: str          # "buy" | "sell"
+    option_type: str   # "call" | "put"
+    strike: float
+    pct_from_price: float  # distance from current price %
+    moneyness: str     # "ATM" | "OTM 3.2%" | "ITM 1.5%"
+
+
+@dataclass
+class OptionRecommendation:
+    action: str                    # "call" | "put" | "bull_put_spread" | "bear_call_spread" | "wait"
+    direction: str                 # "bullish" | "bearish" | "neutral"
+    expiry: str | None = None      # "2026-03-18"
+    legs: list[OptionLeg] = field(default_factory=list)
+    moneyness: str = ""            # "ATM" | "OTM" | "ITM"
+    rationale: str = ""            # recommendation rationale
+    risk_note: str = ""            # risk note / wait reason
+    wait_conditions: list[str] = field(default_factory=list)
+    liquidity_warning: str | None = None
+
+
+@dataclass
 class Playbook:
     regime: RegimeResult
     volume_profile: VolumeProfileResult
@@ -71,3 +93,4 @@ class Playbook:
     key_levels: dict[str, float] = field(default_factory=dict)
     strategy_text: str = ""
     generated_at: datetime | None = None
+    option_rec: OptionRecommendation | None = None

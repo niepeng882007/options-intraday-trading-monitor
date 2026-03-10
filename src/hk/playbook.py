@@ -1,3 +1,5 @@
+"""HK Playbook — generate and format aggregated playbook messages."""
+
 from __future__ import annotations
 
 import html
@@ -5,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 
 from src.hk import (
     RegimeType, RegimeResult, VolumeProfileResult,
-    GammaWallResult, FilterResult, Playbook,
+    GammaWallResult, FilterResult, Playbook, OptionRecommendation,
 )
 from src.utils.logger import setup_logger
 
@@ -50,7 +52,7 @@ REGIME_STRATEGY = {
     RegimeType.UNCLEAR: (
         "\u89c2\u671b\u4e3a\u4e3b \u2014 \u964d\u4f4e\u4ed3\u4f4d\n"
         "\u2022 \u4ed3\u4f4d\u964d\u81f3\u6b63\u5e38\u7684 30%\n"
-        "\u2022 \u7b49\u5f85 10:05 / 13:05 Regime \u66f4\u65b0\n"
+        "\u2022 \u7b49\u5f85 Regime \u66f4\u65b0\n"
         "\u2022 \u4ec5\u53c2\u4e0e\u9ad8\u786e\u5b9a\u6027\u673a\u4f1a"
     ),
 }
@@ -64,6 +66,7 @@ def generate_playbook(
     filters: FilterResult | None = None,
     symbol: str = "",
     update_type: str = "morning",
+    option_rec: OptionRecommendation | None = None,
 ) -> Playbook:
     """Generate a complete Playbook object."""
     if filters is None:
@@ -94,6 +97,7 @@ def generate_playbook(
         key_levels=key_levels,
         strategy_text=strategy_text,
         generated_at=datetime.now(HKT),
+        option_rec=option_rec,
     )
 
 
@@ -103,55 +107,128 @@ def _confidence_bar(confidence: float) -> str:
     return "\u2588" * filled + "\u2591" * (5 - filled)
 
 
+def _price_position(price: float, vp: VolumeProfileResult, vwap: float) -> str:
+    """Describe price position relative to VA and VWAP."""
+    parts = []
+    if price > vp.vah:
+        parts.append("VAH \u4e0a\u65b9")
+    elif price < vp.val:
+        parts.append("VAL \u4e0b\u65b9")
+    else:
+        parts.append("VA \u5185\u90e8")
+
+    if vwap > 0:
+        if price > vwap:
+            parts.append("VWAP \u4e0a\u65b9")
+        else:
+            parts.append("VWAP \u4e0b\u65b9")
+
+    return "\u4ef7\u683c\u4f4d\u4e8e " + ", ".join(parts)
+
+
 def format_playbook_message(
     playbook: Playbook,
     symbol: str = "",
-    update_type: str = "morning",
+    update_type: str = "manual",
 ) -> str:
-    """Format playbook as Telegram HTML message."""
+    """Format playbook as Telegram HTML message — 5-section aggregated output."""
+    _esc = html.escape
     r = playbook.regime
     emoji = REGIME_EMOJI.get(r.regime, "\u2753")
     regime_cn = REGIME_NAME_CN.get(r.regime, "\u672a\u77e5")
     now = playbook.generated_at or datetime.now(HKT)
 
-    # Update type label
-    update_labels = {
-        "morning": "\u65e9\u76d8 Playbook",
-        "confirm": "10:05 \u786e\u8ba4\u66f4\u65b0",
-        "afternoon": "\u5348\u540e Playbook",
-        "alert": "\u76d8\u53e3\u5f02\u5e38\u544a\u8b66",
-    }
-    label = update_labels.get(update_type, "Playbook")
+    lines: list[str] = []
+    sep = "\u2501" * 20
 
-    lines = [
-        f"{emoji} <b>\u3010{label}\u3011{symbol}</b>",
-        "\u2501" * 20,
-        "",
-        "<b>\u4eca\u65e5\u5e02\u573a\u5b9a\u8c03</b>",
-        f"  \u98ce\u683c: {emoji} {regime_cn}",
-        f"  \u4fe1\u5fc3: {_confidence_bar(r.confidence)} {r.confidence:.0%}",
-        f"  RVOL: {r.rvol:.2f}",
-        f"  \u8be6\u60c5: {html.escape(r.details)}",
-        "",
-        "<b>\u5173\u952e\u70b9\u4f4d</b>",
-    ]
+    # (1) Header
+    lines.append(sep)
+    lines.append(f"<b>{_esc(symbol)}</b>")
+    lines.append(f"{now.strftime('%Y-%m-%d %H:%M:%S')} HKT")
+    lines.append("")
 
-    for name, val in sorted(playbook.key_levels.items(), key=lambda x: -x[1]):
-        # Mark current price position relative to levels
-        marker = ""
-        if abs(val - r.price) / r.price < 0.002:
-            marker = " \u2190 \u5f53\u524d"
-        lines.append(f"  {name}: {val:,.2f}{marker}")
+    # (2) Market regime
+    lines.append(f"{emoji} <b>\u5e02\u573a\u5b9a\u8c03</b>")
+    lines.append(f"  Regime: {regime_cn}")
+    lines.append(f"  \u7f6e\u4fe1\u5ea6: {_confidence_bar(r.confidence)} {r.confidence:.0%}")
+    lines.append(f"  \u89e3\u8bfb: {_esc(r.details)}")
+    lines.append("")
 
+    # (3) Real-time data
+    lines.append("\U0001f4ca <b>\u5b9e\u65f6\u6570\u636e\u652f\u6491</b>")
     lines.append(f"  \u5f53\u524d\u4ef7: {r.price:,.2f}")
-    lines.append("")
-    lines.append("<b>\u4ea4\u6613\u98ce\u683c\u5efa\u8bae</b>")
-    lines.append(playbook.strategy_text)
 
-    # Filters section
-    f = playbook.filters
+    vwap = playbook.vwap
+    if vwap > 0:
+        vwap_pct = (r.price - vwap) / vwap * 100
+        lines.append(f"  VWAP: {vwap:,.2f} ({vwap_pct:+.2f}%)")
+
+    lines.append(f"  RVOL: {r.rvol:.2f}")
+
+    vp = playbook.volume_profile
+    lines.append(f"  POC: {vp.poc:,.2f} | VAH: {vp.vah:,.2f} | VAL: {vp.val:,.2f}")
+
+    gw = playbook.gamma_wall
+    if gw and (gw.call_wall_strike > 0 or gw.put_wall_strike > 0):
+        gw_parts = []
+        if gw.call_wall_strike > 0:
+            gw_parts.append(f"Call {gw.call_wall_strike:,.0f}")
+        if gw.put_wall_strike > 0:
+            gw_parts.append(f"Put {gw.put_wall_strike:,.0f}")
+        if gw.max_pain > 0:
+            gw_parts.append(f"Max Pain {gw.max_pain:,.0f}")
+        lines.append(f"  Gamma Wall: {' | '.join(gw_parts)}")
+
+    lines.append(f"  {_price_position(r.price, vp, vwap)}")
     lines.append("")
-    lines.append("<b>\u4ea4\u6613\u8fc7\u6ee4\u72b6\u6001</b>")
+
+    # (4) Option recommendation
+    rec = playbook.option_rec
+    if rec:
+        lines.append("\U0001f3af <b>\u671f\u6743\u64cd\u4f5c\u5efa\u8bae</b>")
+        if rec.action == "wait":
+            lines.append("  \u5efa\u8bae: \u26d4 <b>\u89c2\u671b</b>")
+            if rec.risk_note:
+                for reason in rec.risk_note.split("\n"):
+                    lines.append(f"  {_esc(reason)}")
+            if rec.wait_conditions:
+                lines.append("  \u91cd\u65b0\u8bc4\u4f30\u6761\u4ef6:")
+                for cond in rec.wait_conditions:
+                    lines.append(f"    \u2022 {_esc(cond)}")
+        else:
+            action_cn = {
+                "call": "\u2191 \u4e70\u5165 Call",
+                "put": "\u2193 \u4e70\u5165 Put",
+                "bull_put_spread": "\u2191 Bull Put Spread",
+                "bear_call_spread": "\u2193 Bear Call Spread",
+            }
+            lines.append(f"  \u5efa\u8bae: <b>{action_cn.get(rec.action, rec.action)}</b>")
+
+            if rec.expiry:
+                lines.append(f"  \u5230\u671f\u65e5: {rec.expiry}")
+
+            for leg in rec.legs:
+                side_cn = "\u4e70\u5165" if leg.side == "buy" else "\u5356\u51fa"
+                lines.append(
+                    f"  {side_cn} {leg.option_type.upper()} "
+                    f"Strike {leg.strike:,.0f} ({leg.moneyness})"
+                )
+
+            if rec.rationale:
+                lines.append(f"  \u7406\u7531: {_esc(rec.rationale)}")
+
+            if rec.liquidity_warning:
+                lines.append(f"  \u26a0\ufe0f {_esc(rec.liquidity_warning)}")
+    else:
+        # Fallback to generic strategy text
+        lines.append("\U0001f3af <b>\u4ea4\u6613\u98ce\u683c\u5efa\u8bae</b>")
+        lines.append(playbook.strategy_text)
+
+    lines.append("")
+
+    # (5) Risk / filters
+    lines.append("\u26a0\ufe0f <b>\u98ce\u9669\u8bf4\u660e</b>")
+    f = playbook.filters
     if not f.tradeable:
         lines.append("  \U0001f534 <b>\u4eca\u65e5\u4e0d\u5b9c\u4ea4\u6613</b>")
     elif f.risk_level == "high":
@@ -162,9 +239,11 @@ def format_playbook_message(
         lines.append("  \U0001f7e2 \u6b63\u5e38\u4ea4\u6613\u65e5")
 
     for w in f.warnings:
-        lines.append(f"  \u26a0\ufe0f {html.escape(w)}")
+        lines.append(f"  \u26a0\ufe0f {_esc(w)}")
 
-    lines.append("")
-    lines.append(f"\u23f1 {now.strftime('%H:%M:%S')} HKT")
+    if rec and rec.action != "wait" and rec.risk_note:
+        lines.append(f"  {_esc(rec.risk_note)}")
+
+    lines.append(sep)
 
     return "\n".join(lines)

@@ -38,11 +38,13 @@ docker compose up --build       # Docker
 
 ### HK Predict Module (`src/hk/`)
 
-Independent HK market prediction system, fully decoupled from US pipeline. Generates daily Playbooks with regime classification and key levels for HK index option trading.
+On-demand HK market prediction system, integrated into `OptionsMonitor` via shared Telegram Application. No scheduled pushes — pure text-triggered playbook generation.
 
-- **Core:** `HKPredictor` orchestrator with 3 daily pushes (09:35/10:05/13:05 HKT). `HKCollector` sync Futu wrapper, `volume_profile` (POC/VAH/VAL), `indicators` (VWAP, RVOL), `regime` (BREAKOUT/RANGE/WHIPSAW/UNCLEAR).
-- **Signals:** `playbook` (Telegram-formatted strategy), `filter` (5 trade filters), `orderbook` (LV2 large orders), `gamma_wall` (Call/Put Wall, Max Pain for indices).
-- **`src/hk/telegram.py`** — Bot commands prefixed `/hk_*` (playbook, orderbook, gamma, levels, regime, quote, filters, watchlist, help).
+- **Core:** `HKPredictor` orchestrator (on-demand, no APScheduler). `HKCollector` sync Futu wrapper, `volume_profile` (POC/VAH/VAL), `indicators` (VWAP, RVOL), `regime` (BREAKOUT/RANGE/WHIPSAW/UNCLEAR with IV spike detection).
+- **Option Recommendation:** `option_recommend.py` — direction from regime + price position, expiry selection (filters DTE=0), single-leg (ATM/OTM, delta 0.3-0.5) or vertical spread (Bull Put / Bear Call for RANGE), strict wait policy (must have concrete strike + expiry, otherwise observe).
+- **Watchlist:** `watchlist.py` — dynamic JSON persistence (`data/hk_watchlist.json`), `+09988` add / `-09988` remove / `wl` view. Falls back to `hk_settings.yaml` on first run.
+- **Signals:** `playbook` (5-section Telegram HTML: regime, data, option rec, risk), `filter` (5 filters: calendar, Inside Day, IV+RVOL, min turnover, expiry risk), `gamma_wall` (Call/Put Wall, Max Pain for indices).
+- **`src/hk/telegram.py`** — Text-triggered MessageHandlers (symbol query `09988`/`HK09988`, `+code` add, `-code` remove, `wl` list) + `/hk_help` command. Integrated into `src/main.py` shared Application.
 - **`src/hk/backtest/`** — Validates VP levels (bounce rates) and regime accuracy on historical data. Trade simulator with fixed/trailing/both exit modes. Run via `python -m src.hk.backtest`.
 
 **Futu API gotchas (HK):** `get_market_snapshot` for bid/ask (not `get_stock_quote`). `option_open_interest` from snapshot for OI (not `option_area_type`). K-line timezone is HKT.
@@ -65,7 +67,7 @@ Strategies live in `config/strategies/` and are hot-reloaded. Required fields: `
 
 ## HK Configuration
 
-- `config/hk_settings.yaml` — HK watchlist (indices + stocks), regime thresholds (`breakout_rvol`, `range_rvol`), playbook push times, filter params, order book and gamma wall settings, `simulation` block (tp/sl/slippage, exit_mode, trailing params, exclude_symbols, skip_signal_types).
+- `config/hk_settings.yaml` — HK initial watchlist (indices + stocks, runtime managed via `data/hk_watchlist.json`), regime thresholds (`breakout_rvol`, `range_rvol`, `iv_spike_ratio`), filter params (min turnover), gamma wall settings, `simulation` block (tp/sl/slippage, exit_mode, trailing params, exclude_symbols, skip_signal_types).
 - `config/hk_calendar.yaml` — Economic calendar (FOMC, HKMA, China PMI/GDP, HK holidays, HSI option expiry dates). Manually maintained.
 
 ## US Playbook Configuration

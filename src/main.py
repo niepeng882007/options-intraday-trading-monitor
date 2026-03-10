@@ -79,6 +79,19 @@ class OptionsMonitor:
         self._daily_pnl: float = 0.0  # cumulative daily stock PnL %
         self._daily_pnl_date: str = ""  # current tracking date
         self.us_playbook = self._build_us_playbook()
+        self.hk_predictor = self._build_hk_predictor()
+
+    def _build_hk_predictor(self):
+        """Build HK Predictor module if config exists."""
+        config_path = "config/hk_settings.yaml"
+        try:
+            from src.hk.main import HKPredictor
+            return HKPredictor(config_path)
+        except FileNotFoundError:
+            return None
+        except Exception:
+            logger.warning("Failed to initialize HK Predictor", exc_info=True)
+            return None
 
     def _build_us_playbook(self):
         """Build US Playbook module if config exists."""
@@ -135,6 +148,17 @@ class OptionsMonitor:
             register_us_playbook_commands(self.notifier._app, self.us_playbook)
             logger.info("US Playbook module initialized")
 
+        # HK Predictor integration (on-demand, no scheduled pushes)
+        if self.hk_predictor:
+            try:
+                await self.hk_predictor.connect()
+                from src.hk.telegram import register_hk_commands
+                register_hk_commands(self.notifier._app, self.hk_predictor)
+                logger.info("HK Predictor module initialized (on-demand mode)")
+            except Exception:
+                logger.warning("Failed to connect HK Predictor", exc_info=True)
+                self.hk_predictor = None
+
         self._register_jobs()
         self.scheduler.start()
 
@@ -155,6 +179,11 @@ class OptionsMonitor:
         self.strategy_loader.stop_watching()
         self._persist_states()
         await self.notifier.stop()
+        if self.hk_predictor:
+            try:
+                await self.hk_predictor.close()
+            except Exception:
+                pass
         await self.collector.close()
         await self.redis_store.close()
         self.sqlite_store.close()
