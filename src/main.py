@@ -16,7 +16,6 @@ import yaml
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from src.collector.base import BaseCollector
-from src.collector.yahoo import YahooCollector
 from src.indicator.engine import IndicatorEngine
 from src.notification.telegram import TelegramNotifier
 from src.store.redis_store import RedisStore
@@ -70,11 +69,11 @@ class OptionsMonitor:
             strategy_loader=self.strategy_loader,
             state_manager=self.state_manager,
             sqlite_store=self.sqlite_store,
-            data_source=config.get("data_source", "yahoo"),
         )
         self.scheduler = AsyncIOScheduler(timezone="America/New_York")
         self._shutdown_event = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._futu_connected: bool = True
         self._last_entry_eval: dict[str, float] = {}  # P5.1 dedup timestamps
         self._daily_pnl: float = 0.0  # cumulative daily stock PnL %
         self._daily_pnl_date: str = ""  # current tracking date
@@ -106,18 +105,13 @@ class OptionsMonitor:
         return None
 
     def _build_collector(self) -> BaseCollector:
-        source = self.config.get("data_source", "yahoo")
-        if source == "yahoo":
-            return YahooCollector()
-        elif source == "futu":
-            from src.collector.futu import FutuCollector
-            futu_cfg = self.config.get("futu", {})
-            return FutuCollector(
-                host=futu_cfg.get("host", "127.0.0.1"),
-                port=futu_cfg.get("port", 11111),
-                subscription_quota=futu_cfg.get("subscription_quota", 300),
-            )
-        raise ValueError(f"Unknown data source: {source}")
+        from src.collector.futu import FutuCollector
+        futu_cfg = self.config.get("futu", {})
+        return FutuCollector(
+            host=futu_cfg.get("host", "127.0.0.1"),
+            port=futu_cfg.get("port", 11111),
+            subscription_quota=futu_cfg.get("subscription_quota", 300),
+        )
 
     # ── Lifecycle ──
 
@@ -138,15 +132,14 @@ class OptionsMonitor:
         self.notifier.build_app()
         await self.notifier.start_polling()
 
-        # US Playbook integration
+        # US Predictor integration (on-demand + auto-scan)
         if self.us_playbook and isinstance(self.us_playbook, dict):
-            from src.us_playbook.main import USPlaybook as USPlaybookCls
+            from src.us_playbook.main import USPredictor
             pb_cfg = self.us_playbook
-            self.us_playbook = USPlaybookCls(pb_cfg, self.collector)
-            self.us_playbook.set_send_fn(self.notifier.send_text)
-            from src.us_playbook.telegram import register_us_playbook_commands
-            register_us_playbook_commands(self.notifier._app, self.us_playbook)
-            logger.info("US Playbook module initialized")
+            self.us_playbook = USPredictor(pb_cfg, self.collector)
+            from src.us_playbook.telegram import register_us_predictor_handlers
+            register_us_predictor_handlers(self.notifier._app, self.us_playbook)
+            logger.info("US Predictor module initialized (on-demand + auto-scan)")
 
         # HK Predictor integration (on-demand, no scheduled pushes)
         if self.hk_predictor:
@@ -159,8 +152,14 @@ class OptionsMonitor:
                 logger.warning("Failed to connect HK Predictor", exc_info=True)
                 self.hk_predictor = None
 
+        # /summary command — manual daily summary trigger
+        from telegram.ext import CommandHandler
+        self.notifier._app.add_handler(CommandHandler("summary", self._cmd_summary))
+
         self._register_jobs()
         self.scheduler.start()
+
+        await self._setup_telegram_menu()
 
         logger.info("Options Monitor started — monitoring %d symbols with %d strategies",
                      len(self.strategy_loader.get_all_symbols()),
@@ -199,12 +198,37 @@ class OptionsMonitor:
 
     # ── Scheduled jobs ──
 
+    async def _setup_telegram_menu(self) -> None:
+        """Register the bot command menu based on all added handlers."""
+        app = self.notifier._app
+        if not app or not app.bot:
+            return
+        
+        from telegram import BotCommand
+        commands = [
+            BotCommand("status", "系统运行和持仓状态"),
+            BotCommand("market", "获取监控列表的实时行情"),
+            BotCommand("summary", "生成并发送每日交易汇总"),
+            BotCommand("strategies", "查看所有策略及其状态"),
+            BotCommand("history", "查看最近10条信号记录"),
+            BotCommand("pause", "暂停/恢复通知推送 (参数: 分钟数)"),
+            BotCommand("chain", "查询期权链 (如 /chain AAPL 230 C 0321)"),
+            BotCommand("hk_help", "港股期权监控说明"),
+            BotCommand("us_help", "美股期权监控说明"),
+            BotCommand("conn", "检查Futu和Redis连接状态"),
+        ]
+        try:
+            await app.bot.set_my_commands(commands)
+            logger.info("Telegram bot commands menu updated")
+        except Exception as e:
+            logger.warning("Failed to set TG commands menu: %s", e)
+
     def _register_jobs(self) -> None:
         poll = self.config.get("polling", {})
 
         # If futu push subscription is enabled, use push instead of polling for quotes
         use_push = self.config.get("futu", {}).get("use_push_subscription", False)
-        if use_push and self.config.get("data_source") == "futu":
+        if use_push:
             symbols = list(
                 self.strategy_loader.get_all_symbols()
                 | set(self.config.get("watchlist", {}).get("symbols", []))
@@ -256,31 +280,50 @@ class OptionsMonitor:
             max_instances=1,
         )
 
-        # US Playbook scheduled pushes
+        # US Predictor auto-scan
         if self.us_playbook and not isinstance(self.us_playbook, dict):
-            from apscheduler.triggers.cron import CronTrigger
-            self.scheduler.add_job(
-                self.us_playbook.run_playbook_cycle,
-                CronTrigger(hour=9, minute=45, day_of_week="mon-fri", timezone="America/New_York"),
-                kwargs={"update_type": "morning"}, id="us_playbook_morning",
-            )
-            self.scheduler.add_job(
-                self.us_playbook.run_playbook_cycle,
-                CronTrigger(hour=10, minute=15, day_of_week="mon-fri", timezone="America/New_York"),
-                kwargs={"update_type": "confirm"}, id="us_playbook_confirm",
-            )
-            logger.info("US Playbook scheduled: 09:45/10:15 ET")
-
-            # Regime monitor: interval job (window guard is inside the method)
-            monitor_cfg = self.us_playbook._cfg.get("regime_monitor", {})
-            if monitor_cfg.get("enabled", True):
-                interval = monitor_cfg.get("check_interval_seconds", 300)
+            scan_cfg = self.us_playbook._cfg.get("auto_scan", {})
+            if scan_cfg.get("enabled", False):
+                interval = scan_cfg.get("interval_seconds", 180)
                 self.scheduler.add_job(
-                    self.us_playbook.run_regime_monitor_cycle,
-                    "interval", seconds=interval,
-                    id="us_regime_monitor", max_instances=1,
+                    self._us_auto_scan,
+                    "interval",
+                    seconds=interval,
+                    id="us_auto_scan",
+                    max_instances=1,
                 )
-                logger.info("US Regime monitor scheduled: every %ds", interval)
+                logger.info("US Auto-scan scheduled: every %ds", interval)
+
+        # Daily summary report at 16:05 ET (Mon-Fri)
+        self.scheduler.add_job(
+            self._send_daily_summary,
+            "cron",
+            hour=16, minute=5, day_of_week="mon-fri",
+            id="daily_summary",
+            max_instances=1,
+        )
+
+        # HK Auto-scan: morning breakout scanner
+        if self.hk_predictor:
+            scan_cfg = self.hk_predictor._cfg.get("auto_scan", {})
+            if scan_cfg.get("enabled", False):
+                interval = scan_cfg.get("interval_seconds", 300)
+                self.scheduler.add_job(
+                    self._hk_auto_scan,
+                    "interval",
+                    seconds=interval,
+                    id="hk_auto_scan",
+                    max_instances=1,
+                )
+                logger.info("HK Auto-scan scheduled: every %ds", interval)
+
+    async def _us_auto_scan(self) -> None:
+        """Run US auto-scan (window/weekday check is inside run_auto_scan)."""
+        await self.us_playbook.run_auto_scan(self.notifier.send_text)
+
+    async def _hk_auto_scan(self) -> None:
+        """Run HK auto-scan (window/weekday check is inside run_auto_scan)."""
+        await self.hk_predictor.run_auto_scan(self.notifier.send_text)
 
     def _is_trading_hours(self) -> bool:
         now = datetime.now(ET)
@@ -312,7 +355,7 @@ class OptionsMonitor:
     # ── Polling tasks ──
 
     async def _poll_stock_quotes(self) -> None:
-        if not self._is_trading_hours():
+        if not self._futu_connected or not self._is_trading_hours():
             return
 
         symbols = self.strategy_loader.get_all_symbols() | set(
@@ -340,7 +383,7 @@ class OptionsMonitor:
 
     async def _on_quote_push(self, quote) -> None:
         """Callback for Futu real-time quote push — processes a single symbol."""
-        if not self._is_trading_hours():
+        if not self._futu_connected or not self._is_trading_hours():
             return
         symbol = quote.symbol
         try:
@@ -363,7 +406,7 @@ class OptionsMonitor:
 
     async def _on_kline_push(self, symbol: str, kline_df) -> None:
         """Callback for Futu real-time 1-minute K-line push."""
-        if not self._is_trading_hours():
+        if not self._futu_connected or not self._is_trading_hours():
             return
         try:
             self.indicator_engine.update_bars(symbol, kline_df)
@@ -378,7 +421,7 @@ class OptionsMonitor:
             logger.exception("Failed to process kline push for %s", symbol)
 
     async def _poll_history(self) -> None:
-        if not self._is_trading_hours():
+        if not self._futu_connected or not self._is_trading_hours():
             return
 
         symbols = self.strategy_loader.get_all_symbols() | set(
@@ -583,6 +626,7 @@ class OptionsMonitor:
                     "conditions": entry_signal.conditions_detail,
                     "quality_score": quality.score,
                     "quality_grade": quality.grade,
+                    "underlying_price": underlying_price,
                 },
             )
             logger.info(
@@ -644,7 +688,12 @@ class OptionsMonitor:
             strategy_name=strategy.name,
             signal_type="exit",
             symbol=symbol,
-            detail={"reason": exit_signal.exit_reason},
+            detail={
+                "reason": exit_signal.exit_reason,
+                "entry_price": entry_price,
+                "exit_price": current_price,
+                "direction": direction,
+            },
         )
         logger.info("Exit signal sent: %s %s reason=%s", strategy_id, symbol, exit_signal.exit_reason)
 
@@ -659,24 +708,39 @@ class OptionsMonitor:
             )
 
     async def _health_check(self) -> None:
-        """Periodic check of data source connection health."""
-        if self.config.get("data_source") != "futu":
-            return
+        """Periodic check of Futu connection health.
+
+        On disconnect: sets _futu_connected=False and pauses signal processing.
+        On reconnect: sets _futu_connected=True and sends recovery notification.
+        """
+        was_connected = self._futu_connected
         try:
             await self.collector.health_check()
+            # Health check passed — restore if previously disconnected
+            if not self._futu_connected:
+                self._futu_connected = True
+                logger.info("Futu connection restored")
+                await self.notifier.send_text("✅ Futu 连接已恢复，信号推送已恢复")
         except Exception:
             logger.error("Health check failed, attempting reconnect")
-            await self.notifier.send_text("⚠️ Futu 连接异常，正在重连...")
+            self._futu_connected = False
+            if was_connected:
+                await self.notifier.send_text(
+                    "⚠️ Futu 连接断开，信号推送已暂停\n正在尝试重连..."
+                )
             try:
                 await self.collector.close()
             except Exception:
                 pass
             try:
                 await self.collector.connect()
-                await self.notifier.send_text("✅ Futu 重连成功")
+                self._futu_connected = True
+                logger.info("Futu reconnect succeeded")
+                await self.notifier.send_text("✅ Futu 重连成功，信号推送已恢复")
             except Exception:
                 logger.exception("Reconnect failed")
-                await self.notifier.send_text("❌ Futu 重连失败，请检查 FutuOpenD")
+                if was_connected:
+                    await self.notifier.send_text("❌ Futu 重连失败，请检查 FutuOpenD")
 
     async def _heartbeat(self) -> None:
         """Periodic heartbeat log for liveness monitoring."""
@@ -705,6 +769,16 @@ class OptionsMonitor:
         prev_data = self.sqlite_store.load_prev_values()
         if prev_data:
             self.rule_matcher.import_prev_values(prev_data)
+
+    # ── Daily summary ──
+
+    async def _send_daily_summary(self) -> None:
+        from src.common.daily_report import collect_pipeline_data, format_daily_summary
+        data = collect_pipeline_data(self.sqlite_store, self._daily_pnl)
+        await self.notifier.send_text(format_daily_summary(data))
+
+    async def _cmd_summary(self, update, context) -> None:
+        await self._send_daily_summary()
 
     # ── Hot-reload callback ──
 

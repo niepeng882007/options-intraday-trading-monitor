@@ -1,7 +1,5 @@
-data_source: futu
-
 futu:
-  host: "host.docker.internal"
+  host: "127.0.0.1"
   port: 11111
   use_push_subscription: true
   subscription_quota: 300

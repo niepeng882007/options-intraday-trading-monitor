@@ -8,10 +8,11 @@ from collections import deque, OrderedDict
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
 )
@@ -42,7 +43,7 @@ ENTRY_SIGNAL_TEMPLATE = (
     "💡 {rationale}\n"
     "\n"
     "⏱ {trigger_time} ET{trading_window_hint}\n"
-    "/confirm {signal_id} &lt;价格&gt;  /skip {signal_id}"
+    "🆔 <code>{signal_id}</code>"
 )
 
 EXIT_SIGNAL_TEMPLATE = (
@@ -300,6 +301,24 @@ def _shorten_rationale(description: str, max_len: int = 35) -> str:
     return text[:max_len] + "…"
 
 
+def _build_entry_keyboard(signal_id: str) -> InlineKeyboardMarkup:
+    """入场信号按钮: [确认][跳过] / [详情]"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ 确认入场", callback_data=f"cfm:{signal_id}"),
+            InlineKeyboardButton("⏭ 跳过", callback_data=f"skip:{signal_id}"),
+        ],
+        [InlineKeyboardButton("📋 详情", callback_data=f"dtl:{signal_id}")],
+    ])
+
+
+def _build_actioned_keyboard(action_text: str) -> InlineKeyboardMarkup:
+    """操作完成后的单按钮（防双击）"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(action_text, callback_data="noop")],
+    ])
+
+
 def _build_indicator_snapshot(
     indicators_by_tf: dict[str, IndicatorResult | None] | None,
 ) -> str:
@@ -345,11 +364,6 @@ def _build_indicator_snapshot(
 class TelegramNotifier:
     """Sends trading signals via Telegram and handles Bot commands."""
 
-    DATA_SOURCE_LABELS: dict[str, str] = {
-        "futu": "Futu OpenD (实时推送)",
-        "yahoo": "Yahoo Finance (延迟~15s)",
-    }
-
     def __init__(
         self,
         bot_token: str,
@@ -358,7 +372,6 @@ class TelegramNotifier:
         strategy_loader: Any = None,
         state_manager: Any = None,
         sqlite_store: Any = None,
-        data_source: str = "yahoo",
     ) -> None:
         self._bot_token = bot_token
         self._chat_id = chat_id
@@ -366,9 +379,7 @@ class TelegramNotifier:
         self._strategy_loader = strategy_loader
         self._state_manager = state_manager
         self._sqlite_store = sqlite_store
-        self._data_source_label = self.DATA_SOURCE_LABELS.get(
-            data_source, f"{data_source} (未知源)"
-        )
+        self._data_source_label = "Futu OpenD (实时推送)"
         self._app: Application | None = None
         self._send_timestamps: deque[float] = deque()
         self._paused_until: float = 0.0
@@ -396,6 +407,9 @@ class TelegramNotifier:
         self._app.add_handler(CommandHandler("detail", self._cmd_detail))
         self._app.add_handler(CommandHandler("test", self._cmd_test))
         self._app.add_handler(CommandHandler("conn", self._cmd_conn))
+        self._app.add_handler(
+            CallbackQueryHandler(self._on_callback_query, pattern=r"^(cfm|skip|dtl|noop)")
+        )
         self._app.add_error_handler(self._on_error)
         return self._app
 
@@ -518,7 +532,8 @@ class TelegramNotifier:
             "timestamp": time.time(),
         })
 
-        return await self._send_message(message)
+        keyboard = _build_entry_keyboard(signal_id)
+        return await self._send_message(message, reply_markup=keyboard)
 
     async def send_exit_signal(
         self,
@@ -592,7 +607,9 @@ class TelegramNotifier:
 
     _STRIP_HTML_RE = re.compile(r"<[^>]+>")
 
-    async def _send_message(self, text: str) -> bool:
+    async def _send_message(
+        self, text: str, reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> bool:
         if not (self._app and self._app.bot):
             return False
         try:
@@ -600,6 +617,7 @@ class TelegramNotifier:
                 chat_id=self._chat_id,
                 text=text,
                 parse_mode="HTML",
+                reply_markup=reply_markup,
             )
             self._send_timestamps.append(time.time())
             return True
@@ -725,9 +743,17 @@ class TelegramNotifier:
 
     async def _cmd_chain(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not context.args or len(context.args) < 4:
-            await update.message.reply_text(  # type: ignore[union-attr]
-                "用法: /chain AAPL 230 C 0321\n(标的 行权价 C/P MMDD)"
+            text = (
+                "❌ <b>缺少参数</b>\n"
+                "点击下方灰色区域可快速复制修改：\n\n"
+                "<code>/chain AAPL 230 C 0321</code>\n\n"
+                "<b>参数说明</b>：\n"
+                "• 第1位: 股票代码 (如 AAPL)\n"
+                "• 第2位: 行权价 (如 230)\n"
+                "• 第3位: 类型 C 或 P (Call/Put)\n"
+                "• 第4位: 到期日 MMDD (如 0321)"
             )
+            await update.message.reply_text(text, parse_mode="HTML")
             return
 
         symbol = context.args[0].upper()
@@ -1029,13 +1055,6 @@ class TelegramNotifier:
             await update.message.reply_text(f"❌ 查询失败: {exc}")  # type: ignore[union-attr]
             return
 
-        source = info.get("source", "unknown")
-        if source != "futu":
-            await update.message.reply_text(  # type: ignore[union-attr]
-                f"📡 数据源: {self._data_source_label}\n非 Futu 连接，无详细状态"
-            )
-            return
-
         connected = info.get("connected", False)
         status_icon = "🟢" if connected else "🔴"
         global_state = info.get("global_state", "N/A")
@@ -1081,3 +1100,91 @@ class TelegramNotifier:
         lines.append(f"\n⏱ {datetime.now(ET).strftime('%H:%M:%S')} ET")
 
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")  # type: ignore[union-attr]
+
+    # ── Inline keyboard callback handlers ──
+
+    async def _on_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+
+        data = query.data or ""
+        if data == "noop":
+            return
+
+        if ":" not in data:
+            return
+        action, signal_id = data.split(":", 1)
+
+        if action == "cfm":
+            await self._handle_confirm_callback(query, signal_id)
+        elif action == "skip":
+            await self._handle_skip_callback(query, signal_id)
+        elif action == "dtl":
+            await self._handle_detail_callback(query, signal_id)
+
+    async def _handle_confirm_callback(self, query: Any, signal_id: str) -> None:
+        cached = self._signal_cache.get(signal_id)
+        if not cached:
+            await query.answer("⚠️ 缓存已过期，请用 /confirm 手动确认", show_alert=True)
+            return
+
+        price = cached.get("underlying_price", 0.0)
+        if not price:
+            await query.answer("⚠️ 无法获取价格，请用 /confirm 手动确认", show_alert=True)
+            return
+
+        if self._state_manager is None:
+            await query.answer("⚠️ 状态管理器未初始化", show_alert=True)
+            return
+
+        if self._state_manager.confirm_entry(signal_id, price):
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=_build_actioned_keyboard(f"✅ 已确认 @ ${price:.2f}"),
+                )
+            except Exception:
+                logger.debug("edit_message_reply_markup failed (confirm)")
+            await self._send_message(
+                f"✅ 已确认建仓 {_esc(signal_id)} @ ${price:.2f}\n开始追踪出场条件"
+            )
+        else:
+            await query.answer("❌ 信号不存在或已处理", show_alert=True)
+
+    async def _handle_skip_callback(self, query: Any, signal_id: str) -> None:
+        if self._state_manager and self._state_manager.skip_entry(signal_id):
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=_build_actioned_keyboard("⏭ 已跳过"),
+                )
+            except Exception:
+                logger.debug("edit_message_reply_markup failed (skip)")
+        else:
+            await query.answer("❌ 信号不存在或已处理", show_alert=True)
+
+    async def _handle_detail_callback(self, query: Any, signal_id: str) -> None:
+        cached = self._signal_cache.get(signal_id)
+        if not cached:
+            await query.answer("❌ 信号详情已过期", show_alert=True)
+            return
+
+        sig: Signal = cached["signal"]
+        indicators_by_tf = cached.get("indicators_by_tf")
+
+        lines = [
+            f"📋 <b>信号详情 | {_esc(sig.strategy_name)}</b>",
+            f"🆔 {_esc(signal_id)} | {_esc(sig.symbol)}",
+            "",
+        ]
+
+        snapshot = _build_indicator_snapshot(indicators_by_tf)
+        if snapshot:
+            lines.append(snapshot)
+
+        if sig.conditions_detail:
+            lines.append("📊 <b>触发条件:</b>")
+            for c in sig.conditions_detail:
+                lines.append(f"   {_esc(c)}")
+
+        await self._send_message("\n".join(lines))
