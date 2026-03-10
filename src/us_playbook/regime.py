@@ -1,11 +1,23 @@
 from __future__ import annotations
 
-from src.hk import GammaWallResult, VolumeProfileResult
+from src.common.types import GammaWallResult, VolumeProfileResult
 from src.us_playbook import USRegimeResult, USRegimeType
 from src.us_playbook.indicators import RvolProfile
 from src.utils.logger import setup_logger
 
 logger = setup_logger("us_regime")
+
+
+def regime_to_signal_type(regime: USRegimeType, direction: str) -> str | None:
+    """Map US regime + direction to auto-scan signal type.
+
+    Returns signal type string or None for UNCLEAR.
+    """
+    if regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+        return f"BREAKOUT_{direction.upper()}"
+    if regime == USRegimeType.FADE_CHOP:
+        return f"RANGE_REVERSAL_{direction.upper()}"
+    return None
 
 
 def classify_us_regime(

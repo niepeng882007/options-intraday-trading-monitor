@@ -37,6 +37,7 @@ def compute_rvol_profile(
     fallback_trend_day: float = 1.2,
     fallback_fade_chop: float = 1.0,
     min_sample_days: int = 5,
+    min_trend_day_floor: float = 1.0,
 ) -> RvolProfile:
     """Compute per-symbol adaptive RVOL thresholds using percentile method.
 
@@ -109,6 +110,13 @@ def compute_rvol_profile(
     trend_day = float(np.percentile(arr, trend_day_pctl))
     fade_chop = float(np.percentile(arr, fade_chop_pctl))
 
+    # Floor: trend_day must be at least min_trend_day_floor (prevents avg volume → TREND_DAY)
+    if trend_day < min_trend_day_floor:
+        trend_day = min_trend_day_floor
+    # Keep fade_chop below trend_day with minimum separation
+    if fade_chop >= trend_day - 0.1:
+        fade_chop = trend_day - 0.1
+
     # Guard: ensure minimum separation between tiers
     if gap_and_go < trend_day + 0.1:
         gap_and_go = trend_day + 0.1
@@ -152,22 +160,8 @@ def _fallback_profile(
     )
 
 
-def calculate_vwap(bars: pd.DataFrame) -> float:
-    """Calculate VWAP for today's bars.
-
-    VWAP = cumsum(typical_price * volume) / cumsum(volume)
-    """
-    if bars.empty:
-        return 0.0
-
-    typical = (bars["High"] + bars["Low"] + bars["Close"]) / 3
-    cum_vol = bars["Volume"].cumsum()
-    cum_tp_vol = (typical * bars["Volume"]).cumsum()
-
-    if cum_vol.iloc[-1] == 0:
-        return 0.0
-
-    return float(cum_tp_vol.iloc[-1] / cum_vol.iloc[-1])
+# Re-export shared VWAP for backward compatibility
+from src.common.indicators import calculate_vwap  # noqa: F401, E402
 
 
 def calculate_us_rvol(

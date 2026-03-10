@@ -1,22 +1,33 @@
-"""US Playbook orchestrator — daily playbook generation with scheduled pushes.
+"""US Predictor orchestrator — on-demand playbook + auto-scan alert system.
 
 Usage:
     python -m src.us_playbook      # Run standalone
-    # Or integrated into OptionsMonitor via shared APScheduler
+    # Or integrated into OptionsMonitor via shared Telegram Application
 """
 
 from __future__ import annotations
 
 import asyncio
 import html
+import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, date, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from src.hk import FilterResult, GammaWallResult, VolumeProfileResult
-from src.hk.gamma_wall import calculate_gamma_wall, format_gamma_wall_message
-from src.us_playbook import KeyLevels, USPlaybookResult, USRegimeResult, USRegimeType
+from src.common.chart import ChartData, generate_chart_async
+from src.common.types import FilterResult, GammaWallResult, OptionMarketSnapshot, OptionRecommendation, PlaybookResponse, QuoteSnapshot, VolumeProfileResult
+from src.common.gamma_wall import calculate_gamma_wall
+from src.us_playbook import (
+    KeyLevels,
+    USPlaybookResult,
+    USRegimeResult,
+    USRegimeType,
+    USScanAlertRecord,
+    USScanSignal,
+)
 from src.us_playbook.filter import check_us_filters
 from src.us_playbook.indicators import calculate_us_rvol, calculate_vwap, compute_rvol_profile
 from src.us_playbook.levels import (
@@ -27,181 +38,192 @@ from src.us_playbook.levels import (
     get_history_bars,
     get_today_bars,
 )
-from src.us_playbook.playbook import REGIME_STRATEGY, format_regime_change_alert, format_us_playbook_message
-from src.us_playbook.regime import classify_us_regime
+from src.us_playbook.option_recommend import (
+    option_quotes_to_df,
+    recommend,
+    select_expiry,
+)
+from src.us_playbook.playbook import format_us_playbook_message, get_regime_strategy
+from src.us_playbook.regime import classify_us_regime, regime_to_signal_type
+from src.us_playbook.watchlist import USWatchlist
 from src.utils.logger import setup_logger
 
-logger = setup_logger("us_playbook")
+logger = setup_logger("us_predictor")
 
-ET = timezone(timedelta(hours=-5))
+ET = ZoneInfo("America/New_York")
 _executor = ThreadPoolExecutor(max_workers=1)
 _esc = html.escape
 
 
-class USPlaybook:
-    """Orchestrates US Playbook pipeline.
+@dataclass
+class _SymbolCache:
+    """Cached data for a symbol — history bars, PDH/PDL, PMH/PML."""
+    timestamp: float
+    hist_bars: pd.DataFrame
+    pdh: float
+    pdl: float
+    pmh: float
+    pml: float
+    pm_source: str
 
-    Data flow per cycle:
-        1. Run market context symbols (SPY/QQQ) first → spy_regime
-        2. For each watchlist symbol:
-           a. Fetch 5-day 1m bars → VP + PDH/PDL + today bars
-           b. Fetch pre-market HL → PMH/PML
-           c. Calculate VWAP + RVOL
-           d. Fetch option chain → Gamma Wall (graceful fallback)
-           e. Check filters
-           f. Classify regime (with spy_regime context)
-           g. Format & push to Telegram
+
+class USPredictor:
+    """Orchestrates US Predictor pipeline — on-demand + auto-scan.
+
+    Data flow per query:
+        1. Fetch multi-day 1m bars → VP + PDH/PDL + today bars
+        2. Fetch pre-market HL → PMH/PML
+        3. Calculate VWAP + RVOL
+        4. Fetch option chain → Gamma Wall + option recommendation
+        5. Check filters
+        6. Classify regime (with SPY context)
+        7. Format & return Playbook
     """
 
     def __init__(self, config: dict, collector) -> None:
         self._cfg = config
         self._collector = collector
-        self._send_fn = None  # async TG callback
+
+        # Watchlist — dynamic, persisted to JSON
+        self.watchlist = USWatchlist(
+            path="data/us_watchlist.json",
+            initial_config=config,
+        )
+
+        # Cache: history bars + PDH/PDL + PMH/PML (today bars always fresh)
+        _cache_ttl = config.get("hist_cache_ttl", 120)
+        self._cache_ttl = _cache_ttl
+        self._hist_cache: dict[str, _SymbolCache] = {}
+
+        # SPY context: full pipeline result, long TTL
+        self._SPY_CONTEXT_TTL = 300
+        self._spy_context: tuple[float, USRegimeResult | None] = (0.0, None)
+
+        # Last playbook results (for display)
         self._last_playbooks: dict[str, USPlaybookResult] = {}
-        self._cached_context: dict[str, dict] = {}
-        self._regime_flip_timestamps: dict[str, list[datetime]] = {}
+        self._last_today_bars: dict[str, pd.DataFrame] = {}
 
-    def set_send_fn(self, fn) -> None:
-        """Set async callback for Telegram message sending: fn(text, parse_mode)."""
-        self._send_fn = fn
+        # Auto-scan state
+        self._scan_history: dict[str, list[USScanAlertRecord]] = {}
+        self._scan_history_date: str = ""
 
-    async def _send_tg(self, text: str) -> None:
-        if self._send_fn:
-            try:
-                await self._send_fn(text, parse_mode="HTML")
-            except Exception as e:
-                logger.error("TG send failed: %s", e)
+    # ── Core: analysis pipeline ──
 
-    # ── Core pipeline ──
-
-    async def run_playbook_cycle(self, update_type: str = "morning") -> None:
-        """Run full playbook pipeline for all configured symbols."""
-        watchlist = self._cfg.get("watchlist", [])
-        context_symbols = self._cfg.get("regime", {}).get("market_context_symbols", ["SPY", "QQQ"])
-
-        # Phase 1: Run market context symbols first
-        spy_result: USPlaybookResult | None = None
-        qqq_result: USPlaybookResult | None = None
-
-        for ctx_sym in context_symbols:
-            ctx_info = self._find_watchlist_entry(ctx_sym, watchlist)
-            if not ctx_info:
-                continue
-            try:
-                result = await self._run_single_symbol(
-                    ctx_info["symbol"], ctx_info.get("name", ctx_sym), update_type, None,
-                )
-                if result:
-                    self._last_playbooks[ctx_sym] = result
-                    if ctx_sym == "SPY":
-                        spy_result = result
-                    elif ctx_sym == "QQQ":
-                        qqq_result = result
-            except Exception:
-                logger.exception("Context symbol %s failed", ctx_sym)
-
-        spy_regime = spy_result.regime.regime if spy_result else None
-
-        # Phase 2: Run individual symbols
-        for entry in watchlist:
-            symbol = entry["symbol"]
-            name = entry.get("name", symbol)
-            if symbol in context_symbols:
-                # Already ran, just format & push
-                result = self._last_playbooks.get(symbol)
-                if result:
-                    msg = format_us_playbook_message(result, update_type, spy_result, qqq_result)
-                    await self._send_tg(msg)
-                continue
-
-            try:
-                result = await self._run_single_symbol(symbol, name, update_type, spy_regime)
-                if result:
-                    self._last_playbooks[symbol] = result
-                    msg = format_us_playbook_message(result, update_type, spy_result, qqq_result)
-                    await self._send_tg(msg)
-                    logger.info("Playbook sent for %s (%s)", symbol, update_type)
-            except Exception:
-                logger.exception("Playbook cycle failed for %s", symbol)
-
-            # Rate limit: 1s between symbols (K-line API)
-            await asyncio.sleep(1)
-
-    async def _run_single_symbol(
+    async def _run_analysis_pipeline(
         self,
         symbol: str,
-        name: str,
-        update_type: str,
-        spy_regime: USRegimeType | None,
+        spy_regime: USRegimeType | None = None,
     ) -> USPlaybookResult | None:
-        """Run pipeline for a single symbol."""
+        """Run full pipeline for a single symbol."""
         cfg = self._cfg
         vp_cfg = cfg.get("volume_profile", {})
         rvol_cfg = cfg.get("rvol", {})
         regime_cfg = cfg.get("regime", {})
         filter_cfg = cfg.get("filters", {})
+        option_cfg = cfg.get("option_recommend", {})
 
-        # 1. Fetch history bars (wide window covers both VP and RVOL)
+        # 1. Get bars (with cache)
         vp_target = vp_cfg.get("lookback_trading_days") or vp_cfg.get("lookback_days", 5)
         min_td = vp_cfg.get("min_trading_days", 3)
         rvol_td = rvol_cfg.get("lookback_days", 10)
         fetch_days = calc_fetch_calendar_days(vp_target, rvol_td)
-        bars = await self._collector.get_history_bars(symbol, days=fetch_days)
-        if bars.empty:
-            logger.warning("No bars for %s, skipping", symbol)
-            return None
 
-        # 2. Split today vs history — VP uses truncated, RVOL uses full
-        history_all = get_history_bars(bars)
-        vp_history = get_history_bars(bars, max_trading_days=vp_target)
-        today = get_today_bars(bars)
+        hist_bars, today, cached_entry = await self._get_bars_split(symbol, fetch_days, vp_target)
 
-        # 3. Volume Profile (with trading_days populated)
+        # 2. Volume Profile
+        vp_history = get_history_bars(hist_bars, max_trading_days=vp_target) if not hist_bars.empty else hist_bars
         vp = compute_volume_profile(vp_history, value_area_pct=vp_cfg.get("value_area_pct", 0.70))
 
-        # 4. PDH/PDL
-        pdh, pdl = extract_previous_day_hl(bars)
+        # 3. PDH/PDL and PMH/PML (from cache)
+        pdh = cached_entry.pdh
+        pdl = cached_entry.pdl
+        pmh = cached_entry.pmh
+        pml = cached_entry.pml
+        pm_source = cached_entry.pm_source
 
-        # 5. Current price (via snapshot — no subscription needed)
+        # 4. Current price (snapshot — no subscription needed)
         snap = await self._collector.get_snapshot(symbol)
         price = snap["last_price"]
         prev_close = snap["prev_close_price"] or 0.0
 
-        # 6. Pre-market HL (reuse snapshot to avoid duplicate API call)
-        pm_data = await self._collector.get_premarket_hl(symbol, snapshot=snap)
-        pmh, pml, pm_source = pm_data.pmh, pm_data.pml, pm_data.source
+        # 4b. Build QuoteSnapshot
+        quote_snapshot = QuoteSnapshot(
+            symbol=symbol,
+            last_price=price,
+            open_price=snap.get("open_price", 0.0),
+            high_price=snap.get("high_price", 0.0),
+            low_price=snap.get("low_price", 0.0),
+            prev_close=prev_close,
+            volume=snap.get("volume", 0),
+            turnover=snap.get("turnover", 0.0),
+            bid_price=snap.get("bid_price", 0.0),
+            ask_price=snap.get("ask_price", 0.0),
+            turnover_rate=snap.get("turnover_rate", 0.0),
+            amplitude=snap.get("amplitude", 0.0),
+        )
 
-        # 7. VWAP + RVOL (RVOL uses full history for better coverage)
+        # 5. VWAP + RVOL
         vwap = calculate_vwap(today)
         rvol = calculate_us_rvol(
-            today, history_all,
+            today, hist_bars,
             skip_open_minutes=rvol_cfg.get("skip_open_minutes", 3),
             lookback_days=rvol_cfg.get("lookback_days", 10),
         )
 
-        # 8. Gamma Wall (graceful fallback, 10s hard timeout)
+        # 6. Option chain fetch (shared by Gamma Wall + option recommendation)
         gamma_wall: GammaWallResult | None = None
-        if cfg.get("gamma_wall", {}).get("enabled", True):
-            try:
-                async def _fetch_gamma():
-                    expiry = self._this_week_friday()
-                    options = await self._collector.get_option_chain(symbol, expiration=expiry)
-                    if options:
-                        chain_df = pd.DataFrame([
-                            {
-                                "option_type": o.option_type.upper(),
-                                "strike_price": o.strike,
-                                "open_interest": o.open_interest,
-                            }
-                            for o in options
-                        ])
-                        return calculate_gamma_wall(chain_df, price)
-                    return None
-                gamma_wall = await asyncio.wait_for(_fetch_gamma(), timeout=10)
-            except Exception:
-                logger.warning("Gamma wall fetch failed for %s, skipping", symbol)
+        chain_df = pd.DataFrame()
+        expiry_dates: list[str] = []
+        target_expiry: str | None = None
+        atm_iv = 0.0
+        avg_iv = 0.0
 
-        # 9. Filters
+        try:
+            expiry_dates = await self._collector.get_option_expiration_dates(symbol)
+            target_expiry = select_expiry(
+                expiry_dates,
+                dte_min=option_cfg.get("dte_min", 1),
+                dte_preferred_max=option_cfg.get("dte_preferred_max", 7),
+            )
+            if target_expiry:
+                try:
+                    options = await asyncio.wait_for(
+                        self._collector.get_option_chain(symbol, expiration=target_expiry),
+                        timeout=10,
+                    )
+                    if options:
+                        chain_df = option_quotes_to_df(options)
+                except Exception:
+                    logger.warning("Option chain fetch failed for %s, continuing without", symbol)
+
+            if not chain_df.empty:
+                # Gamma Wall (chain_df already has option_type/strike_price/open_interest)
+                if cfg.get("gamma_wall", {}).get("enabled", True):
+                    try:
+                        gamma_wall = calculate_gamma_wall(chain_df, price)
+                    except Exception:
+                        logger.warning("Gamma wall calc failed for %s", symbol)
+
+                atm_iv, avg_iv = self._extract_iv(chain_df, price)
+        except Exception:
+            logger.warning("Option data fetch failed for %s", symbol, exc_info=True)
+
+        # 6b. Build OptionMarketSnapshot
+        option_market = OptionMarketSnapshot(
+            expiry=target_expiry,
+            contract_count=len(chain_df),
+            call_contract_count=int(
+                (chain_df["option_type"].astype(str).str.upper() == "CALL").sum()
+            ) if not chain_df.empty and "option_type" in chain_df.columns else 0,
+            put_contract_count=int(
+                (chain_df["option_type"].astype(str).str.upper() == "PUT").sum()
+            ) if not chain_df.empty and "option_type" in chain_df.columns else 0,
+            atm_iv=atm_iv,
+            avg_iv=avg_iv,
+            iv_ratio=(atm_iv / avg_iv) if avg_iv > 0 else 0.0,
+        )
+
+        # 7. Filters
         filters = check_us_filters(
             rvol=rvol,
             prev_high=pdh,
@@ -212,12 +234,12 @@ class USPlaybook:
             inside_day_rvol_threshold=filter_cfg.get("inside_day_rvol_threshold", 0.8),
         )
 
-        # 10. Adaptive RVOL profile
+        # 8. Adaptive RVOL profile
         adaptive_cfg = regime_cfg.get("adaptive", {})
         rvol_profile = None
         if adaptive_cfg.get("enabled", True):
             rvol_profile = compute_rvol_profile(
-                history_bars=history_all,
+                history_bars=hist_bars,
                 today_rvol=rvol,
                 skip_open_minutes=rvol_cfg.get("skip_open_minutes", 3),
                 gap_and_go_pctl=adaptive_cfg.get("gap_and_go_percentile", 85),
@@ -227,9 +249,10 @@ class USPlaybook:
                 fallback_trend_day=regime_cfg.get("trend_day_rvol", 1.2),
                 fallback_fade_chop=regime_cfg.get("fade_chop_rvol", 1.0),
                 min_sample_days=adaptive_cfg.get("min_sample_days", 5),
+                min_trend_day_floor=adaptive_cfg.get("min_trend_day_floor", 1.0),
             )
 
-        # 11. Regime classification (with VP data quality + adaptive thresholds)
+        # 9. Regime classification
         regime = classify_us_regime(
             price=price,
             prev_close=prev_close,
@@ -249,24 +272,35 @@ class USPlaybook:
             pm_source=pm_source,
         )
 
-        # 12. Build key levels
+        # 10. Option recommendation (reuse chain_df from step 6)
+        chase_risk_cfg = self._cfg.get("chase_risk", {})
+        option_rec: OptionRecommendation | None = None
+        try:
+            option_rec = recommend(
+                regime=regime,
+                vp=vp,
+                filters=filters,
+                chain_df=chain_df if not chain_df.empty else None,
+                expiry_dates=expiry_dates,
+                gamma_wall=gamma_wall,
+                vwap=vwap,
+                chase_risk_cfg=chase_risk_cfg,
+                option_cfg=option_cfg,
+            )
+        except Exception:
+            logger.warning("Option recommendation failed for %s", symbol, exc_info=True)
+
+        # 11. Build key levels
         key_levels = build_key_levels(vp, pdh, pdl, pmh, pml, vwap, gamma_wall, pm_source=pm_source)
 
-        # 13. Cache intermediate data for lightweight regime monitor
-        self._cached_context[symbol] = {
-            "history_all": history_all,
-            "vp": vp,
-            "pdh": pdh, "pdl": pdl,
-            "pmh": pmh, "pml": pml,
-            "prev_close": prev_close,
-            "rvol_profile": rvol_profile,
-            "gamma_wall": gamma_wall,
-        }
+        # 12. Strategy text (direction-aware)
+        _dir = "bullish" if price > vp.vah or (vp.poc > 0 and price > vp.poc) else "bearish"
+        if price < vp.val:
+            _dir = "bearish"
+        strategy_text = get_regime_strategy(regime.regime, _dir)
 
-        # 14. Strategy text
-        strategy_text = REGIME_STRATEGY.get(regime.regime, "")
-
-        return USPlaybookResult(
+        name = self.watchlist.get_name(symbol)
+        result = USPlaybookResult(
             symbol=symbol,
             name=name,
             regime=regime,
@@ -276,288 +310,633 @@ class USPlaybook:
             filters=filters,
             strategy_text=strategy_text,
             generated_at=datetime.now(ET),
+            option_rec=option_rec,
+            quote=quote_snapshot,
+            option_market=option_market,
         )
+        self._last_playbooks[symbol] = result
+        self._last_today_bars[symbol] = today
+        return result
 
-    # ── Regime Monitor ──
+    @staticmethod
+    def _extract_iv(chain_df: pd.DataFrame, price: float) -> tuple[float, float]:
+        """Extract ATM implied volatility from option chain.
 
-    async def run_regime_monitor_cycle(self) -> None:
-        """Lightweight regime check between morning/confirm pushes.
-
-        Runs only in the 09:50-10:13 ET window. Compares current regime
-        against cached playbook regime; pushes alert only on change.
+        Returns (atm_iv, avg_iv) where:
+        - atm_iv = mean IV of 4 nearest strikes to current price
+        - avg_iv = median IV of strikes within ATM ±3 strikes
         """
-        now = datetime.now(ET)
-        if not self._is_in_monitor_window(now):
-            return
+        iv_col = None
+        for col in ("implied_volatility", "iv"):
+            if col in chain_df.columns:
+                iv_col = col
+                break
+        if chain_df.empty or iv_col is None:
+            return 0.0, 0.0
 
-        if not self._last_playbooks:
-            return
+        strike_col = "strike" if "strike" in chain_df.columns else "strike_price"
+        if strike_col not in chain_df.columns:
+            return 0.0, 0.0
 
-        monitor_cfg = self._cfg.get("regime_monitor", {})
-        conf_threshold = monitor_cfg.get("confidence_change_threshold", 0.2)
-        max_flips = monitor_cfg.get("max_flips_in_window", 2)
+        chain_copy = chain_df.copy()
+        chain_copy["_dist"] = (chain_copy[strike_col] - price).abs()
 
-        watchlist = self._cfg.get("watchlist", [])
-        context_symbols = self._cfg.get("regime", {}).get("market_context_symbols", ["SPY", "QQQ"])
+        nearest_strikes = (
+            chain_copy.drop_duplicates(subset=[strike_col])
+            .nsmallest(7, "_dist")[strike_col]
+            .tolist()
+        )
+        near_atm = chain_copy[chain_copy[strike_col].isin(nearest_strikes)]
+        near_atm_iv = near_atm[iv_col].dropna()
+        near_atm_iv = near_atm_iv[near_atm_iv > 0]
+        if near_atm_iv.empty:
+            all_iv = chain_df[iv_col].dropna()
+            all_iv = all_iv[all_iv > 0]
+            avg_iv = float(all_iv.median()) if not all_iv.empty else 0.0
+        else:
+            avg_iv = float(near_atm_iv.median())
 
-        # Phase 1: Check context symbols first to get spy_regime
-        spy_regime: USRegimeType | None = None
-        for ctx_sym in context_symbols:
-            changed, new_regime, old_regime = await self._check_regime_change(
-                ctx_sym, None, conf_threshold,
+        atm = chain_copy.nsmallest(4, "_dist")
+        atm_iv_vals = atm[iv_col].dropna()
+        atm_iv_vals = atm_iv_vals[atm_iv_vals > 0]
+        if atm_iv_vals.empty:
+            return 0.0, avg_iv
+
+        return float(atm_iv_vals.mean()), avg_iv
+
+    # ── SPY context ──
+
+    async def _ensure_spy_context(self) -> USRegimeType | None:
+        """SPY regime from full analysis pipeline. Cached with long TTL."""
+        now = time.time()
+        if self._spy_context[1] and now - self._spy_context[0] < self._SPY_CONTEXT_TTL:
+            return self._spy_context[1].regime
+
+        spy_result = await self._run_analysis_pipeline("SPY", spy_regime=None)
+        if spy_result:
+            self._spy_context = (now, spy_result.regime)
+            return spy_result.regime.regime
+        return self._spy_context[1].regime if self._spy_context[1] else None
+
+    # ── On-demand playbook for a single symbol ──
+
+    async def generate_playbook_for_symbol(self, symbol: str) -> PlaybookResponse:
+        """Generate playbook for a symbol. Returns PlaybookResponse with HTML + chart."""
+        # Get SPY context first (unless querying SPY itself)
+        if symbol == "SPY":
+            result = await self._run_analysis_pipeline(symbol, spy_regime=None)
+            if result:
+                # Update SPY context
+                self._spy_context = (time.time(), result.regime)
+        else:
+            spy_regime = await self._ensure_spy_context()
+            result = await self._run_analysis_pipeline(symbol, spy_regime=spy_regime)
+
+        if not result:
+            return PlaybookResponse(html=f"Failed to generate playbook for {symbol}")
+
+        # Get SPY/QQQ results for market context display
+        spy_result = self._last_playbooks.get("SPY")
+        qqq_result = self._last_playbooks.get("QQQ")
+        html_text = format_us_playbook_message(result, spy_result=spy_result, qqq_result=qqq_result)
+
+        # Generate chart (best-effort — failure degrades to text-only)
+        chart_bytes: bytes | None = None
+        try:
+            today_bars = self._last_today_bars.get(symbol)
+            kl = result.key_levels
+            key_levels_dict: dict[str, float] = {}
+            for attr, label in [
+                ("poc", "POC"), ("vah", "VAH"), ("val", "VAL"),
+                ("vwap", "VWAP"), ("pdh", "PDH"), ("pdl", "PDL"),
+                ("pmh", "PMH"), ("pml", "PML"),
+                ("gamma_call_wall", "Gamma Call Wall"),
+                ("gamma_put_wall", "Gamma Put Wall"),
+            ]:
+                v = getattr(kl, attr, 0.0)
+                if v and v > 0:
+                    key_levels_dict[label] = v
+
+            display = f"{result.name} ({symbol})" if result.name != symbol else symbol
+            chart_data = ChartData(
+                symbol=display,
+                today_bars=today_bars if today_bars is not None else pd.DataFrame(),
+                volume_profile=result.volume_profile,
+                vwap=kl.vwap,
+                last_price=result.regime.price,
+                prev_close=result.quote.prev_close if result.quote else 0.0,
+                regime_label=f"{result.regime.regime.value.upper()} {result.regime.confidence:.0%}",
+                key_levels=key_levels_dict,
+                gamma_wall=result.gamma_wall,
             )
-            if new_regime and ctx_sym == "SPY":
-                spy_regime = new_regime.regime
-            if changed and new_regime and old_regime:
-                if self._should_suppress_flip(ctx_sym, now, max_flips):
-                    continue
-                await self._send_regime_alert(ctx_sym, old_regime, new_regime)
+            buf = await generate_chart_async(chart_data)
+            if buf is not None:
+                chart_bytes = buf.getvalue()
+        except Exception:
+            logger.warning("Chart generation failed for %s", symbol, exc_info=True)
 
-        # Phase 2: Check remaining symbols
-        for entry in watchlist:
-            symbol = entry["symbol"]
+        return PlaybookResponse(html=html_text, chart=chart_bytes)
+
+    # ── Auto-scan ──
+
+    async def run_auto_scan(self, send_fn) -> None:
+        """Scan watchlist for strong signals and push alerts."""
+        scan_cfg = self._cfg.get("auto_scan", {})
+        if not scan_cfg.get("enabled", False):
+            return
+
+        now_et = datetime.now(ET)
+        in_window, session = self._get_scan_window(scan_cfg, now_et)
+        if not in_window:
+            return
+
+        self._reset_scan_history_if_new_day()
+
+        symbols = self.watchlist.symbols()
+        context_symbols = self._cfg.get("regime", {}).get("market_context_symbols", ["SPY", "QQQ"])
+        cooldown_mins = scan_cfg.get("cooldown", {}).get("same_signal_minutes", 30)
+
+        # Phase 1: Scan SPY first for market context
+        for ctx_sym in context_symbols:
+            if ctx_sym in symbols:
+                try:
+                    result = await self._run_analysis_pipeline(ctx_sym, spy_regime=None)
+                    if result and ctx_sym == "SPY":
+                        self._spy_context = (time.time(), result.regime)
+                except Exception:
+                    logger.warning("Context symbol %s scan failed", ctx_sym, exc_info=True)
+
+        spy_regime_type = self._spy_context[1].regime if self._spy_context[1] else None
+
+        # Phase 2: Scan remaining symbols
+        for symbol in symbols:
             if symbol in context_symbols:
                 continue
-            changed, new_regime, old_regime = await self._check_regime_change(
-                symbol, spy_regime, conf_threshold,
-            )
-            if changed and new_regime and old_regime:
-                if self._should_suppress_flip(symbol, now, max_flips):
+            try:
+                l1_data = await self._l1_screen(symbol, session, scan_cfg, spy_regime_type)
+                if l1_data is None:
                     continue
-                await self._send_regime_alert(symbol, old_regime, new_regime)
-            await asyncio.sleep(1)  # rate limit
 
-    async def _check_regime_change(
+                logger.info(
+                    "L1 pass %s: type=%s dir=%s price=%.2f",
+                    symbol, l1_data["signal_type"], l1_data["direction"], l1_data["price"],
+                )
+
+                # L2: full pipeline verification (structure + execution decoupled)
+                l2_result = await self._l2_verify(symbol, l1_data, spy_regime_type)
+                if l2_result is None:
+                    continue
+
+                signal, playbook_html, option_rec, l2_filters = l2_result
+
+                # Frequency control
+                allowed, override_reason = self._check_frequency(
+                    symbol, signal, session, scan_cfg,
+                )
+                if not allowed:
+                    continue
+
+                # Format and send
+                header = self._format_scan_header(
+                    signal, l2_filters.risk_level, option_rec, override_reason, cooldown_mins,
+                )
+                await send_fn(header + "\n" + playbook_html, parse_mode="HTML")
+
+                self._record_alert(symbol, signal, session)
+                logger.info(
+                    "Auto-scan alert sent: %s %s %s conf=%.2f%s",
+                    symbol, signal.signal_type, signal.direction,
+                    signal.regime.confidence,
+                    f" (override: {override_reason})" if override_reason else "",
+                )
+
+            except Exception:
+                logger.warning("Auto-scan error for %s", symbol, exc_info=True)
+
+    # ── Auto-scan: window check ──
+
+    @staticmethod
+    def _get_scan_window(
+        scan_cfg: dict,
+        now_et: datetime | None = None,
+    ) -> tuple[bool, str]:
+        """Check if current time is within a scan window."""
+        if now_et is None:
+            now_et = datetime.now(ET)
+
+        if now_et.weekday() > 4:
+            return False, ""
+
+        t = now_et.hour * 60 + now_et.minute
+
+        for session_name, key in [("morning", "morning_window"), ("afternoon", "afternoon_window")]:
+            window = scan_cfg.get(key)
+            if not window or len(window) < 2:
+                continue
+            s_h, s_m = map(int, window[0].split(":"))
+            e_h, e_m = map(int, window[1].split(":"))
+            if s_h * 60 + s_m <= t <= e_h * 60 + e_m:
+                return True, session_name
+
+        return False, ""
+
+    # ── Auto-scan: L1 lightweight screen ──
+
+    async def _l1_screen(
         self,
         symbol: str,
-        spy_regime: USRegimeType | None,
-        conf_threshold: float,
-    ) -> tuple[bool, USRegimeResult | None, USRegimeResult | None]:
-        """Lightweight regime re-check using cached VP/PDH/PDL/PMH/PML.
-
-        Returns (changed, new_regime, old_regime).
-        """
-        cached = self._cached_context.get(symbol)
-        old_pb = self._last_playbooks.get(symbol)
-        if not cached or not old_pb:
-            return False, None, None
-
-        old_regime = old_pb.regime
+        session: str,
+        scan_cfg: dict,
+        spy_regime: USRegimeType | None = None,
+    ) -> dict | None:
+        """Lightweight L1 screen. Returns screening data if passed, None otherwise."""
         cfg = self._cfg
+        vp_cfg = cfg.get("volume_profile", {})
         rvol_cfg = cfg.get("rvol", {})
         regime_cfg = cfg.get("regime", {})
+        breakout_cfg = scan_cfg.get("breakout", {})
+
+        # Get bars (cached)
+        vp_target = vp_cfg.get("lookback_trading_days") or vp_cfg.get("lookback_days", 5)
+        rvol_td = rvol_cfg.get("lookback_days", 10)
+        fetch_days = calc_fetch_calendar_days(vp_target, rvol_td)
+        hist_bars, today, cached_entry = await self._get_bars_split(symbol, fetch_days, vp_target)
+
+        # VP
+        vp_history = get_history_bars(hist_bars, max_trading_days=vp_target) if not hist_bars.empty else hist_bars
+        vp = compute_volume_profile(vp_history, value_area_pct=vp_cfg.get("value_area_pct", 0.70))
+        if vp.vah <= 0 or vp.val <= 0:
+            return None
+
+        # Snapshot for price
+        snap = await self._collector.get_snapshot(symbol)
+        price = snap["last_price"]
+        prev_close = snap["prev_close_price"] or 0.0
+        if price <= 0:
+            return None
+
+        # RVOL
+        rvol = calculate_us_rvol(
+            today, hist_bars,
+            skip_open_minutes=rvol_cfg.get("skip_open_minutes", 3),
+            lookback_days=rvol_cfg.get("lookback_days", 10),
+        )
+
+        # Lightweight regime (no option chain / gamma wall)
         adaptive_cfg = regime_cfg.get("adaptive", {})
-
-        try:
-            # Fresh data: snapshot + today bars
-            vp_target = cfg.get("volume_profile", {}).get("lookback_trading_days", 5)
-            rvol_td = rvol_cfg.get("lookback_days", 10)
-            fetch_days = calc_fetch_calendar_days(vp_target, rvol_td)
-            bars = await self._collector.get_history_bars(symbol, days=fetch_days)
-            if bars.empty:
-                return False, None, None
-
-            today = get_today_bars(bars)
-            history_all = get_history_bars(bars)
-
-            snap = await self._collector.get_snapshot(symbol)
-            price = snap["last_price"]
-
-            # Fresh VWAP + RVOL
-            vwap = calculate_vwap(today)
-            rvol = calculate_us_rvol(
-                today, history_all,
+        rvol_profile = None
+        if adaptive_cfg.get("enabled", True):
+            rvol_profile = compute_rvol_profile(
+                history_bars=hist_bars,
+                today_rvol=rvol,
                 skip_open_minutes=rvol_cfg.get("skip_open_minutes", 3),
-                lookback_days=rvol_cfg.get("lookback_days", 10),
+                gap_and_go_pctl=adaptive_cfg.get("gap_and_go_percentile", 85),
+                trend_day_pctl=adaptive_cfg.get("trend_day_percentile", 60),
+                fade_chop_pctl=adaptive_cfg.get("fade_chop_percentile", 30),
+                fallback_gap_and_go=regime_cfg.get("gap_and_go_rvol", 1.5),
+                fallback_trend_day=regime_cfg.get("trend_day_rvol", 1.2),
+                fallback_fade_chop=regime_cfg.get("fade_chop_rvol", 1.0),
+                min_sample_days=adaptive_cfg.get("min_sample_days", 5),
+                min_trend_day_floor=adaptive_cfg.get("min_trend_day_floor", 1.0),
             )
 
-            # Reuse cached: VP, PDH/PDL, PMH/PML, prev_close, rvol_profile, gamma_wall
-            new_regime = classify_us_regime(
-                price=price,
-                prev_close=cached["prev_close"],
-                rvol=rvol,
-                pmh=cached["pmh"],
-                pml=cached["pml"],
-                vp=cached["vp"],
-                gamma_wall=cached["gamma_wall"],
-                spy_regime=spy_regime,
-                gap_and_go_rvol=regime_cfg.get("gap_and_go_rvol", 1.5),
-                trend_day_rvol=regime_cfg.get("trend_day_rvol", 1.2),
-                fade_chop_rvol=regime_cfg.get("fade_chop_rvol", 1.0),
-                vp_trading_days=cached["vp"].trading_days,
-                min_vp_trading_days=cfg.get("volume_profile", {}).get("min_trading_days", 3),
-                rvol_profile=cached["rvol_profile"],
-                gap_significance_threshold=adaptive_cfg.get("gap_significance_threshold", 0.3),
-            )
-        except Exception:
-            logger.exception("Regime check failed for %s", symbol)
-            return False, None, None
+        regime = classify_us_regime(
+            price=price,
+            prev_close=prev_close,
+            rvol=rvol,
+            pmh=cached_entry.pmh,
+            pml=cached_entry.pml,
+            vp=vp,
+            spy_regime=spy_regime,
+            gap_and_go_rvol=regime_cfg.get("gap_and_go_rvol", 1.5),
+            trend_day_rvol=regime_cfg.get("trend_day_rvol", 1.2),
+            fade_chop_rvol=regime_cfg.get("fade_chop_rvol", 1.0),
+            vp_trading_days=vp.trading_days,
+            min_vp_trading_days=vp_cfg.get("min_trading_days", 3),
+            rvol_profile=rvol_profile,
+            gap_significance_threshold=adaptive_cfg.get("gap_significance_threshold", 0.3),
+            pm_source=cached_entry.pm_source,
+        )
 
-        # Detect change: regime flip or large confidence shift
-        regime_changed = new_regime.regime != old_regime.regime
-        conf_changed = abs(new_regime.confidence - old_regime.confidence) >= conf_threshold
-        changed = regime_changed or conf_changed
+        # BREAKOUT check
+        bo_min_conf = breakout_cfg.get("min_confidence", 0.70)
+        bo_min_rvol = breakout_cfg.get("min_rvol", 1.30)
+        bo_min_mag = breakout_cfg.get("min_magnitude_pct", 0.20)
 
-        if changed:
-            # Update cached playbook with new regime and key levels
-            old_pb.regime = new_regime
-            old_pb.key_levels = build_key_levels(
-                cached["vp"], cached["pdh"], cached["pdl"],
-                cached["pmh"], cached["pml"], vwap, cached["gamma_wall"],
-            )
-            old_pb.generated_at = datetime.now(ET)
-            logger.info(
-                "Regime change detected for %s: %s→%s (conf %.0f%%→%.0f%%, RVOL %.2f→%.2f)",
-                symbol, old_regime.regime.value, new_regime.regime.value,
-                old_regime.confidence * 100, new_regime.confidence * 100,
-                old_regime.rvol, new_regime.rvol,
-            )
+        if (
+            regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY)
+            and regime.confidence >= bo_min_conf
+            and rvol >= bo_min_rvol
+        ):
+            magnitude = 0.0
+            if price > vp.vah and vp.vah > 0:
+                magnitude = (price - vp.vah) / price * 100
+            elif price < vp.val and vp.val > 0:
+                magnitude = (vp.val - price) / price * 100
 
-        return changed, new_regime, old_regime
+            if magnitude >= bo_min_mag:
+                direction = "bullish" if price > vp.vah else "bearish"
+                signal_type = regime_to_signal_type(regime.regime, direction) or "BREAKOUT_LONG"
+                triggers = []
+                boundary = "VAH" if price > vp.vah else "VAL"
+                triggers.append(f"突破 {boundary} {magnitude:.2f}%")
+                triggers.append(f"RVOL {rvol:.2f} | Conf {regime.confidence:.0%}")
 
-    async def _send_regime_alert(
+                return {
+                    "signal_type": signal_type,
+                    "direction": direction,
+                    "regime": regime,
+                    "price": price,
+                    "trigger_reasons": triggers,
+                }
+
+        # RANGE_REVERSAL check (disabled by default in v1)
+        range_cfg = scan_cfg.get("range_reversal", {})
+        if range_cfg.get("enabled", False) and session == "morning":
+            rng_min_conf = range_cfg.get("min_confidence", 0.70)
+            rng_rvol_min = range_cfg.get("rvol_min", 0.50)
+            rng_rvol_max = range_cfg.get("rvol_max", 1.00)
+            rng_prox = range_cfg.get("va_proximity_pct", 0.30)
+
+            if (
+                regime.regime == USRegimeType.FADE_CHOP
+                and regime.confidence >= rng_min_conf
+                and rng_rvol_min <= rvol <= rng_rvol_max
+            ):
+                dist_vah = abs(price - vp.vah) / price * 100 if price > 0 else 999
+                dist_val = abs(price - vp.val) / price * 100 if price > 0 else 999
+                near_boundary = min(dist_vah, dist_val)
+
+                if near_boundary <= rng_prox:
+                    direction = "bearish" if dist_vah < dist_val else "bullish"
+                    signal_type = regime_to_signal_type(USRegimeType.FADE_CHOP, direction)
+                    boundary = "VAH" if dist_vah < dist_val else "VAL"
+                    triggers = [f"接近 {boundary} (距离 {near_boundary:.2f}%)"]
+                    return {
+                        "signal_type": signal_type,
+                        "direction": direction,
+                        "regime": regime,
+                        "price": price,
+                        "trigger_reasons": triggers,
+                    }
+
+        return None
+
+    # ── Auto-scan: L2 verification (structure + execution decoupled) ──
+
+    async def _l2_verify(
         self,
         symbol: str,
-        old_regime: USRegimeResult,
-        new_regime: USRegimeResult,
-    ) -> None:
-        pb = self._last_playbooks.get(symbol)
-        name = pb.name if pb else symbol
-        key_levels = pb.key_levels if pb else None
-        msg = format_regime_change_alert(symbol, name, old_regime, new_regime, key_levels)
-        await self._send_tg(msg)
+        l1_data: dict,
+        spy_regime: USRegimeType | None = None,
+    ) -> tuple[USScanSignal, str, OptionRecommendation | None, FilterResult] | None:
+        """Full pipeline verification. Structure verification gates the push; execution status is informational."""
+        result = await self._run_analysis_pipeline(symbol, spy_regime=spy_regime)
+        if not result:
+            return None
 
-    def _is_in_monitor_window(self, now: datetime) -> bool:
-        """Check if current time falls in the regime monitor window."""
-        if now.weekday() >= 5:
-            return False
-        monitor_cfg = self._cfg.get("regime_monitor", {})
-        if not monitor_cfg.get("enabled", True):
-            return False
-        push_times = self._cfg.get("playbook", {}).get("push_times", ["09:45", "10:15"])
-        morning_h, morning_m = map(int, push_times[0].split(":"))
-        confirm_h, confirm_m = map(int, push_times[1].split(":"))
-        start_offset = monitor_cfg.get("start_after_morning_minutes", 5)
-        end_offset = monitor_cfg.get("end_before_confirm_minutes", 2)
-        window_start = now.replace(
-            hour=morning_h, minute=morning_m, second=0, microsecond=0,
-        ) + timedelta(minutes=start_offset)
-        window_end = now.replace(
-            hour=confirm_h, minute=confirm_m, second=0, microsecond=0,
-        ) - timedelta(minutes=end_offset)
-        return window_start <= now <= window_end
+        # Structure verification (must all pass to push)
+        if not result.filters.tradeable:
+            logger.debug("L2 reject %s: not tradeable", symbol)
+            return None
+        if result.filters.risk_level == "high":
+            logger.debug("L2 reject %s: risk_level=high", symbol)
+            return None
 
-    def _should_suppress_flip(self, symbol: str, now: datetime, max_flips: int) -> bool:
-        """Suppress alerts if regime has flipped too many times in the monitor window."""
-        timestamps = self._regime_flip_timestamps.setdefault(symbol, [])
-        # Prune timestamps older than 10 minutes
-        cutoff = now - timedelta(minutes=10)
-        timestamps[:] = [ts for ts in timestamps if ts > cutoff]
-        timestamps.append(now)
-        if len(timestamps) > max_flips:
-            logger.warning(
-                "Regime flip suppressed for %s: %d flips in 10min (unstable)",
-                symbol, len(timestamps),
+        signal_type = l1_data["signal_type"]
+        direction = l1_data["direction"]
+
+        # Regime consistency check
+        expected_regimes = {
+            "BREAKOUT": (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY),
+            "RANGE_REVERSAL": (USRegimeType.FADE_CHOP,),
+        }
+        signal_prefix = signal_type.rsplit("_", 1)[0] if "_" in signal_type else signal_type
+        # Handle BREAKOUT_LONG → BREAKOUT, RANGE_REVERSAL_LONG → RANGE_REVERSAL
+        if signal_prefix.endswith("_LONG") or signal_prefix.endswith("_SHORT"):
+            signal_prefix = signal_type.rsplit("_", 1)[0]
+        # Map BREAKOUT_LONG/SHORT to BREAKOUT category
+        for prefix, regimes in expected_regimes.items():
+            if signal_type.startswith(prefix):
+                if result.regime.regime not in regimes:
+                    logger.debug("L2 reject %s: regime %s not in expected %s", symbol, result.regime.regime, regimes)
+                    return None
+                break
+
+        # SPY context consistency
+        spy_ctx = self._spy_context[1]
+        if spy_ctx and direction == "bullish" and spy_ctx.regime == USRegimeType.FADE_CHOP:
+            if result.regime.confidence < 0.75:
+                logger.debug("L2 reject %s: bullish signal but SPY is FADE_CHOP with low conf", symbol)
+                return None
+
+        signal = USScanSignal(
+            signal_type=signal_type,
+            direction=direction,
+            symbol=symbol,
+            regime=result.regime,
+            price=result.regime.price,
+            trigger_reasons=l1_data["trigger_reasons"],
+            timestamp=time.time(),
+        )
+
+        # Format playbook HTML
+        spy_result = self._last_playbooks.get("SPY")
+        qqq_result = self._last_playbooks.get("QQQ")
+        playbook_html = format_us_playbook_message(result, spy_result=spy_result, qqq_result=qqq_result)
+
+        return signal, playbook_html, result.option_rec, result.filters
+
+    # ── Auto-scan: frequency control ──
+
+    def _reset_scan_history_if_new_day(self) -> None:
+        today = datetime.now(ET).strftime("%Y-%m-%d")
+        if self._scan_history_date != today:
+            self._scan_history.clear()
+            self._scan_history_date = today
+
+    def _check_frequency(
+        self,
+        symbol: str,
+        signal: USScanSignal,
+        session: str,
+        scan_cfg: dict,
+    ) -> tuple[bool, str | None]:
+        """3-layer frequency control with override exceptions."""
+        cooldown_cfg = scan_cfg.get("cooldown", {})
+        override_cfg = scan_cfg.get("override", {})
+        same_signal_mins = cooldown_cfg.get("same_signal_minutes", 30)
+        max_per_session = cooldown_cfg.get("max_per_session", 2)
+        max_per_day = cooldown_cfg.get("max_per_day", 3)
+
+        records = self._scan_history.get(symbol, [])
+        now = signal.timestamp
+
+        # Layer 3: max per day
+        if len(records) >= max_per_day:
+            if override_cfg.get("regime_upgrade", True):
+                last = records[-1]
+                if last.signal_type.startswith("RANGE") and signal.signal_type.startswith("BREAKOUT"):
+                    return True, "Regime 从 RANGE 升级为 BREAKOUT"
+            return False, None
+
+        # Layer 2: max per session
+        session_records = [r for r in records if r.session == session]
+        if len(session_records) >= max_per_session:
+            if override_cfg.get("regime_upgrade", True):
+                last = session_records[-1]
+                if last.signal_type.startswith("RANGE") and signal.signal_type.startswith("BREAKOUT"):
+                    return True, "Regime 从 RANGE 升级为 BREAKOUT"
+            return False, None
+
+        # Layer 1: same signal cooldown
+        same_signals = [
+            r for r in records
+            if r.signal_type == signal.signal_type
+            and r.direction == signal.direction
+            and now - r.timestamp < same_signal_mins * 60
+        ]
+        if same_signals:
+            last = same_signals[-1]
+
+            conf_threshold = override_cfg.get("confidence_increase", 0.10)
+            if signal.regime.confidence - last.confidence >= conf_threshold:
+                return True, f"置信度提升 {signal.regime.confidence - last.confidence:.0%}"
+
+            ext_threshold = override_cfg.get("price_extension_pct", 0.50)
+            if last.price > 0:
+                if signal.direction == "bullish":
+                    price_ext = (signal.price - last.price) / last.price * 100
+                else:
+                    price_ext = (last.price - signal.price) / last.price * 100
+                if price_ext >= ext_threshold:
+                    return True, f"价格继续扩展 {price_ext:.2f}%"
+
+            if override_cfg.get("regime_upgrade", True):
+                if last.signal_type.startswith("RANGE") and signal.signal_type.startswith("BREAKOUT"):
+                    return True, "Regime 从 RANGE 升级为 BREAKOUT"
+
+            return False, None
+
+        return True, None
+
+    def _record_alert(self, symbol: str, signal: USScanSignal, session: str) -> None:
+        record = USScanAlertRecord(
+            symbol=symbol,
+            signal_type=signal.signal_type,
+            direction=signal.direction,
+            confidence=signal.regime.confidence,
+            price=signal.price,
+            timestamp=signal.timestamp,
+            session=session,
+        )
+        self._scan_history.setdefault(symbol, []).append(record)
+
+    # ── Auto-scan: alert message formatting ──
+
+    @staticmethod
+    def _format_scan_header(
+        signal: USScanSignal,
+        risk_level: str,
+        option_rec: OptionRecommendation | None,
+        override_reason: str | None,
+        cooldown_mins: int = 30,
+    ) -> str:
+        """Format the alert header with structure/execution dual status."""
+        is_breakout = signal.signal_type.startswith("BREAKOUT")
+        emoji = "\U0001f680" if is_breakout else "\U0001f4e6"
+        dir_cn = "看多" if signal.direction == "bullish" else "看空"
+        dir_arrow = "\u2191" if signal.direction == "bullish" else "\u2193"
+
+        lines = [
+            f"\U0001f514 <b>{signal.signal_type} 强信号</b> {emoji} {dir_arrow} {dir_cn}",
+            f"  置信度: {signal.regime.confidence:.0%}",
+        ]
+
+        # Execution status (informational, does not block push)
+        if option_rec and option_rec.action != "wait":
+            lines.append(f"  期权执行: ✅ 可执行 ({option_rec.action} {option_rec.expiry or ''})")
+        else:
+            wait_reason = option_rec.risk_note if option_rec else "期权链不可用"
+            lines.append(f"  期权执行: ⏳ 暂无合约 ({_esc(wait_reason[:50])})")
+
+        lines.append("  触发原因:")
+        for reason in signal.trigger_reasons:
+            lines.append(f"  • {_esc(reason)}")
+
+        if risk_level == "elevated":
+            lines.append("  ⚠️ 风险偏高, 仓位和出手频率都要收缩")
+
+        if override_reason:
+            lines.append(f"  • 冷却期覆盖: {_esc(override_reason)}")
+
+        lines.append(f"  • {cooldown_mins} 分钟内不再重复 (除非信号显著增强)")
+        lines.append("\u2501" * 20)
+
+        return "\n".join(lines)
+
+    # ── Bar caching: history cached, today always fresh ──
+
+    async def _get_bars_split(
+        self,
+        symbol: str,
+        fetch_days: int,
+        vp_target: int,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, _SymbolCache]:
+        """Return (hist_bars, today_bars, cache_entry). History is cached, today is always fresh."""
+        now = time.time()
+        cached = self._hist_cache.get(symbol)
+
+        if cached and now - cached.timestamp < self._cache_ttl:
+            # Cache hit: reuse history, fetch fresh today bars
+            fresh = await self._collector.get_history_bars(symbol, days=1)
+            today_bars = get_today_bars(fresh)
+            return cached.hist_bars, today_bars, cached
+
+        # Cache miss: fetch full, split, cache
+        full = await self._collector.get_history_bars(symbol, days=fetch_days)
+        if full.empty:
+            empty = pd.DataFrame()
+            entry = _SymbolCache(
+                timestamp=now, hist_bars=empty,
+                pdh=0.0, pdl=0.0, pmh=0.0, pml=0.0, pm_source="gap_estimate",
             )
-            return True
-        return False
+            return empty, empty, entry
+
+        hist_bars = get_history_bars(full)
+        today_bars = get_today_bars(full)
+
+        # PDH/PDL from full bars (needs today to find "previous day")
+        pdh, pdl = extract_previous_day_hl(full)
+
+        # PDH/PDL consistency check vs snapshot prev_close
+        snap = await self._collector.get_snapshot(symbol)
+        prev_close_snap = snap.get("prev_close_price", 0.0) or 0.0
+        if pdh > 0 and pdl > 0 and prev_close_snap > 0:
+            if prev_close_snap > pdh * 1.002 or prev_close_snap < pdl * 0.998:
+                logger.warning(
+                    "%s PDH/PDL mismatch: prev_close=%.2f, PDH=%.2f, PDL=%.2f "
+                    "(bar-based 'previous day' may differ from snapshot)",
+                    symbol, prev_close_snap, pdh, pdl,
+                )
+
+        # PMH/PML (reuse snap from PDH/PDL check above)
+        pm_data = await self._collector.get_premarket_hl(symbol, snapshot=snap)
+        pmh, pml, pm_source = pm_data.pmh, pm_data.pml, pm_data.source
+
+        entry = _SymbolCache(
+            timestamp=now, hist_bars=hist_bars,
+            pdh=pdh, pdl=pdl, pmh=pmh, pml=pml, pm_source=pm_source,
+        )
+        self._hist_cache[symbol] = entry
+        return hist_bars, today_bars, entry
 
     # ── Helpers ──
 
     def _this_week_friday(self) -> str:
-        """Return this week's Friday as YYYY-MM-DD string."""
         today = datetime.now(ET).date()
-        days_ahead = 4 - today.weekday()  # 4 = Friday
+        days_ahead = 4 - today.weekday()
         if days_ahead < 0:
             days_ahead += 7
         friday = today + timedelta(days=days_ahead)
         return friday.strftime("%Y-%m-%d")
-
-    @staticmethod
-    def _find_watchlist_entry(symbol: str, watchlist: list[dict]) -> dict | None:
-        for entry in watchlist:
-            if entry["symbol"] == symbol:
-                return entry
-        return None
-
-    # ── Bot command helpers ──
-
-    async def get_playbook_text(self, symbol: str | None = None) -> str:
-        """Generate playbook for a single symbol (manual trigger)."""
-        target = symbol or "SPY"
-        entry = self._find_watchlist_entry(target, self._cfg.get("watchlist", []))
-        if not entry:
-            return f"Symbol {target} not in watchlist"
-        name = entry.get("name", target)
-        result = await self._run_single_symbol(target, name, "manual", None)
-        if not result:
-            return f"Failed to generate playbook for {target}"
-        self._last_playbooks[target] = result
-        return format_us_playbook_message(result, "manual")
-
-    async def get_levels_text(self, symbol: str | None = None) -> str:
-        target = symbol or "SPY"
-        pb = self._last_playbooks.get(target)
-        if not pb:
-            return f"No playbook cached for {target}. Run /us_playbook first."
-
-        kl = pb.key_levels
-        lines = [f"📍 <b>{target} 关键点位</b>", "━" * 20]
-        level_pairs = [
-            ("Call Wall", kl.gamma_call_wall),
-            ("PDH", kl.pdh), ("PMH", kl.pmh), ("VAH", kl.vah),
-            ("VWAP", kl.vwap), ("POC", kl.poc), ("VAL", kl.val),
-            ("PDL", kl.pdl), ("PML", kl.pml),
-            ("Put Wall", kl.gamma_put_wall),
-            ("Max Pain", kl.gamma_max_pain),
-        ]
-        for name, val in sorted(level_pairs, key=lambda x: -x[1]):
-            if val > 0:
-                lines.append(f"  {name}: {val:,.2f}")
-        lines.append(f"\n当前价: {pb.regime.price:,.2f}")
-        return "\n".join(lines)
-
-    async def get_regime_text(self, symbol: str | None = None) -> str:
-        target = symbol or "SPY"
-        pb = self._last_playbooks.get(target)
-        if not pb:
-            return f"No playbook cached for {target}. Run /us_playbook first."
-
-        r = pb.regime
-        from src.us_playbook.playbook import REGIME_EMOJI, REGIME_NAME_CN
-        emoji = REGIME_EMOJI.get(r.regime, "❓")
-        name = REGIME_NAME_CN.get(r.regime, "未知")
-        lines = [
-            f"{emoji} <b>{target} Regime</b>",
-            f"风格: {name}",
-            f"置信度: {r.confidence:.0%}",
-            f"RVOL: {r.rvol:.2f}",
-            f"Gap: {r.gap_pct:+.2f}%",
-            f"详情: {_esc(r.details)}",
-        ]
-        strategy = REGIME_STRATEGY.get(r.regime, "")
-        if strategy:
-            lines.extend(["", strategy])
-        return "\n".join(lines)
-
-    async def get_filters_text(self) -> str:
-        lines = ["⚡ <b>US 风险过滤状态</b>", "━" * 20]
-        if not self._last_playbooks:
-            lines.append("暂无数据，等待 Playbook 生成")
-            return "\n".join(lines)
-        for sym, pb in self._last_playbooks.items():
-            f = pb.filters
-            status = "🟢" if f.tradeable else "🔴"
-            lines.append(f"{status} {sym}: {f.risk_level}")
-            for w in f.warnings:
-                lines.append(f"  ⚠️ {_esc(w)}")
-        return "\n".join(lines)
-
-    async def get_gamma_text(self, symbol: str | None = None) -> str:
-        target = symbol or "SPY"
-        pb = self._last_playbooks.get(target)
-        if not pb:
-            return f"No playbook cached for {target}. Run /us_playbook first."
-        if not pb.gamma_wall:
-            return f"{target}: Gamma Wall 数据不可用"
-        return format_gamma_wall_message(pb.gamma_wall, symbol=target)

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.hk import GammaWallResult, VolumeProfileResult
-from src.hk.volume_profile import calculate_volume_profile
+from src.common.types import GammaWallResult, VolumeProfileResult
+from src.common.volume_profile import calculate_volume_profile
 from src.us_playbook import KeyLevels
 from src.utils.logger import setup_logger
 
@@ -42,7 +42,13 @@ def extract_previous_day_hl(bars: pd.DataFrame) -> tuple[float, float]:
     if prev_bars.empty:
         return 0.0, 0.0
 
-    return float(prev_bars["High"].max()), float(prev_bars["Low"].min())
+    pdh = float(prev_bars["High"].max())
+    pdl = float(prev_bars["Low"].min())
+    logger.debug(
+        "extract_previous_day_hl: using date %s (of %d dates), PDH=%.2f, PDL=%.2f",
+        prev_date, len(dates), pdh, pdl,
+    )
+    return pdh, pdl
 
 
 def get_today_bars(bars: pd.DataFrame) -> pd.DataFrame:

@@ -4,7 +4,17 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
-from src.hk import FilterResult, GammaWallResult, VolumeProfileResult  # shared types
+from src.common.types import (  # noqa: F401
+    ChaseRiskResult,
+    FilterResult,
+    GammaWallResult,
+    OptionLeg,
+    OptionMarketSnapshot,
+    OptionRecommendation,
+    QuoteSnapshot,
+    SpreadMetrics,
+    VolumeProfileResult,
+)
 
 
 class USRegimeType(Enum):
@@ -54,3 +64,30 @@ class USPlaybookResult:
     filters: FilterResult
     strategy_text: str = ""
     generated_at: datetime | None = None
+    option_rec: OptionRecommendation | None = None
+    quote: QuoteSnapshot | None = None
+    option_market: OptionMarketSnapshot | None = None
+
+
+@dataclass
+class USScanSignal:
+    """Result of a successful L1+L2 scan for a single symbol."""
+    signal_type: str        # BREAKOUT_LONG / BREAKOUT_SHORT / RANGE_REVERSAL_LONG / RANGE_REVERSAL_SHORT
+    direction: str          # bullish / bearish
+    symbol: str
+    regime: USRegimeResult
+    price: float
+    trigger_reasons: list[str] = field(default_factory=list)
+    timestamp: float = 0.0
+
+
+@dataclass
+class USScanAlertRecord:
+    """Tracks a sent scan alert for frequency control."""
+    symbol: str
+    signal_type: str
+    direction: str
+    confidence: float
+    price: float
+    timestamp: float
+    session: str            # morning / afternoon

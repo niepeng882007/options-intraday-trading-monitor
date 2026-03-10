@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import yaml
 
-from src.hk import FilterResult
+from src.common.types import FilterResult
 from src.utils.logger import setup_logger
 
 logger = setup_logger("us_filter")
 
-ET = timezone(timedelta(hours=-5))
+ET = ZoneInfo("America/New_York")
 
 
 def check_us_filters(

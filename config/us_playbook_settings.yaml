@@ -28,11 +28,8 @@ regime:
     trend_day_percentile: 60
     fade_chop_percentile: 30
     min_sample_days: 5
+    min_trend_day_floor: 1.0
     gap_significance_threshold: 0.3
-
-playbook:
-  push_times: ["09:45", "10:15"]
-  timezone: "America/New_York"
 
 filters:
   calendar_file: "config/us_calendar.yaml"
@@ -42,10 +39,54 @@ gamma_wall:
   enabled: true
   use_weekly_expiry: true
 
-regime_monitor:
+auto_scan:
   enabled: true
-  check_interval_seconds: 300
-  start_after_morning_minutes: 5
-  end_before_confirm_minutes: 2
-  confidence_change_threshold: 0.2
-  max_flips_in_window: 2
+  interval_seconds: 180
+  morning_window: ["09:40", "11:30"]
+  afternoon_window: ["13:00", "15:00"]
+  breakout:
+    min_confidence: 0.70
+    min_rvol: 1.30
+    min_magnitude_pct: 0.20
+    volume_surge_threshold: 2.0
+    volume_surge_bars: 5
+  range_reversal:
+    enabled: false  # v1 disabled
+    min_confidence: 0.70
+    rvol_min: 0.50
+    rvol_max: 1.00
+    va_proximity_pct: 0.30
+  cooldown:
+    same_signal_minutes: 30
+    max_per_session: 2
+    max_per_day: 3
+  override:
+    confidence_increase: 0.10
+    price_extension_pct: 0.50
+    regime_upgrade: true
+
+chase_risk:
+  vwap_moderate_pct: 1.5
+  vwap_high_pct: 2.5
+  va_moderate_pct: 2.0
+  va_high_pct: 3.0
+  afternoon_tighten_pct: 0.3
+
+option_recommend:
+  dte_min: 1
+  dte_preferred_max: 7
+  delta_min: 0.30
+  delta_max: 0.50
+  min_oi: 100
+
+hist_cache_ttl: 120  # VP/历史 K 线缓存 TTL（秒）
+
+simulation:
+  tp_pct: 0.5
+  sl_pct: 0.25
+  slippage_per_leg: 0.03
+  exit_mode: trailing
+  trailing_activation_pct: 0.4
+  trailing_trail_pct: 0.2
+  exclude_symbols: []
+  skip_signal_types: []
