@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import time
 
 import pandas as pd
 import numpy as np
@@ -12,7 +13,9 @@ from datetime import datetime, date, timezone, timedelta
 from src.hk import (
     RegimeType, VolumeProfileResult, GammaWallResult,
     RegimeResult, FilterResult, Playbook,
-    OptionRecommendation, OptionLeg,
+    OptionRecommendation, OptionLeg, ChaseRiskResult,
+    OptionMarketSnapshot, QuoteSnapshot, SpreadMetrics,
+    ScanSignal, ScanAlertRecord,
 )
 from src.hk.volume_profile import calculate_volume_profile
 from src.hk.indicators import (
@@ -32,6 +35,8 @@ from src.hk.option_recommend import (
     recommend_spread,
     should_wait,
     recommend,
+    assess_chase_risk,
+    _is_positive_ev,
 )
 
 HKT = timezone(timedelta(hours=8))
@@ -190,6 +195,36 @@ class TestVolumeProfile:
         result = calculate_volume_profile(bars)
         assert all(p % 50 == 0 for p in result.volume_by_price.keys())
 
+    def test_recency_decay_narrows_va(self):
+        """Recency decay should reduce influence of old days, narrowing VA after trend breaks."""
+        # Day 1 (old): traded at 135-140
+        # Day 2-3 (recent): traded at 125-131
+        bars = _make_bars([
+            ("2026-03-05 09:30:00", 137, 140, 135, 138, 100000),
+            ("2026-03-05 10:00:00", 138, 140, 136, 139, 100000),
+            ("2026-03-07 09:30:00", 128, 131, 125, 129, 100000),
+            ("2026-03-07 10:00:00", 127, 130, 125, 128, 100000),
+            ("2026-03-08 09:30:00", 127, 130, 126, 129, 100000),
+            ("2026-03-08 10:00:00", 126, 129, 125, 127, 100000),
+        ])
+        vp_no_decay = calculate_volume_profile(bars, tick_size=1.0, recency_decay=0)
+        vp_decay = calculate_volume_profile(bars, tick_size=1.0, recency_decay=0.3)
+        # Without decay: VA spans both clusters → wide
+        # With decay: old cluster (135-140) is down-weighted → VA narrows to recent range
+        assert vp_decay.vah - vp_decay.val < vp_no_decay.vah - vp_no_decay.val
+
+    def test_recency_decay_zero_is_noop(self):
+        """recency_decay=0 should produce identical results to default."""
+        bars = _make_bars([
+            ("2026-03-07 09:30:00", 100, 102, 98, 101, 10000),
+            ("2026-03-08 09:30:00", 101, 103, 99, 102, 10000),
+        ])
+        vp_default = calculate_volume_profile(bars, tick_size=1.0)
+        vp_zero = calculate_volume_profile(bars, tick_size=1.0, recency_decay=0)
+        assert vp_default.poc == vp_zero.poc
+        assert vp_default.vah == vp_zero.vah
+        assert vp_default.val == vp_zero.val
+
 
 # ── VWAP Tests ──
 
@@ -285,6 +320,316 @@ class TestRegime:
         assert result.regime == RegimeType.BREAKOUT
         assert "below VAL" in result.details
 
+    # ── Issue 0: WHIPSAW overrides BREAKOUT ──
+
+    def test_whipsaw_overrides_breakout(self):
+        """WHIPSAW should take priority even when BREAKOUT conditions are also met."""
+        gw = GammaWallResult(call_wall_strike=516, put_wall_strike=490, max_pain=500)
+        # price=515 > VAH=510 (outside VA), rvol=1.5 > breakout_rvol
+        # BUT IV spiking + near call wall (516) → should be WHIPSAW, not BREAKOUT
+        result = classify_regime(
+            price=515, rvol=1.5, vp=self._vp(),
+            gamma_wall=gw, atm_iv=50, avg_iv=30, iv_spike_ratio=1.3,
+        )
+        assert result.regime == RegimeType.WHIPSAW
+
+    def test_breakout_when_no_iv_spike(self):
+        """Without IV spike, BREAKOUT should still work even near gamma wall."""
+        gw = GammaWallResult(call_wall_strike=516, put_wall_strike=490, max_pain=500)
+        result = classify_regime(
+            price=515, rvol=1.5, vp=self._vp(),
+            gamma_wall=gw, atm_iv=30, avg_iv=30, iv_spike_ratio=1.3,
+        )
+        assert result.regime == RegimeType.BREAKOUT
+
+    # ── Issue 3: Multi-factor confidence ──
+
+    def test_breakout_confidence_reduced_near_gamma_wall(self):
+        """BREAKOUT near gamma wall should have lower confidence."""
+        gw = GammaWallResult(call_wall_strike=516, put_wall_strike=490, max_pain=500)
+        result_near = classify_regime(
+            price=515, rvol=1.5, vp=self._vp(), gamma_wall=gw,
+        )
+        result_far = classify_regime(
+            price=515, rvol=1.5, vp=self._vp(),
+        )
+        assert result_near.regime == RegimeType.BREAKOUT
+        assert result_far.regime == RegimeType.BREAKOUT
+        assert result_near.confidence < result_far.confidence
+
+    def test_range_confidence_boosted_near_gamma_wall(self):
+        """RANGE near gamma wall should have higher confidence (pinning effect)."""
+        gw = GammaWallResult(call_wall_strike=505, put_wall_strike=490, max_pain=500)
+        result_near = classify_regime(
+            price=504, rvol=0.6, vp=self._vp(), gamma_wall=gw,
+        )
+        result_far = classify_regime(
+            price=500, rvol=0.6, vp=self._vp(),
+        )
+        assert result_near.regime == RegimeType.RANGE
+        assert result_far.regime == RegimeType.RANGE
+        assert result_near.confidence > result_far.confidence
+
+    def test_breakout_deep_has_higher_confidence(self):
+        """Deeper breakout (farther from VA) should have slightly higher confidence."""
+        result_shallow = classify_regime(price=511, rvol=1.5, vp=self._vp())
+        result_deep = classify_regime(price=530, rvol=1.5, vp=self._vp())
+        assert result_deep.confidence >= result_shallow.confidence
+
+    # ── Issue 4: Put Wall detection ──
+
+    def test_near_put_wall_only(self):
+        """WHIPSAW should trigger when only put_wall_strike > 0 and price is near it."""
+        gw = GammaWallResult(call_wall_strike=0, put_wall_strike=501, max_pain=500)
+        result = classify_regime(
+            price=500, rvol=1.0, vp=self._vp(),
+            gamma_wall=gw, atm_iv=50, avg_iv=30, iv_spike_ratio=1.3,
+        )
+        assert result.regime == RegimeType.WHIPSAW
+
+    def test_no_gamma_wall_no_whipsaw(self):
+        """Without gamma wall, IV spike alone should not trigger WHIPSAW."""
+        result = classify_regime(
+            price=500, rvol=1.0, vp=self._vp(),
+            atm_iv=50, avg_iv=30, iv_spike_ratio=1.3,
+        )
+        assert result.regime != RegimeType.WHIPSAW
+
+    # ── RANGE confidence discount for wide intraday range ──
+
+    def test_range_confidence_discounted_by_wide_intraday_range(self):
+        """Wide intraday range (>30% of VA) should reduce RANGE confidence."""
+        vp = self._vp()  # vah=510, val=490, VA range=20
+        result_narrow = classify_regime(
+            price=500, rvol=0.6, vp=vp, intraday_range=4.0,  # 20% of VA
+        )
+        result_wide = classify_regime(
+            price=500, rvol=0.6, vp=vp, intraday_range=8.0,  # 40% of VA
+        )
+        assert result_narrow.regime == RegimeType.RANGE
+        assert result_wide.regime == RegimeType.RANGE
+        assert result_wide.confidence < result_narrow.confidence
+        assert "振幅" in result_wide.details
+
+    def test_range_no_discount_narrow_range(self):
+        """Narrow intraday range (<=30% of VA) should not discount."""
+        vp = self._vp()  # VA range=20
+        result_no_range = classify_regime(price=500, rvol=0.6, vp=vp)
+        result_narrow = classify_regime(
+            price=500, rvol=0.6, vp=vp, intraday_range=5.0,  # 25% of VA
+        )
+        assert result_no_range.confidence == result_narrow.confidence
+
+    def test_range_heavy_discount_very_wide(self):
+        """Very wide intraday range should get capped discount."""
+        vp = self._vp()  # VA range=20
+        result = classify_regime(
+            price=500, rvol=0.6, vp=vp, intraday_range=20.0,  # 100% of VA
+        )
+        assert result.regime == RegimeType.RANGE
+        result_base = classify_regime(price=500, rvol=0.6, vp=vp)
+        assert result_base.confidence - result.confidence >= 0.25
+
+    # ── Momentum Breakout (Style A2) ──
+
+    def test_momentum_breakout_above_vah(self):
+        """Price >1% above VAH + low RVOL → Momentum BREAKOUT."""
+        # price=520, vah=510 → dist = (520-510)/520*100 = 1.92%
+        result = classify_regime(price=520, rvol=0.9, vp=self._vp(), momentum_min_dist_pct=1.0)
+        assert result.regime == RegimeType.BREAKOUT
+        assert "Momentum" in result.details
+        assert 0.40 <= result.confidence <= 0.65
+
+    def test_momentum_breakout_below_val(self):
+        """Price >1% below VAL + low RVOL → Momentum BREAKOUT."""
+        # price=480, val=490 → dist = (490-480)/480*100 = 2.08%
+        result = classify_regime(price=480, rvol=0.9, vp=self._vp(), momentum_min_dist_pct=1.0)
+        assert result.regime == RegimeType.BREAKOUT
+        assert "Momentum" in result.details
+        assert "below VAL" in result.details
+
+    def test_momentum_breakout_distance_too_small(self):
+        """Price outside VA but <1% → should NOT trigger momentum breakout."""
+        # price=511, vah=510 → dist = (511-510)/511*100 = 0.196% < 1%
+        result = classify_regime(price=511, rvol=0.9, vp=self._vp(), momentum_min_dist_pct=1.0)
+        assert result.regime != RegimeType.BREAKOUT or "Momentum" not in result.details
+
+    def test_momentum_breakout_volume_surge_boost(self):
+        """Volume surge should add +0.10 to confidence."""
+        vp = self._vp()
+        result_no_surge = classify_regime(
+            price=520, rvol=0.9, vp=vp, has_volume_surge=False, momentum_min_dist_pct=1.0,
+        )
+        result_surge = classify_regime(
+            price=520, rvol=0.9, vp=vp, has_volume_surge=True, momentum_min_dist_pct=1.0,
+        )
+        assert result_surge.confidence > result_no_surge.confidence
+        assert result_surge.confidence - result_no_surge.confidence == pytest.approx(0.10, abs=0.01)
+        assert "volume surge" in result_surge.details
+
+    def test_momentum_breakout_lower_than_traditional(self):
+        """Momentum BREAKOUT confidence should be lower than traditional BREAKOUT."""
+        vp = self._vp()
+        # Traditional: high RVOL + outside VA
+        trad = classify_regime(price=520, rvol=1.5, vp=vp)
+        # Momentum: low RVOL + outside VA
+        momentum = classify_regime(price=520, rvol=0.9, vp=vp, momentum_min_dist_pct=1.0)
+        assert trad.regime == RegimeType.BREAKOUT
+        assert momentum.regime == RegimeType.BREAKOUT
+        assert trad.confidence > momentum.confidence
+
+    def test_whipsaw_still_overrides_momentum(self):
+        """WHIPSAW (IV spike + gamma wall) should still take priority over momentum."""
+        gw = GammaWallResult(call_wall_strike=521, put_wall_strike=490, max_pain=500)
+        result = classify_regime(
+            price=520, rvol=0.9, vp=self._vp(),
+            gamma_wall=gw, atm_iv=50, avg_iv=30, iv_spike_ratio=1.3,
+            momentum_min_dist_pct=1.0,
+        )
+        assert result.regime == RegimeType.WHIPSAW
+
+    def test_momentum_breakout_gamma_wall_penalty(self):
+        """Near gamma wall should reduce momentum breakout confidence by 0.05."""
+        vp = self._vp()
+        gw = GammaWallResult(call_wall_strike=521, put_wall_strike=490, max_pain=500)
+        result_no_gw = classify_regime(
+            price=520, rvol=0.9, vp=vp, momentum_min_dist_pct=1.0,
+        )
+        # Not IV spiking, so no WHIPSAW, but near gamma wall
+        result_gw = classify_regime(
+            price=520, rvol=0.9, vp=vp, gamma_wall=gw, momentum_min_dist_pct=1.0,
+        )
+        assert result_no_gw.regime == RegimeType.BREAKOUT
+        assert result_gw.regime == RegimeType.BREAKOUT
+        assert result_no_gw.confidence > result_gw.confidence
+
+    def test_momentum_breakout_rvol_near_threshold_boost(self):
+        """RVOL closer to breakout threshold should get small boost."""
+        vp = self._vp()
+        # rvol=0.9 (near range_rvol=0.8) vs rvol=1.0 (closer to breakout_rvol=1.2)
+        result_low = classify_regime(
+            price=520, rvol=0.86, vp=vp, momentum_min_dist_pct=1.0,
+            breakout_rvol=1.2, range_rvol=0.8,
+        )
+        result_high = classify_regime(
+            price=520, rvol=1.15, vp=vp, momentum_min_dist_pct=1.0,
+            breakout_rvol=1.2, range_rvol=0.8,
+        )
+        assert result_high.confidence >= result_low.confidence
+
+    def test_existing_unclear_low_rvol_outside_va_unchanged(self):
+        """Price outside VA + very low RVOL + small distance → still UNCLEAR (not momentum)."""
+        # price=511, dist=0.196% < 1.0% threshold
+        result = classify_regime(price=511, rvol=0.5, vp=self._vp())
+        assert result.regime == RegimeType.UNCLEAR
+
+
+# ── Volume Surge Detection Tests ──
+
+class TestVolumeSurgeDetection:
+    def test_no_surge_below_threshold(self):
+        from src.hk.main import _detect_volume_surges
+        bars = _make_bars([
+            (f"2026-03-09 {9+i//60:02d}:{30+i%60:02d}:00", 100, 101, 99, 100, 1000)
+            for i in range(15)
+        ])
+        assert _detect_volume_surges(bars) == []
+
+    def test_surge_detected(self):
+        from src.hk.main import _detect_volume_surges
+        base = [
+            (f"2026-03-09 {9+i//60:02d}:{30+i%60:02d}:00", 100, 101, 99, 100, 1000)
+            for i in range(12)
+        ]
+        # Add 3 surge bars at the end
+        base.append(("2026-03-09 09:42:00", 100, 102, 100, 101, 5000))
+        base.append(("2026-03-09 09:43:00", 101, 103, 101, 102, 8000))
+        base.append(("2026-03-09 09:44:00", 102, 104, 102, 103, 6000))
+        bars = _make_bars(base)
+        warnings = _detect_volume_surges(bars, threshold=3.0, recent_n=5)
+        assert len(warnings) >= 1
+        assert "量能突变" in warnings[0]
+
+    def test_surge_not_detected_if_too_few_bars(self):
+        from src.hk.main import _detect_volume_surges
+        bars = _make_bars([
+            ("2026-03-09 09:30:00", 100, 101, 99, 100, 10000),
+        ])
+        assert _detect_volume_surges(bars) == []
+
+
+# ── VA Boundary Distance in Playbook Tests ──
+
+class TestPlaybookVADistance:
+    def test_va_distance_shown_in_risk_section(self):
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=132.6, vah=135.0, val=130.0, poc=132.5,
+        )
+        vp = VolumeProfileResult(poc=132.5, vah=135.0, val=130.0)
+        pb = generate_playbook(regime, vp, vwap=132.0)
+        msg = format_playbook_message(pb, symbol="Test")
+        assert "距关键位" in msg
+        assert "VAH" in msg
+        assert "VAL" in msg
+
+    def test_va_distance_shows_percentage(self):
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=132.6, vah=135.0, val=130.0, poc=132.5,
+        )
+        vp = VolumeProfileResult(poc=132.5, vah=135.0, val=130.0)
+        pb = generate_playbook(regime, vp, vwap=132.0)
+        msg = format_playbook_message(pb, symbol="Test")
+        # VAH 135 is ~1.8% above 132.6
+        assert "1.8%" in msg or "1.9%" in msg
+
+    def test_va_distance_with_gamma_wall(self):
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=500.0, vah=510.0, val=490.0, poc=500.0,
+        )
+        vp = VolumeProfileResult(poc=500, vah=510, val=490)
+        gw = GammaWallResult(call_wall_strike=520, put_wall_strike=480, max_pain=500)
+        pb = generate_playbook(regime, vp, vwap=500, gamma_wall=gw)
+        msg = format_playbook_message(pb, symbol="Test")
+        assert "Call Wall" in msg
+        assert "Put Wall" in msg
+
+
+# ── Extract IV Tests ──
+
+class TestExtractIV:
+    def test_median_baseline(self):
+        """avg_iv should be median of all strikes, not atm_iv * 0.8."""
+        from src.hk.main import HKPredictor
+        chain = pd.DataFrame({
+            "strike_price": [95, 97, 100, 103, 105, 110],
+            "implied_volatility": [40, 35, 30, 28, 25, 20],
+        })
+        atm_iv, avg_iv = HKPredictor._extract_iv(chain, price=100)
+        # Median of [40, 35, 30, 28, 25, 20] = 29.0
+        assert abs(avg_iv - 29.0) < 1.0
+        # ATM (4 nearest: 100=30, 97=35, 103=28, 95=40) mean = 33.25
+        assert abs(atm_iv - 33.25) < 1.0
+
+    def test_iv_spike_detectable(self):
+        """When ATM IV is much higher than chain median, spike should be detectable."""
+        from src.hk.main import HKPredictor
+        chain = pd.DataFrame({
+            "strike_price": [90, 95, 100, 105, 110, 115, 120],
+            "implied_volatility": [20, 22, 60, 58, 21, 19, 18],
+        })
+        atm_iv, avg_iv = HKPredictor._extract_iv(chain, price=100)
+        # ATM IV ~59 (high), median ~21 (low) → atm_iv > avg_iv * 1.3
+        assert atm_iv > avg_iv * 1.3
+
+    def test_empty_chain(self):
+        from src.hk.main import HKPredictor
+        atm_iv, avg_iv = HKPredictor._extract_iv(pd.DataFrame(), price=100)
+        assert atm_iv == 0.0
+        assert avg_iv == 0.0
+
 
 # ── Playbook Tests ──
 
@@ -305,6 +650,7 @@ class TestPlaybook:
         regime = RegimeResult(
             regime=RegimeType.RANGE, confidence=0.7,
             rvol=0.6, price=500, vah=510, val=490, poc=500,
+            details="RVOL 0.60 < 0.80, price in value area",
         )
         vp = VolumeProfileResult(poc=500, vah=510, val=490)
         rec = OptionRecommendation(
@@ -318,12 +664,14 @@ class TestPlaybook:
         pb = generate_playbook(regime, vp, vwap=502, option_rec=rec)
         msg = format_playbook_message(pb, symbol="Tencent (HK.00700)")
         # Section checks
-        assert "Regime" in msg
+        assert "区间震荡日" in msg
         assert "RVOL" in msg
         assert "POC" in msg
         assert "Call" in msg
         assert "505" in msg
         assert "2026-03-18" in msg
+        assert "判断依据" in msg
+        assert "失效条件" in msg
 
     def test_format_wait_recommendation(self):
         regime = RegimeResult(
@@ -341,6 +689,275 @@ class TestPlaybook:
         msg = format_playbook_message(pb, symbol="Test")
         assert "观望" in msg
         assert "VAH" in msg
+
+    def test_format_message_shows_full_realtime_snapshot(self):
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.74,
+            rvol=0.81, price=96.5, vah=97.0, val=92.5, poc=94.0,
+            details="RVOL 0.81 < 0.95, price in value area",
+        )
+        vp = VolumeProfileResult(poc=94.0, vah=97.0, val=92.5)
+        quote = QuoteSnapshot(
+            symbol="HK.01211",
+            last_price=96.5,
+            open_price=96.2,
+            high_price=97.1,
+            low_price=95.8,
+            prev_close=95.4,
+            volume=1234567,
+            turnover=234000000.0,
+            bid_price=96.45,
+            ask_price=96.5,
+            amplitude=1.36,
+            turnover_rate=0.42,
+        )
+        option_market = OptionMarketSnapshot(
+            expiry="2026-03-13",
+            contract_count=24,
+            call_contract_count=12,
+            put_contract_count=12,
+            atm_iv=31.2,
+            avg_iv=28.4,
+            iv_ratio=1.10,
+        )
+        pb = generate_playbook(
+            regime, vp, vwap=96.85, quote=quote, option_market=option_market,
+        )
+        msg = format_playbook_message(pb, symbol="BYD (HK.01211)")
+        assert "96.50" in msg
+        assert "买一" in msg
+        assert "成交量" in msg
+        assert "到期日 2026-03-13" in msg
+        assert "ATM IV 31.20" in msg
+        assert "判断依据" in msg
+        assert "加分项" in msg
+
+    def test_format_spread_recommendation_is_beginner_friendly(self):
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.75,
+            rvol=0.81, price=96.5, vah=97.0, val=92.5, poc=94.0,
+            details="RVOL 0.81 < 0.95, price in value area",
+        )
+        vp = VolumeProfileResult(poc=94.0, vah=97.0, val=92.5)
+        rec = OptionRecommendation(
+            action="bear_call_spread",
+            direction="bearish",
+            expiry="2026-03-13",
+            legs=[
+                OptionLeg(
+                    side="sell", option_type="call", strike=98.0,
+                    pct_from_price=1.55, moneyness="OTM 1.6%",
+                    delta=0.31, open_interest=320, last_price=1.25,
+                    implied_volatility=30.2, volume=88,
+                ),
+                OptionLeg(
+                    side="buy", option_type="call", strike=100.0,
+                    pct_from_price=3.63, moneyness="OTM 3.6%",
+                    delta=0.18, open_interest=210, last_price=0.66,
+                    implied_volatility=29.7, volume=54,
+                ),
+            ],
+            rationale="Regime: 区间震荡; 价格 96.50 靠近 VAH 97.00, 高抛机会; 震荡市适合使用价差策略, 利用时间价值衰减",
+            risk_note="止损: 突破 VAH 97.00; 失效条件: 带量突破 VA 边界转为 BREAKOUT",
+        )
+        pb = generate_playbook(regime, vp, vwap=96.85, option_rec=rec)
+        msg = format_playbook_message(pb, symbol="BYD (HK.01211)")
+        assert "白话解释:" in msg
+        assert "执行: 组合单一次提交" in msg
+        assert "卖 CALL 98" in msg
+        assert "Δ +0.31" in msg
+        assert "触发后怎么做: 直接把整组 Bear Call Spread 一次性平仓" in msg
+
+
+# ── SpreadMetrics Tests ──
+
+class TestSpreadMetrics:
+    def test_calculate_spread_metrics_bear_call(self):
+        from src.hk.option_recommend import _calculate_spread_metrics
+        legs = [
+            OptionLeg(
+                side="sell", option_type="call", strike=98.0,
+                pct_from_price=1.0, moneyness="OTM 1.0%",
+                delta=0.43, last_price=1.390,
+            ),
+            OptionLeg(
+                side="buy", option_type="call", strike=100.0,
+                pct_from_price=3.6, moneyness="OTM 3.6%",
+                delta=0.24, last_price=0.660,
+            ),
+        ]
+        sm = _calculate_spread_metrics(legs, "bear_call_spread")
+        assert sm is not None
+        assert abs(sm.net_credit - 0.730) < 0.001
+        assert abs(sm.max_loss - 1.270) < 0.001
+        assert abs(sm.breakeven - 98.730) < 0.001
+        assert sm.risk_reward_ratio > 0
+        assert sm.win_probability > 0
+
+    def test_calculate_spread_metrics_bull_put(self):
+        from src.hk.option_recommend import _calculate_spread_metrics
+        legs = [
+            OptionLeg(
+                side="sell", option_type="put", strike=95.0,
+                pct_from_price=2.0, moneyness="OTM 2.0%",
+                delta=-0.35, last_price=1.200,
+            ),
+            OptionLeg(
+                side="buy", option_type="put", strike=93.0,
+                pct_from_price=4.0, moneyness="OTM 4.0%",
+                delta=-0.20, last_price=0.500,
+            ),
+        ]
+        sm = _calculate_spread_metrics(legs, "bull_put_spread")
+        assert sm is not None
+        assert abs(sm.net_credit - 0.700) < 0.001
+        assert abs(sm.breakeven - 94.300) < 0.001
+
+    def test_calculate_spread_metrics_no_price(self):
+        from src.hk.option_recommend import _calculate_spread_metrics
+        legs = [
+            OptionLeg(side="sell", option_type="call", strike=98.0,
+                      pct_from_price=1.0, moneyness="OTM", last_price=0),
+            OptionLeg(side="buy", option_type="call", strike=100.0,
+                      pct_from_price=3.0, moneyness="OTM", last_price=0),
+        ]
+        assert _calculate_spread_metrics(legs, "bear_call_spread") is None
+
+
+class TestPlaybookSpreadPnL:
+    def test_spread_pnl_shown_in_message(self):
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.75,
+            rvol=0.81, price=96.5, vah=97.0, val=92.5, poc=94.0,
+        )
+        vp = VolumeProfileResult(poc=94.0, vah=97.0, val=92.5)
+        sm = SpreadMetrics(
+            net_credit=0.730, max_profit=0.730, max_loss=1.270,
+            breakeven=98.730, risk_reward_ratio=0.575, win_probability=0.57,
+        )
+        rec = OptionRecommendation(
+            action="bear_call_spread", direction="bearish",
+            expiry="2026-03-13", dte=3,
+            legs=[
+                OptionLeg(side="sell", option_type="call", strike=98.0,
+                          pct_from_price=1.55, moneyness="OTM 1.6%",
+                          delta=0.43, open_interest=491, last_price=1.390,
+                          implied_volatility=51.7, volume=332),
+                OptionLeg(side="buy", option_type="call", strike=100.0,
+                          pct_from_price=3.63, moneyness="OTM 3.6%",
+                          delta=0.24, open_interest=289, last_price=0.660,
+                          implied_volatility=52.7, volume=236),
+            ],
+            spread_metrics=sm,
+            rationale="Regime 区间震荡",
+            risk_note="止损: 突破 VAH 97.00",
+        )
+        pb = generate_playbook(regime, vp, vwap=96.80, option_rec=rec)
+        msg = format_playbook_message(pb, symbol="BYD (HK.01211)")
+        assert "Spread 损益" in msg
+        assert "净收入 0.730" in msg
+        assert "最大亏损 1.270" in msg
+        assert "盈亏平衡 98.730" in msg
+        assert "R:R" in msg
+
+    def test_position_size_shown(self):
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.62,
+            rvol=0.76, price=96.55, vah=97.0, val=92.5, poc=94.0,
+        )
+        vp = VolumeProfileResult(poc=94.0, vah=97.0, val=92.5)
+        rec = OptionRecommendation(
+            action="call", direction="bullish",
+            expiry="2026-03-18",
+            legs=[OptionLeg(side="buy", option_type="call", strike=97,
+                            pct_from_price=0.5, moneyness="OTM 0.5%")],
+            rationale="test",
+        )
+        pb = generate_playbook(regime, vp, vwap=96.8, option_rec=rec)
+        msg = format_playbook_message(pb, symbol="Test")
+        assert "仓位参考:" in msg
+        assert "50%" in msg
+
+    def test_dte_gamma_warning_in_risk(self):
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.8, price=96.5, vah=97.0, val=92.5, poc=94.0,
+        )
+        vp = VolumeProfileResult(poc=94.0, vah=97.0, val=92.5)
+        rec = OptionRecommendation(
+            action="call", direction="bullish",
+            expiry="2026-03-13", dte=3,
+            legs=[OptionLeg(side="buy", option_type="call", strike=97,
+                            pct_from_price=0.5, moneyness="OTM 0.5%")],
+            rationale="test",
+        )
+        pb = generate_playbook(regime, vp, vwap=96.8, option_rec=rec)
+        msg = format_playbook_message(pb, symbol="Test")
+        assert "3 DTE" in msg
+        assert "Gamma" in msg
+
+    def test_stop_loss_uses_breakeven_for_spread(self):
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.75,
+            rvol=0.81, price=96.5, vah=97.0, val=92.5, poc=94.0,
+        )
+        vp = VolumeProfileResult(poc=94.0, vah=97.0, val=92.5)
+        sm = SpreadMetrics(
+            net_credit=0.730, max_profit=0.730, max_loss=1.270,
+            breakeven=98.730, risk_reward_ratio=0.575, win_probability=0.57,
+        )
+        rec = OptionRecommendation(
+            action="bear_call_spread", direction="bearish",
+            expiry="2026-03-13", dte=3,
+            legs=[
+                OptionLeg(side="sell", option_type="call", strike=98.0,
+                          pct_from_price=1.55, moneyness="OTM 1.6%",
+                          delta=0.43, last_price=1.390),
+                OptionLeg(side="buy", option_type="call", strike=100.0,
+                          pct_from_price=3.63, moneyness="OTM 3.6%",
+                          delta=0.24, last_price=0.660),
+            ],
+            spread_metrics=sm,
+            rationale="test",
+            risk_note="test risk",
+        )
+        pb = generate_playbook(regime, vp, vwap=96.80, option_rec=rec)
+        msg = format_playbook_message(pb, symbol="Test")
+        # Stop loss references breakeven, not VAH
+        assert "盈亏平衡 98.73" in msg
+        assert "最大亏损 1.270" in msg
+
+
+class TestIVInterpretation:
+    def test_high_iv_ratio_seller_strategy(self):
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=500, vah=510, val=490, poc=500,
+        )
+        vp = VolumeProfileResult(poc=500, vah=510, val=490)
+        option_market = OptionMarketSnapshot(
+            expiry="2026-03-13", contract_count=24,
+            call_contract_count=12, put_contract_count=12,
+            atm_iv=60.0, avg_iv=48.0, iv_ratio=1.25,
+        )
+        pb = generate_playbook(regime, vp, vwap=502, option_market=option_market)
+        msg = format_playbook_message(pb, symbol="Test")
+        assert "卖方策略" in msg
+
+    def test_low_iv_ratio_cheap_options(self):
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=500, vah=510, val=490, poc=500,
+        )
+        vp = VolumeProfileResult(poc=500, vah=510, val=490)
+        option_market = OptionMarketSnapshot(
+            expiry="2026-03-13", contract_count=24,
+            call_contract_count=12, put_contract_count=12,
+            atm_iv=30.0, avg_iv=38.0, iv_ratio=0.79,
+        )
+        pb = generate_playbook(regime, vp, vwap=502, option_market=option_market)
+        msg = format_playbook_message(pb, symbol="Test")
+        assert "期权定价相对便宜" in msg
 
 
 # ── Filter Tests ──
@@ -427,10 +1044,17 @@ class TestOrderBook:
     def test_format_summary(self):
         text = format_order_book_summary(self._book())
         assert "HK.00700" in text
-        assert "512.00" in text
+        assert "最优卖价" in text
+        assert "盘口结论" in text
 
     def test_format_alerts_empty(self):
         assert format_alerts_message([]) == ""
+
+    def test_format_alerts_has_interpretation(self):
+        alerts = analyze_order_book(self._book(), large_order_ratio=3.0)
+        text = format_alerts_message(alerts)
+        assert "盘口异常检测" in text
+        assert "解读" in text
 
 
 # ── Gamma Wall Tests ──
@@ -468,10 +1092,12 @@ class TestGammaWall:
             call_wall_strike=25200, put_wall_strike=24800, max_pain=25000,
             call_oi_by_strike={25200: 500}, put_oi_by_strike={24800: 800},
         )
-        msg = format_gamma_wall_message(gw, "HSI")
+        msg = format_gamma_wall_message(gw, "HSI", current_price=25100)
         assert "25,200" in msg
         assert "24,800" in msg
         assert "HSI" in msg
+        assert "上方阻力" in msg
+        assert "解读" in msg
 
 
 # ── Bar Splitting Tests ──
@@ -495,6 +1121,34 @@ class TestBarSplitting:
         ])
         hist = get_history_bars(bars)
         assert len(hist) == 2
+
+    def test_get_history_bars_max_trading_days(self):
+        """max_trading_days should truncate to most recent N days."""
+        bars = _make_bars([
+            ("2026-03-05 09:30:00", 100, 101, 99, 100, 1000),
+            ("2026-03-06 09:30:00", 100, 101, 99, 100, 1000),
+            ("2026-03-07 09:30:00", 100, 101, 99, 100, 1000),
+            ("2026-03-08 09:30:00", 100, 101, 99, 100, 1000),
+            ("2026-03-09 09:30:00", 100, 101, 99, 100, 1000),  # today
+        ])
+        # Without cap: 4 history days
+        hist_all = get_history_bars(bars)
+        assert len(set(hist_all.index.date)) == 4
+        # With cap: 2 most recent history days (03-07, 03-08)
+        hist_2 = get_history_bars(bars, max_trading_days=2)
+        dates = sorted(set(hist_2.index.date))
+        assert len(dates) == 2
+        assert dates[0] == pd.Timestamp("2026-03-07").date()
+
+    def test_get_history_bars_max_no_cap(self):
+        """max_trading_days=0 should return all history days."""
+        bars = _make_bars([
+            ("2026-03-06 09:30:00", 100, 101, 99, 100, 1000),
+            ("2026-03-07 09:30:00", 100, 101, 99, 100, 1000),
+            ("2026-03-09 09:30:00", 100, 101, 99, 100, 1000),
+        ])
+        hist = get_history_bars(bars, max_trading_days=0)
+        assert len(set(hist.index.date)) == 2
 
 
 # ── Trading Time Tests ──
@@ -815,3 +1469,1071 @@ class TestTelegramRegex:
         assert _RE_WATCHLIST.match("watchlist")
         assert _RE_WATCHLIST.match("Watchlist")
         assert not _RE_WATCHLIST.match("wl ")  # trailing space
+
+
+# ── Chase Risk Assessment Tests ──
+
+class TestAssessChaseRisk:
+    def _vp(self, poc=500, vah=510, val=490):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    def test_inside_va_near_vwap_none(self):
+        """Price inside VA, near VWAP → no chase risk."""
+        result = assess_chase_risk(
+            price=505, vwap=503, vp=self._vp(), direction="bullish",
+        )
+        assert result.level == "none"
+
+    def test_va_dist_moderate(self):
+        """Price 2.5%+ above VAH with bullish direction → moderate."""
+        # VAH=510, price=523.5 → dist = 2.65%
+        result = assess_chase_risk(
+            price=523.5, vwap=520, vp=self._vp(), direction="bullish",
+        )
+        assert result.level == "moderate"
+        assert result.va_dist_pct > 2.5
+
+    def test_va_dist_high(self):
+        """Price 4%+ above VAH → high (00700 case: price=545, VAH=520)."""
+        vp = self._vp(poc=515, vah=520, val=510)
+        result = assess_chase_risk(
+            price=545, vwap=536, vp=vp, direction="bullish",
+        )
+        assert result.level == "high"
+        assert result.va_dist_pct >= 4.0
+
+    def test_vwap_dev_high(self):
+        """VWAP deviation 3.5%+ → high."""
+        result = assess_chase_risk(
+            price=520, vwap=500, vp=self._vp(), direction="bullish",
+        )
+        assert result.level == "high"
+        assert result.vwap_dev_pct >= 3.5
+
+    def test_direction_not_aligned_no_risk(self):
+        """Bearish direction + price above VAH → no risk (not chasing)."""
+        result = assess_chase_risk(
+            price=525, vwap=520, vp=self._vp(), direction="bearish",
+        )
+        assert result.level == "none"
+
+    def test_vwap_zero_skip(self):
+        """VWAP=0 → skip assessment, return none."""
+        result = assess_chase_risk(
+            price=525, vwap=0, vp=self._vp(), direction="bullish",
+        )
+        assert result.level == "none"
+
+    def test_afternoon_tighten(self):
+        """Afternoon should tighten thresholds by 0.5%."""
+        vp = self._vp(poc=500, vah=510, val=490)
+        # Price 520 → va_dist from VAH = 1.96%, normally below 2.5 → none
+        # With afternoon tighten (2.5 - 0.5 = 2.0), 1.96% is still < 2.0 → none
+        # Price 522 → va_dist = 2.35%, < 2.5 normally → none, but >= 2.0 afternoon → moderate
+        result = assess_chase_risk(
+            price=522, vwap=520, vp=vp, direction="bullish",
+            is_afternoon=True,
+        )
+        assert result.level == "moderate"
+        # Same price without afternoon → none
+        result_morning = assess_chase_risk(
+            price=522, vwap=520, vp=vp, direction="bullish",
+            is_afternoon=False,
+        )
+        assert result_morning.level == "none"
+
+    def test_pullback_target_is_vwap(self):
+        """pullback_target should equal VWAP."""
+        result = assess_chase_risk(
+            price=545, vwap=536, vp=self._vp(poc=515, vah=520, val=510),
+            direction="bullish",
+        )
+        assert result.pullback_target == 536
+
+    def test_bearish_below_val(self):
+        """Bearish + price below VAL → chase risk on short side."""
+        vp = self._vp(poc=500, vah=510, val=490)
+        # val=490, price=469 → dist = (490-469)/490 = 4.29% → high
+        result = assess_chase_risk(
+            price=469, vwap=480, vp=vp, direction="bearish",
+        )
+        assert result.level == "high"
+        assert result.va_dist_pct >= 4.0
+
+
+# ── Recommend with Chase Risk Integration Tests ──
+
+class TestRecommendChaseRisk:
+    def _vp(self):
+        return VolumeProfileResult(poc=515, vah=520, val=510)
+
+    def _filters(self):
+        return FilterResult(tradeable=True)
+
+    def _chain(self, expiry="2026-03-17"):
+        return pd.DataFrame([
+            {"code": "C1", "option_type": "CALL", "strike_price": 540,
+             "strike_time": expiry, "open_interest": 200, "delta": 0.5},
+            {"code": "C2", "option_type": "CALL", "strike_price": 545,
+             "strike_time": expiry, "open_interest": 150, "delta": 0.4},
+            {"code": "C3", "option_type": "CALL", "strike_price": 550,
+             "strike_time": expiry, "open_interest": 100, "delta": 0.3},
+        ])
+
+    def test_high_chase_returns_wait(self):
+        """High chase risk → action=wait, direction preserved."""
+        regime = RegimeResult(
+            regime=RegimeType.BREAKOUT, confidence=0.8,
+            rvol=1.5, price=545, vah=520, val=510, poc=515,
+        )
+        dates = [{"strike_time": "2026-03-17"}]
+        rec = recommend(
+            regime, self._vp(), self._filters(),
+            chain_df=self._chain(), expiry_dates=dates,
+            vwap=536, chase_risk_cfg={"va_high_pct": 4.0},
+        )
+        assert rec.action == "wait"
+        assert rec.direction == "bullish"
+        assert "追高" in rec.rationale or "延伸" in rec.rationale
+
+    def test_moderate_chase_prefers_atm(self):
+        """Moderate chase risk → call action, risk_note contains chase warning."""
+        regime = RegimeResult(
+            regime=RegimeType.BREAKOUT, confidence=0.8,
+            rvol=1.5, price=525, vah=520, val=510, poc=515,
+        )
+        # va_dist = (525-520)/520 = 0.96% → below moderate threshold
+        # But use low thresholds to trigger moderate
+        dates = [{"strike_time": "2026-03-17"}]
+        chain = pd.DataFrame([
+            {"code": "C1", "option_type": "CALL", "strike_price": 524,
+             "strike_time": "2026-03-17", "open_interest": 200, "delta": 0.5},
+            {"code": "C2", "option_type": "CALL", "strike_price": 526,
+             "strike_time": "2026-03-17", "open_interest": 150, "delta": 0.4},
+        ])
+        rec = recommend(
+            regime, self._vp(), self._filters(),
+            chain_df=chain, expiry_dates=dates,
+            vwap=520,
+            chase_risk_cfg={"vwap_moderate_pct": 0.5, "va_moderate_pct": 0.5,
+                            "vwap_high_pct": 10.0, "va_high_pct": 10.0},
+        )
+        assert rec.action == "call"
+        assert "追高" in rec.risk_note
+
+    def test_no_chase_inside_va(self):
+        """Inside VA, no chase risk → normal behavior."""
+        regime = RegimeResult(
+            regime=RegimeType.BREAKOUT, confidence=0.8,
+            rvol=1.5, price=516, vah=520, val=510, poc=515,
+        )
+        chain = pd.DataFrame([
+            {"code": "C1", "option_type": "CALL", "strike_price": 515,
+             "strike_time": "2026-03-17", "open_interest": 200, "delta": 0.5},
+        ])
+        dates = [{"strike_time": "2026-03-17"}]
+        rec = recommend(
+            regime, self._vp(), self._filters(),
+            chain_df=chain, expiry_dates=dates,
+            vwap=514,
+        )
+        assert rec.action == "call"
+        assert "追高" not in rec.risk_note
+
+
+# ── Auto-Scan Tests ──
+
+class TestScanWindow:
+    """Test _get_scan_window static method."""
+
+    def test_morning_window(self):
+        from src.hk.main import HKPredictor
+        cfg = {
+            "morning_window": ["09:35", "12:00"],
+            "afternoon_window": ["13:05", "15:45"],
+        }
+        # 10:00 HKT → morning
+        t = datetime(2026, 3, 10, 10, 0, tzinfo=HKT)  # Tuesday
+        in_w, session = HKPredictor._get_scan_window(cfg, t)
+        assert in_w is True
+        assert session == "morning"
+
+    def test_afternoon_window(self):
+        from src.hk.main import HKPredictor
+        cfg = {
+            "morning_window": ["09:35", "12:00"],
+            "afternoon_window": ["13:05", "15:45"],
+        }
+        t = datetime(2026, 3, 10, 14, 0, tzinfo=HKT)  # Tuesday
+        in_w, session = HKPredictor._get_scan_window(cfg, t)
+        assert in_w is True
+        assert session == "afternoon"
+
+    def test_lunch_break_not_in_window(self):
+        from src.hk.main import HKPredictor
+        cfg = {
+            "morning_window": ["09:35", "12:00"],
+            "afternoon_window": ["13:05", "15:45"],
+        }
+        t = datetime(2026, 3, 10, 12, 30, tzinfo=HKT)
+        in_w, _ = HKPredictor._get_scan_window(cfg, t)
+        assert in_w is False
+
+    def test_weekend_not_in_window(self):
+        from src.hk.main import HKPredictor
+        cfg = {
+            "morning_window": ["09:35", "12:00"],
+            "afternoon_window": ["13:05", "15:45"],
+        }
+        # Saturday
+        t = datetime(2026, 3, 14, 10, 0, tzinfo=HKT)
+        in_w, _ = HKPredictor._get_scan_window(cfg, t)
+        assert in_w is False
+
+    def test_before_open_not_in_window(self):
+        from src.hk.main import HKPredictor
+        cfg = {
+            "morning_window": ["09:35", "12:00"],
+            "afternoon_window": ["13:05", "15:45"],
+        }
+        t = datetime(2026, 3, 10, 9, 0, tzinfo=HKT)
+        in_w, _ = HKPredictor._get_scan_window(cfg, t)
+        assert in_w is False
+
+
+class TestL1Screen:
+    """Test L1 lightweight screening logic."""
+
+    def _make_predictor(self, scan_cfg=None):
+        from unittest.mock import MagicMock, patch
+        from src.hk.main import HKPredictor
+
+        with patch.object(HKPredictor, '__init__', lambda self, *a, **kw: None):
+            p = HKPredictor.__new__(HKPredictor)
+            p._cfg = {
+                "auto_scan": scan_cfg or {
+                    "breakout": {
+                        "min_confidence": 0.72,
+                        "min_rvol": 1.35,
+                        "min_magnitude_pct": 0.15,
+                        "volume_surge_threshold": 2.0,
+                        "volume_surge_bars": 5,
+                    },
+                    "range": {
+                        "min_confidence": 0.72,
+                        "rvol_min": 0.55,
+                        "rvol_max": 0.90,
+                        "va_proximity_pct": 0.30,
+                    },
+                },
+                "volume_profile": {"value_area_pct": 0.70, "recency_decay": 0.15},
+                "rvol": {"lookback_days": 10},
+                "regime": {"breakout_rvol": 1.05, "range_rvol": 0.95},
+            }
+            p.watchlist = MagicMock()
+            p._vp_cache = {}
+            p._scan_history = {}
+            p._scan_history_date = ""
+
+            async def run_sync(fn, *args):
+                return fn(*args)
+            p._run_sync = run_sync
+            p._collector = MagicMock()
+
+            return p
+
+    @pytest.mark.asyncio
+    async def test_breakout_l1_pass(self):
+        """High RVOL + price above VAH + magnitude → BREAKOUT L1 pass."""
+        p = self._make_predictor()
+
+        # Price 525, clearly above VAH ~521
+        p._collector.get_quote = lambda sym: {
+            "last_price": 525, "high_price": 530, "low_price": 520, "turnover": 5e9,
+        }
+
+        # Bars: today 3x volume → RVOL ≈ 3.0 (well above 1.35)
+        # Generate enough bars for volume surge detection (needs >=10)
+        today_bars = _make_bars([
+            (f"2026-03-10 09:{30+i}:00", 520+i*0.5, 521+i*0.5, 519+i*0.5, 520.5+i*0.5, 3000)
+            for i in range(12)
+        ])
+        hist_bars = _make_bars([
+            (f"2026-03-09 09:{30+i}:00", 515+i*0.2, 516+i*0.2, 514+i*0.2, 515.5+i*0.2, 1000)
+            for i in range(12)
+        ])
+
+        async def mock_bars(sym, cfg):
+            return hist_bars, today_bars
+        p._get_bars_cached = mock_bars
+
+        result = await p._l1_screen("HK.00700", "morning", p._cfg["auto_scan"])
+        assert result is not None
+        assert result["signal_type"] == "BREAKOUT"
+        assert result["direction"] == "bullish"
+        assert len(result["trigger_reasons"]) > 0
+
+    @pytest.mark.asyncio
+    async def test_low_rvol_l1_reject(self):
+        """Low RVOL → L1 rejects."""
+        p = self._make_predictor()
+        p._collector.get_quote = lambda sym: {
+            "last_price": 515, "high_price": 520, "low_price": 510, "turnover": 5e9,
+        }
+
+        # Equal volume → RVOL ≈ 1.0
+        today_bars = _make_bars([
+            (f"2026-03-10 09:{30+i}:00", 515, 516, 514, 515, 1000)
+            for i in range(12)
+        ])
+        hist_bars = _make_bars([
+            (f"2026-03-09 09:{30+i}:00", 515, 516, 514, 515, 1000)
+            for i in range(12)
+        ])
+
+        async def mock_bars(sym, cfg):
+            return hist_bars, today_bars
+        p._get_bars_cached = mock_bars
+
+        result = await p._l1_screen("HK.00700", "morning", p._cfg["auto_scan"])
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_range_blocked_in_afternoon(self):
+        """RANGE signal in afternoon → L1 rejects."""
+        p = self._make_predictor()
+        # Price inside VA, near VAL → would trigger RANGE in morning
+        p._collector.get_quote = lambda sym: {
+            "last_price": 515.5, "high_price": 516, "low_price": 515, "turnover": 5e9,
+        }
+
+        # Low volume → RVOL low → RANGE regime
+        today_bars = _make_bars([
+            (f"2026-03-10 09:{30+i}:00", 515, 516, 514, 515.5, 500)
+            for i in range(12)
+        ])
+        hist_bars = _make_bars([
+            (f"2026-03-09 09:{30+i}:00", 515, 521, 514, 518, 1000)
+            for i in range(12)
+        ])
+
+        async def mock_bars(sym, cfg):
+            return hist_bars, today_bars
+        p._get_bars_cached = mock_bars
+
+        result = await p._l1_screen("HK.00700", "afternoon", p._cfg["auto_scan"])
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_breakout_needs_enhanced_condition(self):
+        """BREAKOUT without magnitude or surge → L1 rejects."""
+        p = self._make_predictor()
+
+        # hist_bars: 515-521 range → VP computes VAH ~519
+        # Price 519.5: barely above VAH, magnitude = (519.5-519)/519.5 ≈ 0.096% < 0.15%
+        p._collector.get_quote = lambda sym: {
+            "last_price": 519.5, "high_price": 520, "low_price": 519, "turnover": 5e9,
+        }
+
+        # High volume but uniform (no surge) — enough bars for detection
+        today_bars = _make_bars([
+            (f"2026-03-10 09:{30+i}:00", 519, 520, 518, 519.5, 3000)
+            for i in range(12)
+        ])
+        hist_bars = _make_bars([
+            (f"2026-03-09 09:{30+i}:00", 515, 521, 514, 518, 1000)
+            for i in range(12)
+        ])
+
+        async def mock_bars(sym, cfg):
+            return hist_bars, today_bars
+        p._get_bars_cached = mock_bars
+
+        result = await p._l1_screen("HK.00700", "morning", p._cfg["auto_scan"])
+        # Should reject because magnitude < 0.15% and no volume surge
+        assert result is None
+
+
+class TestFrequencyControl:
+    """Test 3-layer frequency control with override exceptions."""
+
+    def _make_predictor(self):
+        from unittest.mock import MagicMock, patch
+        from src.hk.main import HKPredictor
+
+        with patch.object(HKPredictor, '__init__', lambda self, *a, **kw: None):
+            p = HKPredictor.__new__(HKPredictor)
+            p._scan_history = {}
+            p._scan_history_date = "2026-03-10"
+            return p
+
+    def _make_signal(self, signal_type="BREAKOUT", direction="bullish",
+                     confidence=0.80, price=525.0):
+        from src.hk import ScanSignal
+        regime = RegimeResult(
+            regime=RegimeType.BREAKOUT if signal_type == "BREAKOUT" else RegimeType.RANGE,
+            confidence=confidence, rvol=1.5, price=price,
+            vah=521, val=514, poc=518,
+        )
+        return ScanSignal(
+            signal_type=signal_type,
+            direction=direction,
+            symbol="HK.00700",
+            regime=regime,
+            price=price,
+            trigger_reasons=["test"],
+            timestamp=time.time(),
+        )
+
+    def _default_scan_cfg(self):
+        return {
+            "cooldown": {
+                "same_signal_minutes": 30,
+                "max_per_session": 2,
+                "max_per_day": 3,
+            },
+            "override": {
+                "confidence_increase": 0.10,
+                "price_extension_pct": 0.50,
+                "regime_upgrade": True,
+            },
+        }
+
+    def test_first_signal_allowed(self):
+        p = self._make_predictor()
+        signal = self._make_signal()
+        allowed, override = p._check_frequency("HK.00700", signal, "morning", self._default_scan_cfg())
+        assert allowed is True
+        assert override is None
+
+    def test_same_signal_within_cooldown_blocked(self):
+        from src.hk import ScanAlertRecord
+        p = self._make_predictor()
+        # Record a recent alert
+        p._scan_history["HK.00700"] = [
+            ScanAlertRecord(
+                symbol="HK.00700", signal_type="BREAKOUT", direction="bullish",
+                confidence=0.80, price=525, timestamp=time.time(), session="morning",
+            )
+        ]
+        signal = self._make_signal(confidence=0.80, price=525)
+        allowed, _ = p._check_frequency("HK.00700", signal, "morning", self._default_scan_cfg())
+        assert allowed is False
+
+    def test_max_per_session_blocked(self):
+        from src.hk import ScanAlertRecord
+        p = self._make_predictor()
+        now = time.time()
+        # 2 alerts already in morning session (different directions, so layer 1 doesn't block)
+        p._scan_history["HK.00700"] = [
+            ScanAlertRecord(
+                symbol="HK.00700", signal_type="BREAKOUT", direction="bullish",
+                confidence=0.80, price=525, timestamp=now - 2000, session="morning",
+            ),
+            ScanAlertRecord(
+                symbol="HK.00700", signal_type="BREAKOUT", direction="bearish",
+                confidence=0.75, price=510, timestamp=now - 1000, session="morning",
+            ),
+        ]
+        # New signal: different direction from last, so layer 1 doesn't block
+        # But session limit (2) is reached → blocked (no regime upgrade since both BREAKOUT)
+        signal = self._make_signal(signal_type="BREAKOUT", direction="bullish", price=528)
+        allowed, _ = p._check_frequency("HK.00700", signal, "morning", self._default_scan_cfg())
+        assert allowed is False
+
+    def test_max_per_day_blocked(self):
+        from src.hk import ScanAlertRecord
+        p = self._make_predictor()
+        now = time.time()
+        # 3 alerts already today
+        p._scan_history["HK.00700"] = [
+            ScanAlertRecord(
+                symbol="HK.00700", signal_type="BREAKOUT", direction="bullish",
+                confidence=0.80, price=525, timestamp=now - 10000, session="morning",
+            ),
+            ScanAlertRecord(
+                symbol="HK.00700", signal_type="RANGE", direction="bearish",
+                confidence=0.75, price=520, timestamp=now - 8000, session="morning",
+            ),
+            ScanAlertRecord(
+                symbol="HK.00700", signal_type="BREAKOUT", direction="bullish",
+                confidence=0.85, price=530, timestamp=now - 3000, session="afternoon",
+            ),
+        ]
+        signal = self._make_signal(direction="bearish", price=510)
+        allowed, _ = p._check_frequency("HK.00700", signal, "afternoon", self._default_scan_cfg())
+        assert allowed is False
+
+    def test_override_confidence_increase(self):
+        from src.hk import ScanAlertRecord
+        p = self._make_predictor()
+        p._scan_history["HK.00700"] = [
+            ScanAlertRecord(
+                symbol="HK.00700", signal_type="BREAKOUT", direction="bullish",
+                confidence=0.72, price=525, timestamp=time.time(), session="morning",
+            )
+        ]
+        # Confidence jumped from 0.72 to 0.85 (delta = 0.13 >= 0.10)
+        signal = self._make_signal(confidence=0.85, price=525)
+        allowed, override = p._check_frequency("HK.00700", signal, "morning", self._default_scan_cfg())
+        assert allowed is True
+        assert override is not None
+        assert "置信度" in override
+
+    def test_override_price_extension(self):
+        from src.hk import ScanAlertRecord
+        p = self._make_predictor()
+        p._scan_history["HK.00700"] = [
+            ScanAlertRecord(
+                symbol="HK.00700", signal_type="BREAKOUT", direction="bullish",
+                confidence=0.80, price=525, timestamp=time.time(), session="morning",
+            )
+        ]
+        # Price extended 0.6% from 525 to 528.15 (>= 0.50%)
+        signal = self._make_signal(confidence=0.80, price=528.15)
+        allowed, override = p._check_frequency("HK.00700", signal, "morning", self._default_scan_cfg())
+        assert allowed is True
+        assert override is not None
+        assert "扩展" in override
+
+    def test_override_regime_upgrade(self):
+        """Session limit reached with last signal being RANGE → BREAKOUT upgrade overrides."""
+        from src.hk import ScanAlertRecord
+        p = self._make_predictor()
+        now = time.time()
+        # 2 alerts in morning session (session limit reached), last one is RANGE
+        p._scan_history["HK.00700"] = [
+            ScanAlertRecord(
+                symbol="HK.00700", signal_type="BREAKOUT", direction="bullish",
+                confidence=0.80, price=525, timestamp=now - 2000, session="morning",
+            ),
+            ScanAlertRecord(
+                symbol="HK.00700", signal_type="RANGE", direction="bearish",
+                confidence=0.75, price=515, timestamp=now - 1000, session="morning",
+            ),
+        ]
+        # New BREAKOUT signal → regime upgrade overrides session limit
+        signal = self._make_signal(signal_type="BREAKOUT", direction="bullish", price=530)
+        allowed, override = p._check_frequency("HK.00700", signal, "morning", self._default_scan_cfg())
+        assert allowed is True
+        assert override is not None
+        assert "BREAKOUT" in override
+
+    def test_daily_reset(self):
+        from src.hk import ScanAlertRecord
+        from unittest.mock import patch
+        from src.hk.main import HKPredictor
+
+        with patch.object(HKPredictor, '__init__', lambda self, *a, **kw: None):
+            p = HKPredictor.__new__(HKPredictor)
+            p._scan_history = {"HK.00700": [
+                ScanAlertRecord(
+                    symbol="HK.00700", signal_type="BREAKOUT", direction="bullish",
+                    confidence=0.80, price=525, timestamp=time.time(), session="morning",
+                )
+            ]}
+            p._scan_history_date = "2026-03-09"  # yesterday
+
+            p._reset_scan_history_if_new_day()
+            assert len(p._scan_history) == 0
+            assert p._scan_history_date == datetime.now(HKT).strftime("%Y-%m-%d")
+
+
+class TestScanHeader:
+    """Test scan alert header formatting."""
+
+    def test_breakout_header(self):
+        from src.hk.main import HKPredictor
+        regime = RegimeResult(
+            regime=RegimeType.BREAKOUT, confidence=0.82, rvol=1.52,
+            price=525, vah=521, val=514, poc=518,
+        )
+        signal = ScanSignal(
+            signal_type="BREAKOUT", direction="bullish", symbol="HK.00700",
+            regime=regime, price=525,
+            trigger_reasons=["突破 VAH 0.32%", "最近 5 根 bar 量能突变"],
+        )
+        header = HKPredictor._format_scan_header(signal, "normal", None, 30)
+        assert "BREAKOUT 强信号" in header
+        assert "看多" in header
+        assert "突破 VAH" in header
+        assert "30 分钟" in header
+        assert "当前状态" in header
+        assert "是否还能追" in header
+
+    def test_elevated_risk_marker(self):
+        from src.hk.main import HKPredictor
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.75, rvol=0.70,
+            price=515, vah=521, val=514, poc=518,
+        )
+        signal = ScanSignal(
+            signal_type="RANGE", direction="bullish", symbol="HK.00700",
+            regime=regime, price=515, trigger_reasons=["接近 VAL"],
+        )
+        header = HKPredictor._format_scan_header(signal, "elevated", None, 30)
+        assert "风险偏高" in header
+        assert "触发原因" in header
+
+    def test_override_reason_shown(self):
+        from src.hk.main import HKPredictor
+        regime = RegimeResult(
+            regime=RegimeType.BREAKOUT, confidence=0.90, rvol=1.6,
+            price=530, vah=521, val=514, poc=518,
+        )
+        signal = ScanSignal(
+            signal_type="BREAKOUT", direction="bullish", symbol="HK.00700",
+            regime=regime, price=530, trigger_reasons=["突破 VAH 0.50%"],
+        )
+        header = HKPredictor._format_scan_header(signal, "normal", "置信度提升 13%", 30)
+        assert "冷却期覆盖" in header
+        assert "置信度提升" in header
+
+
+class TestAutoScanIntegration:
+    """Integration-level tests for run_auto_scan."""
+
+    @pytest.mark.asyncio
+    async def test_disabled_scan_does_nothing(self):
+        """auto_scan.enabled=false → no scan."""
+        from unittest.mock import MagicMock, patch
+        from src.hk.main import HKPredictor
+
+        sent = []
+        async def mock_send(msg):
+            sent.append(msg)
+
+        with patch.object(HKPredictor, '__init__', lambda self, *a, **kw: None):
+            p = HKPredictor.__new__(HKPredictor)
+            p._cfg = {"auto_scan": {"enabled": False}}
+            p._scan_history = {}
+            p._scan_history_date = ""
+            await p.run_auto_scan(mock_send)
+
+        assert len(sent) == 0
+
+    @pytest.mark.asyncio
+    async def test_outside_window_does_nothing(self):
+        """Outside trading window → no scan."""
+        from unittest.mock import MagicMock, patch
+        from src.hk.main import HKPredictor
+
+        sent = []
+        async def mock_send(msg):
+            sent.append(msg)
+
+        with patch.object(HKPredictor, '__init__', lambda self, *a, **kw: None):
+            p = HKPredictor.__new__(HKPredictor)
+            p._cfg = {
+                "auto_scan": {
+                    "enabled": True,
+                    "morning_window": ["09:35", "12:00"],
+                    "afternoon_window": ["13:05", "15:45"],
+                },
+            }
+            p._scan_history = {}
+            p._scan_history_date = ""
+
+            # Mock time to be outside window (lunch break)
+            with patch("src.hk.main.datetime") as mock_dt:
+                mock_dt.now.return_value = datetime(2026, 3, 10, 12, 30, tzinfo=HKT)
+                mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+                await p.run_auto_scan(mock_send)
+
+        assert len(sent) == 0
+
+    @pytest.mark.asyncio
+    async def test_full_scan_breakout_triggers(self):
+        """Full L1→L2→frequency→send pipeline for BREAKOUT."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from src.hk.main import HKPredictor
+        from src.hk import (
+            Playbook, OptionRecommendation, OptionLeg,
+        )
+
+        sent = []
+        async def mock_send(msg):
+            sent.append(msg)
+
+        with patch.object(HKPredictor, '__init__', lambda self, *a, **kw: None):
+            p = HKPredictor.__new__(HKPredictor)
+            p._cfg = {
+                "auto_scan": {
+                    "enabled": True,
+                    "morning_window": ["09:35", "12:00"],
+                    "afternoon_window": ["13:05", "15:45"],
+                    "breakout": {
+                        "min_confidence": 0.72,
+                        "min_rvol": 1.35,
+                        "min_magnitude_pct": 0.15,
+                        "volume_surge_threshold": 2.0,
+                        "volume_surge_bars": 5,
+                    },
+                    "range": {
+                        "min_confidence": 0.72,
+                        "rvol_min": 0.55,
+                        "rvol_max": 0.90,
+                        "va_proximity_pct": 0.30,
+                    },
+                    "cooldown": {
+                        "same_signal_minutes": 30,
+                        "max_per_session": 2,
+                        "max_per_day": 3,
+                    },
+                    "override": {
+                        "confidence_increase": 0.10,
+                        "price_extension_pct": 0.50,
+                        "regime_upgrade": True,
+                    },
+                },
+                "volume_profile": {"value_area_pct": 0.70, "recency_decay": 0.15},
+                "rvol": {"lookback_days": 10},
+                "regime": {"breakout_rvol": 1.05, "range_rvol": 0.95},
+            }
+            p.watchlist = MagicMock()
+            p.watchlist.symbols.return_value = ["HK.00700"]
+            p.watchlist.get_name.return_value = "Tencent"
+            p._scan_history = {}
+            p._scan_history_date = ""
+            p._vp_cache = {}
+
+            async def run_sync(fn, *args):
+                return fn(*args)
+            p._run_sync = run_sync
+
+            # Quote: price above VAH with good magnitude
+            p._collector = MagicMock()
+            p._collector.get_quote = lambda sym: {
+                "last_price": 525, "high_price": 530, "low_price": 520, "turnover": 5e9,
+            }
+
+            # Bars with high volume (RVOL ~3.0)
+            today_bars = _make_bars([
+                (f"2026-03-10 09:{30+i}:00", 520+i*0.5, 521+i*0.5, 519+i*0.5, 520.5+i*0.5, 3000)
+                for i in range(12)
+            ])
+            hist_bars = _make_bars([
+                (f"2026-03-09 09:{30+i}:00", 515+i*0.2, 516+i*0.2, 514+i*0.2, 515.5+i*0.2, 1000)
+                for i in range(12)
+            ])
+
+            async def mock_bars(sym, cfg):
+                return hist_bars, today_bars
+            p._get_bars_cached = mock_bars
+
+            # Mock L2 pipeline to return valid results
+            regime = RegimeResult(
+                regime=RegimeType.BREAKOUT, confidence=0.82, rvol=1.52,
+                price=525, vah=521, val=514, poc=518,
+            )
+            option_rec = OptionRecommendation(
+                action="call", direction="bullish", expiry="2026-03-18",
+                legs=[OptionLeg(side="buy", option_type="call", strike=525,
+                               pct_from_price=0.0, moneyness="ATM")],
+            )
+            filters = FilterResult(tradeable=True, risk_level="normal")
+            vp = VolumeProfileResult(poc=518, vah=521, val=514)
+            playbook = Playbook(
+                regime=regime, volume_profile=vp, gamma_wall=None,
+                filters=filters, vwap=520.0, option_rec=option_rec,
+            )
+
+            async def mock_pipeline(symbol):
+                return regime, vp, 520.0, filters, option_rec, None, playbook, today_bars
+            p._run_analysis_pipeline = mock_pipeline
+
+            # Mock time to be in morning window
+            with patch("src.hk.main.datetime") as mock_dt:
+                mock_dt.now.return_value = datetime(2026, 3, 10, 10, 0, tzinfo=HKT)
+                mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+                mock_dt.strptime = datetime.strptime
+                await p.run_auto_scan(mock_send)
+
+        assert len(sent) == 1
+        assert "BREAKOUT 强信号" in sent[0]
+        assert "看多" in sent[0]
+        # Verify alert was recorded
+        assert "HK.00700" in p._scan_history
+        assert len(p._scan_history["HK.00700"]) == 1
+
+
+# ── P1: Negative EV Spread Filter Tests ──
+
+class TestNegativeEVFilter:
+    """P1: Spread with R:R < 0.10 or negative EV should be rejected."""
+
+    def test_positive_ev_passes(self):
+        # EV = 0.75 * 0.700 - 0.25 * 1.300 = 0.525 - 0.325 = +0.200
+        sm = SpreadMetrics(
+            net_credit=0.700, max_profit=0.700, max_loss=1.300,
+            breakeven=98.7, risk_reward_ratio=0.538, win_probability=0.75,
+        )
+        assert _is_positive_ev(sm)
+
+    def test_negative_ev_rejected(self):
+        """HK.00941 case: R:R=0.04, win_prob=0.81, EV=-0.385 → reject."""
+        sm = SpreadMetrics(
+            net_credit=0.090, max_profit=0.090, max_loss=2.410,
+            breakeven=80.09, risk_reward_ratio=0.037, win_probability=0.81,
+        )
+        assert not _is_positive_ev(sm)
+
+    def test_low_rr_rejected(self):
+        sm = SpreadMetrics(
+            net_credit=0.050, max_profit=0.050, max_loss=1.950,
+            breakeven=100.05, risk_reward_ratio=0.026, win_probability=0.90,
+        )
+        assert not _is_positive_ev(sm)
+
+    def test_borderline_rr_passes(self):
+        sm = SpreadMetrics(
+            net_credit=0.200, max_profit=0.200, max_loss=1.800,
+            breakeven=100.2, risk_reward_ratio=0.111, win_probability=0.80,
+        )
+        # EV = 0.80*0.200 - 0.20*1.800 = 0.160 - 0.360 = -0.200 → still negative
+        assert not _is_positive_ev(sm)
+
+    def test_recommend_rejects_negative_ev_spread(self):
+        """Full recommend() should fall through to single leg when spread has negative EV."""
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=79.0, vah=79.5, val=78.0, poc=78.5,
+        )
+        vp = VolumeProfileResult(poc=78.5, vah=79.5, val=78.0)
+        filters = FilterResult(tradeable=True)
+        # Build chain where spread would have very poor R:R
+        chain = pd.DataFrame([
+            {"code": "C1", "option_type": "CALL", "strike_price": 80.0,
+             "strike_time": "2026-03-20", "open_interest": 200,
+             "delta": 0.19, "last_price": 0.100},
+            {"code": "C2", "option_type": "CALL", "strike_price": 82.50,
+             "strike_time": "2026-03-20", "open_interest": 150,
+             "delta": 0.08, "last_price": 0.010},
+        ])
+        dates = [{"strike_time": "2026-03-20"}]
+        rec = recommend(regime, vp, filters, chain_df=chain, expiry_dates=dates)
+        # Should NOT be bear_call_spread (negative EV)
+        assert rec.action != "bear_call_spread"
+
+
+# ── P2: Strike Display Precision Tests ──
+
+class TestStrikeDisplayPrecision:
+    """P2: Fractional strikes should display with 1 decimal, not truncated."""
+
+    def test_fractional_strike_in_leg(self):
+        from src.hk.playbook import _format_leg_line
+        leg = OptionLeg(
+            side="buy", option_type="call", strike=82.50,
+            pct_from_price=4.5, moneyness="OTM 4.5%",
+            delta=0.08, open_interest=150, last_price=0.010,
+        )
+        lines = _format_leg_line(leg)
+        assert "82.5" in lines[0]
+        assert "82 " not in lines[0]  # Should not truncate to "82"
+
+    def test_integer_strike_no_decimal(self):
+        from src.hk.playbook import _format_leg_line
+        leg = OptionLeg(
+            side="sell", option_type="call", strike=80.0,
+            pct_from_price=1.3, moneyness="OTM 1.3%",
+            delta=0.19, open_interest=200, last_price=0.100,
+        )
+        lines = _format_leg_line(leg)
+        assert "80 " in lines[0] or "80 (" in lines[0]
+
+    def test_format_strike_in_playbook_message(self):
+        """Full playbook message should show 82.5 not 82."""
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=79.0, vah=79.5, val=78.0, poc=78.5,
+        )
+        vp = VolumeProfileResult(poc=78.5, vah=79.5, val=78.0)
+        rec = OptionRecommendation(
+            action="bear_call_spread", direction="bearish",
+            expiry="2026-03-13", dte=3,
+            legs=[
+                OptionLeg(side="sell", option_type="call", strike=80.0,
+                          pct_from_price=1.3, moneyness="OTM 1.3%",
+                          delta=0.19, open_interest=200, last_price=0.100),
+                OptionLeg(side="buy", option_type="call", strike=82.50,
+                          pct_from_price=4.5, moneyness="OTM 4.5%",
+                          delta=0.08, open_interest=150, last_price=0.010),
+            ],
+            spread_metrics=SpreadMetrics(
+                net_credit=0.090, max_profit=0.090, max_loss=2.410,
+                breakeven=80.09, risk_reward_ratio=0.037, win_probability=0.81,
+            ),
+        )
+        pb = generate_playbook(regime, vp, vwap=78.55, option_rec=rec)
+        msg = format_playbook_message(pb, symbol="HK.00941")
+        assert "82.5" in msg
+
+
+# ── P3: IV Interpretation Strategy-Aware Tests ──
+
+class TestIVInterpretationStrategyAware:
+    """P3: Low IV should be negative for seller strategies, positive for buyer strategies."""
+
+    def test_low_iv_seller_strategy_warning(self):
+        """Low IV with bear_call_spread should show warning, not support."""
+        from src.hk.playbook import _regime_reason_lines
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=79.0, vah=79.5, val=78.0, poc=78.5,
+        )
+        vp = VolumeProfileResult(poc=78.5, vah=79.5, val=78.0)
+        option_market = OptionMarketSnapshot(
+            atm_iv=18.25, avg_iv=22.0, iv_ratio=0.83,
+        )
+        rec = OptionRecommendation(
+            action="bear_call_spread", direction="bearish",
+        )
+        reasons, supports, uncertainties, invalidations = _regime_reason_lines(
+            regime, vp, 78.55, None, option_market, None, option_rec=rec,
+        )
+        # Should be in uncertainties (warning), not supports
+        assert any("premium 收入偏少" in u or "卖方" in u for u in uncertainties)
+        assert not any("期权定价相对便宜" in s for s in supports)
+
+    def test_low_iv_buyer_strategy_support(self):
+        """Low IV with single leg call should show as support."""
+        from src.hk.playbook import _regime_reason_lines
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=79.0, vah=79.5, val=78.0, poc=78.5,
+        )
+        vp = VolumeProfileResult(poc=78.5, vah=79.5, val=78.0)
+        option_market = OptionMarketSnapshot(
+            atm_iv=18.25, avg_iv=22.0, iv_ratio=0.83,
+        )
+        rec = OptionRecommendation(action="call", direction="bullish")
+        reasons, supports, uncertainties, invalidations = _regime_reason_lines(
+            regime, vp, 78.55, None, option_market, None, option_rec=rec,
+        )
+        assert any("期权定价相对便宜" in s for s in supports)
+        assert not any("卖方" in u for u in uncertainties)
+
+
+# ── P4: Volume Surge RANGE Downgrade Tests ──
+
+class TestVolumeSurgeRangeDowngrade:
+    """P4: Volume surge during RANGE near VA edge should reduce confidence."""
+
+    def test_range_with_surge_near_vah_reduces_confidence(self):
+        vp = VolumeProfileResult(poc=78.5, vah=79.0, val=78.0)
+        # Price near VAH (78.95 vs VAH 79.0)
+        result_no_surge = classify_regime(
+            price=78.95, rvol=0.6, vp=vp,
+            has_volume_surge=False, intraday_range=0.5,
+        )
+        result_with_surge = classify_regime(
+            price=78.95, rvol=0.6, vp=vp,
+            has_volume_surge=True, intraday_range=0.5,
+        )
+        # Both should be RANGE (or UNCLEAR if downgraded)
+        if result_with_surge.regime == RegimeType.RANGE:
+            assert result_with_surge.confidence < result_no_surge.confidence
+        else:
+            # Downgraded to UNCLEAR
+            assert result_with_surge.regime == RegimeType.UNCLEAR
+
+    def test_range_with_surge_at_center_no_downgrade(self):
+        """Volume surge near center of VA should not cause downgrade."""
+        vp = VolumeProfileResult(poc=78.5, vah=79.0, val=78.0)
+        result_no_surge = classify_regime(
+            price=78.5, rvol=0.6, vp=vp,
+            has_volume_surge=False, intraday_range=0.3,
+        )
+        result_with_surge = classify_regime(
+            price=78.5, rvol=0.6, vp=vp,
+            has_volume_surge=True, intraday_range=0.3,
+        )
+        # At center (0.5 of range), both should be RANGE with same confidence
+        assert result_with_surge.regime == RegimeType.RANGE
+        assert result_with_surge.confidence == result_no_surge.confidence
+
+
+# ── P5: DTE <= 3 Spread Downgrade Tests ──
+
+class TestDTESpreadDowngrade:
+    """P5: DTE <= 3 should skip spread and fall through to single leg."""
+
+    def test_dte_3_no_spread(self):
+        """With DTE=3, should get single leg instead of spread."""
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=102.0, vah=105.0, val=95.0, poc=100.0,
+        )
+        vp = VolumeProfileResult(poc=100.0, vah=105.0, val=95.0)
+        filters = FilterResult(tradeable=True)
+        chain = pd.DataFrame([
+            {"code": f"C{i}", "option_type": "CALL", "strike_price": 100 + i * 2,
+             "strike_time": "2026-03-13", "open_interest": 200, "delta": 0.5 - i * 0.1,
+             "last_price": 2.0 - i * 0.4}
+            for i in range(5)
+        ])
+        # Expiry is 3 days away
+        today = date(2026, 3, 10)
+        dates = [{"strike_time": "2026-03-13"}]
+        rec = recommend(regime, vp, filters, chain_df=chain, expiry_dates=dates)
+        # Should NOT be a spread (DTE too low)
+        assert rec.action not in {"bear_call_spread", "bull_put_spread"}
+
+    def test_dte_7_allows_spread(self):
+        """With DTE=10, spread path is available (may still be rejected by EV check)."""
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=102.0, vah=105.0, val=95.0, poc=100.0,
+        )
+        vp = VolumeProfileResult(poc=100.0, vah=105.0, val=95.0)
+        filters = FilterResult(tradeable=True)
+        # Build chain with both CALL and PUT, and good R:R for spread
+        chain = pd.DataFrame([
+            {"code": "C0", "option_type": "CALL", "strike_price": 102,
+             "strike_time": "2026-03-20", "open_interest": 200, "delta": 0.50,
+             "last_price": 3.0},
+            {"code": "C1", "option_type": "CALL", "strike_price": 104,
+             "strike_time": "2026-03-20", "open_interest": 200, "delta": 0.35,
+             "last_price": 1.5},
+            {"code": "P0", "option_type": "PUT", "strike_price": 100,
+             "strike_time": "2026-03-20", "open_interest": 200, "delta": -0.40,
+             "last_price": 2.0},
+            {"code": "P1", "option_type": "PUT", "strike_price": 98,
+             "strike_time": "2026-03-20", "open_interest": 200, "delta": -0.25,
+             "last_price": 0.5},
+        ])
+        dates = [{"strike_time": "2026-03-20"}]
+        rec = recommend(regime, vp, filters, chain_df=chain, expiry_dates=dates)
+        # DTE=10, spread path is open — should get bear_call_spread or fall through to put
+        assert rec.action != "wait"
+
+
+# ── P6: avg_iv ATM ±3 Strikes Tests ──
+
+class TestExtractIVNarrowRange:
+    """P6: avg_iv should use ATM ±3 strikes, not full chain median."""
+
+    def test_narrow_range_avoids_deep_otm_skew(self):
+        """Deep OTM strikes with high IV should not inflate avg_iv."""
+        from src.hk.main import HKPredictor
+        chain = pd.DataFrame({
+            "strike_price": [60, 65, 70, 75, 78, 80, 82, 85, 90, 95, 100],
+            "implied_volatility": [120, 100, 80, 40, 25, 20, 18, 22, 60, 90, 110],
+        })
+        atm_iv, avg_iv = HKPredictor._extract_iv(chain, price=80)
+        # Near-ATM strikes (75,78,80,82,85,65,70) IVs: 40,25,20,18,22,100,80
+        # The avg_iv should be much lower than full-chain median
+        full_chain_median = chain["implied_volatility"].median()  # ~60
+        assert avg_iv < full_chain_median  # Narrower range avoids deep OTM skew
+
+    def test_atm_iv_unchanged(self):
+        """atm_iv calculation should remain the same (4 nearest strikes mean)."""
+        from src.hk.main import HKPredictor
+        chain = pd.DataFrame({
+            "strike_price": [95, 97, 100, 103, 105, 110],
+            "implied_volatility": [40, 35, 30, 28, 25, 20],
+        })
+        atm_iv, avg_iv = HKPredictor._extract_iv(chain, price=100)
+        # ATM (4 nearest: 100=30, 97=35, 103=28, 95=40) mean = 33.25
+        assert abs(atm_iv - 33.25) < 1.0

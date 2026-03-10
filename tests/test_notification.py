@@ -6,6 +6,8 @@ from src.indicator.engine import IndicatorResult
 from src.strategy.matcher import EntryQuality, Signal
 from src.notification.telegram import (
     TelegramNotifier,
+    _build_entry_keyboard,
+    _build_actioned_keyboard,
     _compute_price_levels,
     _compute_position_size,
     _suggest_order_type,
@@ -244,3 +246,49 @@ class TestInlineQuality:
 
     def test_none(self):
         assert _inline_quality(None) == ""
+
+
+class TestBuildEntryKeyboard:
+    def test_structure(self):
+        kb = _build_entry_keyboard("SIG-123")
+        # 2 rows: [confirm, skip], [detail]
+        assert len(kb.inline_keyboard) == 2
+        assert len(kb.inline_keyboard[0]) == 2
+        assert len(kb.inline_keyboard[1]) == 1
+
+    def test_callback_data_format(self):
+        kb = _build_entry_keyboard("SIG-1678892400-0001")
+        row0 = kb.inline_keyboard[0]
+        assert row0[0].callback_data == "cfm:SIG-1678892400-0001"
+        assert row0[1].callback_data == "skip:SIG-1678892400-0001"
+        assert kb.inline_keyboard[1][0].callback_data == "dtl:SIG-1678892400-0001"
+
+    def test_button_labels(self):
+        kb = _build_entry_keyboard("SIG-123")
+        assert "确认" in kb.inline_keyboard[0][0].text
+        assert "跳过" in kb.inline_keyboard[0][1].text
+        assert "详情" in kb.inline_keyboard[1][0].text
+
+    def test_callback_data_within_64_bytes(self):
+        # Longest realistic signal_id
+        long_id = "SIG-1678892400-9999"
+        kb = _build_entry_keyboard(long_id)
+        for row in kb.inline_keyboard:
+            for btn in row:
+                assert len(btn.callback_data.encode("utf-8")) <= 64
+
+
+class TestBuildActionedKeyboard:
+    def test_single_button(self):
+        kb = _build_actioned_keyboard("✅ 已确认 @ $185.50")
+        assert len(kb.inline_keyboard) == 1
+        assert len(kb.inline_keyboard[0]) == 1
+
+    def test_noop_callback(self):
+        kb = _build_actioned_keyboard("⏭ 已跳过")
+        assert kb.inline_keyboard[0][0].callback_data == "noop"
+
+    def test_action_text_preserved(self):
+        text = "✅ 已确认 @ $185.50"
+        kb = _build_actioned_keyboard(text)
+        assert kb.inline_keyboard[0][0].text == text

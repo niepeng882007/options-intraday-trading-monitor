@@ -46,8 +46,8 @@ class TestStockQuote:
         assert d["delta"] is None
 
 
-class TestYahooCollectorUnit:
-    """Unit tests that don't require network access."""
+class TestQuoteDataclasses:
+    """Unit tests for StockQuote/OptionQuote dataclasses."""
 
     def test_stock_quote_fields(self):
         quote = StockQuote(
