@@ -9,3 +9,4 @@ pyyaml>=6.0
 watchdog>=3.0
 httpx>=0.25
 python-dotenv>=1.0
+matplotlib>=3.8
