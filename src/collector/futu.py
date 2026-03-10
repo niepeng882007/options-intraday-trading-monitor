@@ -301,38 +301,28 @@ class FutuCollector(BaseCollector):
         if not option_codes:
             return []
 
-        # Fetch quotes for all option codes
-        ret2, quote_data = ctx.get_stock_quote(option_codes)
+        # Fetch snapshots for quotes + Greeks/IV (no subscription needed)
+        snapshot_map: dict[str, dict] = {}
+        ret2, snapshot_data = ctx.get_market_snapshot(option_codes)
         if ret2 != RET_OK:
-            raise RuntimeError(f"get_stock_quote for options failed: {quote_data}")
-
-        # Fetch option snapshots for Greeks/IV
-        greeks_map: dict[str, dict] = {}
-        try:
-            ret3, snapshot_data = ctx.get_market_snapshot(option_codes)
-            if ret3 == RET_OK and not snapshot_data.empty:
-                greeks_map = {row["code"]: row for _, row in snapshot_data.iterrows()}
-        except Exception:
-            logger.debug("Failed to fetch option snapshots for Greeks/IV, continuing without")
-
-        # Merge data
-        quote_map = {row["code"]: row for _, row in quote_data.iterrows()}
+            raise RuntimeError(f"get_market_snapshot for options failed: {snapshot_data}")
+        if not snapshot_data.empty:
+            snapshot_map = {row["code"]: row for _, row in snapshot_data.iterrows()}
 
         results: list[OptionQuote] = []
         now = time.time()
 
         for _, row in data.iterrows():
             code = row["code"]
-            q = quote_map.get(code, {})
-            g = greeks_map.get(code, {})
+            s = snapshot_map.get(code, {})
             option_type = "call" if row.get("option_type", "").upper() == "CALL" else "put"
 
             # Extract Greeks from snapshot data
-            iv = float(g.get("option_implied_volatility", 0) or 0)
-            delta = g.get("option_delta")
-            gamma = g.get("option_gamma")
-            theta = g.get("option_theta")
-            vega = g.get("option_vega")
+            iv = float(s.get("option_implied_volatility", 0) or 0)
+            delta = s.get("option_delta")
+            gamma = s.get("option_gamma")
+            theta = s.get("option_theta")
+            vega = s.get("option_vega")
 
             results.append(
                 OptionQuote(
@@ -341,11 +331,11 @@ class FutuCollector(BaseCollector):
                     strike=float(row.get("strike_price", 0) or 0),
                     option_type=option_type,
                     expiration=str(row.get("strike_time", ""))[:10],
-                    bid=float(q.get("bid_price", 0) or 0),
-                    ask=float(q.get("ask_price", 0) or 0),
-                    last=float(q.get("last_price", 0) or 0),
-                    volume=int(q.get("volume", 0) or 0),
-                    open_interest=int(g.get("option_open_interest", 0) or 0),
+                    bid=float(s.get("bid_price", 0) or 0),
+                    ask=float(s.get("ask_price", 0) or 0),
+                    last=float(s.get("last_price", 0) or 0),
+                    volume=int(s.get("volume", 0) or 0),
+                    open_interest=int(s.get("option_open_interest", 0) or 0),
                     implied_volatility=iv / 100 if iv > 1 else iv,
                     delta=float(delta) if delta is not None else None,
                     gamma=float(gamma) if gamma is not None else None,
@@ -355,6 +345,33 @@ class FutuCollector(BaseCollector):
                 )
             )
         return results
+
+    # ── Option expiration dates (lightweight, cached) ──
+
+    _EXPIRY_CACHE_TTL = 300  # 5 minutes
+
+    def _fetch_option_expiration_dates(self, symbol: str) -> list[str]:
+        """Get sorted list of expiry date strings for a symbol (structure only, no quotes)."""
+        ctx = self._ensure_connected()
+        futu_code = to_futu(symbol)
+        ret, data = ctx.get_option_chain(futu_code)
+        if ret != RET_OK or data.empty:
+            return []
+        return sorted(data["strike_time"].unique().tolist())
+
+    async def get_option_expiration_dates(self, symbol: str) -> list[str]:
+        """Return cached list of expiry date strings. TTL 5 minutes."""
+        now = time.time()
+        cache = getattr(self, "_expiry_cache", None)
+        if cache is None:
+            self._expiry_cache: dict[str, tuple[float, list[str]]] = {}
+            cache = self._expiry_cache
+        cached = cache.get(symbol)
+        if cached and now - cached[0] < self._EXPIRY_CACHE_TTL:
+            return cached[1]
+        dates = await self._retry(self._fetch_option_expiration_dates, symbol)
+        cache[symbol] = (now, dates)
+        return dates
 
     async def get_option_chain(
         self,
@@ -420,7 +437,9 @@ class FutuCollector(BaseCollector):
         today = datetime.now(ET).date()
         start = (today - timedelta(days=days + 3)).strftime("%Y-%m-%d")  # buffer for weekends
         end = today.strftime("%Y-%m-%d")
-        max_count = min(days * 400 + 100, 5000)
+        # Futu returns OLDEST max_count bars when start+end given
+        # Use generous limit to ensure today's bars are included
+        max_count = (days + 3) * 400
 
         ret, data, _ = ctx.request_history_kline(
             futu_code, start=start, end=end, ktype=kl_type, max_count=max_count,
@@ -454,6 +473,10 @@ class FutuCollector(BaseCollector):
             "turnover": float(row.get("turnover", 0) or 0),
             "pre_high_price": float(row.get("pre_high_price", 0) or 0),
             "pre_low_price": float(row.get("pre_low_price", 0) or 0),
+            "bid_price": float(row.get("bid_price", 0) or 0),
+            "ask_price": float(row.get("ask_price", 0) or 0),
+            "turnover_rate": float(row.get("turnover_rate", 0) or 0),
+            "amplitude": float(row.get("amplitude", 0) or 0),
         }
 
     async def get_snapshot(self, symbol: str) -> dict:

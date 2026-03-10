@@ -16,7 +16,7 @@ class StockQuote:
     ask: float
     volume: int
     timestamp: float
-    # Extended fields (populated by Futu, optional for Yahoo)
+    # Extended fields (populated by Futu; may be None)
     open_price: float | None = None
     high_price: float | None = None
     low_price: float | None = None
