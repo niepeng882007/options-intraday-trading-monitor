@@ -53,8 +53,9 @@ rvol:
 
 regime:
   breakout_rvol: 1.05
-  range_rvol: 0.95
+  range_rvol: 0.85
   iv_spike_ratio: 1.3
+  momentum_min_dist_pct: 1.0  # VA 边界距离 >= 1% 触发动量突破
 
 simulation:
   tp_pct: 0.8
@@ -66,8 +67,52 @@ simulation:
   exclude_symbols:
     - "HK.800000"
     - "HK.00941"
+    - "HK.800700"
+    - "HK.09988"
   skip_signal_types:
     - "BREAKOUT_long"
+    - "BREAKOUT_short"
+    - "RANGE_long"
+
+chase_risk:
+  vwap_moderate_pct: 2.0       # VWAP deviation >= 2% → moderate
+  vwap_high_pct: 3.5            # VWAP deviation >= 3.5% → high
+  va_moderate_pct: 2.5          # VA boundary distance >= 2.5% → moderate
+  va_high_pct: 4.0              # VA boundary distance >= 4.0% → high
+  afternoon_tighten_pct: 0.5    # Tighten thresholds by 0.5% after 12:00 HKT
+
+auto_scan:
+  enabled: true
+  interval_seconds: 180              # Scan every 3 minutes
+  morning_window: ["09:35", "12:00"]
+  afternoon_window: ["13:05", "15:45"]
+
+  # BREAKOUT signal thresholds (both sessions)
+  breakout:
+    min_confidence: 0.72
+    min_rvol: 1.35
+    min_magnitude_pct: 0.15        # % beyond VA boundary
+    volume_surge_threshold: 2.0    # x median for volume surge
+    volume_surge_bars: 5           # recent N bars to check
+
+  # RANGE signal thresholds (morning only)
+  range:
+    min_confidence: 0.72
+    rvol_min: 0.55
+    rvol_max: 0.90
+    va_proximity_pct: 0.30         # % distance to VAH/VAL
+
+  # Frequency control
+  cooldown:
+    same_signal_minutes: 30        # same symbol+direction+regime
+    max_per_session: 2             # same symbol per session
+    max_per_day: 3                 # same symbol per day
+
+  # Override thresholds (bypass cooldown)
+  override:
+    confidence_increase: 0.10
+    price_extension_pct: 0.50
+    regime_upgrade: true           # RANGE -> BREAKOUT
 
 playbook:
   push_times: ["09:35", "10:05", "13:05"]

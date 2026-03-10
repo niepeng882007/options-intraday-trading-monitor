@@ -21,30 +21,8 @@ def is_trading_time(t: dt_time) -> bool:
     return (MORNING_OPEN <= t <= MORNING_CLOSE) or (AFTERNOON_OPEN <= t <= AFTERNOON_CLOSE)
 
 
-def calculate_vwap(bars: pd.DataFrame) -> float:
-    """Calculate VWAP for today's bars, continuous across lunch break.
-
-    VWAP = cumsum(typical_price * volume) / cumsum(volume)
-    Lunch break (12:00-13:00) is simply skipped -- no special handling needed
-    since there are no bars during lunch.
-
-    Args:
-        bars: Today's 1m bars with Open, High, Low, Close, Volume columns
-
-    Returns:
-        Current VWAP value, or 0.0 if no data
-    """
-    if bars.empty:
-        return 0.0
-
-    typical_price = (bars["High"] + bars["Low"] + bars["Close"]) / 3
-    cum_vol = bars["Volume"].cumsum()
-    cum_tp_vol = (typical_price * bars["Volume"]).cumsum()
-
-    if cum_vol.iloc[-1] == 0:
-        return 0.0
-
-    return float(cum_tp_vol.iloc[-1] / cum_vol.iloc[-1])
+# Re-export shared VWAP for backward compatibility
+from src.common.indicators import calculate_vwap  # noqa: F401, E402
 
 
 def calculate_vwap_series(bars: pd.DataFrame) -> pd.Series:
@@ -168,8 +146,11 @@ def get_today_bars(bars: pd.DataFrame) -> pd.DataFrame:
     return bars[pd.to_datetime(bars.index).date == today]
 
 
-def get_history_bars(bars: pd.DataFrame) -> pd.DataFrame:
-    """Extract historical (non-today) bars from a multi-day DataFrame."""
+def get_history_bars(bars: pd.DataFrame, max_trading_days: int = 0) -> pd.DataFrame:
+    """Extract historical (non-today) bars from a multi-day DataFrame.
+
+    If max_trading_days > 0, keep only the most recent N trading days.
+    """
     if bars.empty:
         return bars
     today = (
@@ -178,5 +159,20 @@ def get_history_bars(bars: pd.DataFrame) -> pd.DataFrame:
         else pd.to_datetime(bars.index[-1]).date()
     )
     if hasattr(bars.index, "date"):
-        return bars[bars.index.date != today]
-    return bars[pd.to_datetime(bars.index).date != today]
+        history = bars[bars.index.date != today]
+    else:
+        history = bars[pd.to_datetime(bars.index).date != today]
+
+    if max_trading_days > 0 and not history.empty:
+        trading_dates = sorted(set(
+            history.index.date if hasattr(history.index, "date")
+            else pd.to_datetime(history.index).date
+        ))
+        if len(trading_dates) > max_trading_days:
+            cutoff = trading_dates[-max_trading_days]
+            if hasattr(history.index, "date"):
+                history = history[history.index.date >= cutoff]
+            else:
+                history = history[pd.to_datetime(history.index).date >= cutoff]
+
+    return history

@@ -2,19 +2,29 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 
-from src.hk import (
+from src.common.option_utils import (
+    assess_chase_risk,
+    calculate_spread_metrics as _calculate_spread_metrics,
+    classify_moneyness,
+    is_positive_ev as _is_positive_ev,
+    option_leg_from_row as _option_leg_from_row,
+    recommend_single_leg,
+    recommend_spread,
+)
+from src.common.types import (
+    ChaseRiskResult,
     FilterResult,
     GammaWallResult,
     OptionLeg,
     OptionRecommendation,
-    RegimeResult,
-    RegimeType,
+    SpreadMetrics,
     VolumeProfileResult,
 )
+from src.hk import RegimeResult, RegimeType
 from src.utils.logger import setup_logger
 
 logger = setup_logger("hk_option_rec")
@@ -63,26 +73,6 @@ def select_expiry(expiry_dates: list[dict], today: date | None = None) -> str | 
             return exp_str
 
     return None
-
-
-# ── Moneyness classification ──
-
-
-def classify_moneyness(strike: float, price: float, option_type: str) -> str:
-    """Classify a strike as ATM / OTM X% / ITM X%."""
-    if price == 0:
-        return "N/A"
-    pct = abs(strike - price) / price * 100
-    if pct < 0.5:
-        return "ATM"
-    if option_type.lower() == "call":
-        if strike > price:
-            return f"OTM {pct:.1f}%"
-        return f"ITM {pct:.1f}%"
-    else:  # put
-        if strike < price:
-            return f"OTM {pct:.1f}%"
-        return f"ITM {pct:.1f}%"
 
 
 # ── Direction decision ──
@@ -160,143 +150,23 @@ def should_wait(
     return bool(reasons), reasons, conditions
 
 
-# ── Single leg recommendation ──
-
-
-def recommend_single_leg(
-    direction: str,
-    chain_df: pd.DataFrame,
-    price: float,
-    expiry: str,
-) -> OptionLeg | None:
-    """Pick best single-leg option.
-
-    Call: ATM or slightly OTM (strike >= price, prefer delta 0.3-0.5)
-    Put:  ATM or slightly OTM (strike <= price, prefer delta -0.3 to -0.5)
-    """
-    if chain_df.empty:
-        return None
-
-    opt_type = "CALL" if direction == "bullish" else "PUT"
-    expiry_match = chain_df["strike_time"].astype(str).str[:10] == expiry
-    type_match = chain_df["option_type"].str.upper() == opt_type
-    candidates = chain_df[expiry_match & type_match].copy()
-
-    if candidates.empty:
-        return None
-
-    # Filter by OI
-    if "open_interest" in candidates.columns:
-        candidates = candidates[candidates["open_interest"] >= 10]
-    if candidates.empty:
-        return None
-
-    # Prefer ATM/slightly OTM
-    candidates = candidates.copy()
-    candidates["dist"] = abs(candidates["strike_price"] - price)
-    candidates = candidates.sort_values("dist")
-
-    # Prefer delta 0.3-0.5 range if available
-    if "delta" in candidates.columns:
-        abs_delta = candidates["delta"].abs()
-        good_delta = candidates[(abs_delta >= 0.3) & (abs_delta <= 0.5)]
-        if not good_delta.empty:
-            candidates = good_delta.sort_values("dist")
-
-    best = candidates.iloc[0]
-    strike = float(best["strike_price"])
-    pct_from = (strike - price) / price * 100
-
-    return OptionLeg(
-        side="buy",
-        option_type=opt_type.lower(),
-        strike=strike,
-        pct_from_price=pct_from,
-        moneyness=classify_moneyness(strike, price, opt_type),
-    )
-
-
-# ── Spread recommendation ──
-
-
-def recommend_spread(
-    direction: str,
-    chain_df: pd.DataFrame,
-    price: float,
-    expiry: str,
-) -> list[OptionLeg] | None:
-    """Build vertical spread (2 legs).
-
-    Bullish (Bull Put Spread): sell higher Put + buy lower Put
-    Bearish (Bear Call Spread): sell lower Call + buy higher Call
-    """
-    if chain_df.empty:
-        return None
-
-    expiry_match = chain_df["strike_time"].astype(str).str[:10] == expiry
-
-    if direction == "bullish":
-        puts = chain_df[expiry_match & (chain_df["option_type"].str.upper() == "PUT")].copy()
-        if "open_interest" in puts.columns:
-            puts = puts[puts["open_interest"] >= MIN_OI]
-        if len(puts) < 2:
-            return None
-        puts = puts.sort_values("strike_price", ascending=False)
-        # Sell ATM/slightly OTM put, buy further OTM put
-        atm_puts = puts[puts["strike_price"] <= price]
-        if len(atm_puts) < 2:
-            return None
-        sell_leg = atm_puts.iloc[0]
-        buy_leg = atm_puts.iloc[1]
-        return [
-            OptionLeg(
-                side="sell", option_type="put",
-                strike=float(sell_leg["strike_price"]),
-                pct_from_price=(float(sell_leg["strike_price"]) - price) / price * 100,
-                moneyness=classify_moneyness(float(sell_leg["strike_price"]), price, "PUT"),
-            ),
-            OptionLeg(
-                side="buy", option_type="put",
-                strike=float(buy_leg["strike_price"]),
-                pct_from_price=(float(buy_leg["strike_price"]) - price) / price * 100,
-                moneyness=classify_moneyness(float(buy_leg["strike_price"]), price, "PUT"),
-            ),
-        ]
-    else:  # bearish
-        calls = chain_df[expiry_match & (chain_df["option_type"].str.upper() == "CALL")].copy()
-        if "open_interest" in calls.columns:
-            calls = calls[calls["open_interest"] >= MIN_OI]
-        if len(calls) < 2:
-            return None
-        calls = calls.sort_values("strike_price")
-        atm_calls = calls[calls["strike_price"] >= price]
-        if len(atm_calls) < 2:
-            return None
-        sell_leg = atm_calls.iloc[0]
-        buy_leg = atm_calls.iloc[1]
-        return [
-            OptionLeg(
-                side="sell", option_type="call",
-                strike=float(sell_leg["strike_price"]),
-                pct_from_price=(float(sell_leg["strike_price"]) - price) / price * 100,
-                moneyness=classify_moneyness(float(sell_leg["strike_price"]), price, "CALL"),
-            ),
-            OptionLeg(
-                side="buy", option_type="call",
-                strike=float(buy_leg["strike_price"]),
-                pct_from_price=(float(buy_leg["strike_price"]) - price) / price * 100,
-                moneyness=classify_moneyness(float(buy_leg["strike_price"]), price, "CALL"),
-            ),
-        ]
-
-
 # ── Liquidity check ──
+
+
+def _has_snapshot_data(chain_df: pd.DataFrame) -> bool:
+    """Check if chain has real snapshot data (OI/Greeks) or just structure."""
+    if chain_df.empty or "open_interest" not in chain_df.columns:
+        return False
+    return (chain_df["open_interest"] > 0).any()
 
 
 def _check_liquidity(chain_df: pd.DataFrame, price: float) -> str | None:
     """Return liquidity warning or None."""
     if chain_df.empty:
         return "期权链为空, 无法评估流动性"
+
+    if not _has_snapshot_data(chain_df):
+        return "期权链快照数据不可用, 无法评估 OI/流动性, 建议下单前核实"
 
     warnings = []
     if "open_interest" in chain_df.columns:
@@ -321,6 +191,8 @@ def recommend(
     chain_df: pd.DataFrame | None = None,
     expiry_dates: list[dict] | None = None,
     gamma_wall: GammaWallResult | None = None,
+    vwap: float = 0.0,
+    chase_risk_cfg: dict | None = None,
 ) -> OptionRecommendation:
     """Generate option recommendation based on regime, levels, and chain data."""
     price = regime.price
@@ -331,7 +203,7 @@ def recommend(
     direction = _decide_direction(regime, vp)
 
     # Check regime/filter-based wait conditions first.
-    # Chain/expiry availability is handled explicitly below (lines 357+)
+    # Chain/expiry availability is handled explicitly below
     # to preserve direction hint in the wait recommendation.
     wait, reasons, conditions = should_wait(
         regime, filters, vp,
@@ -356,8 +228,50 @@ def recommend(
             wait_conditions=["等待价格突破关键位后再入场"],
         )
 
-    # Expiry
+    # ── Chase risk check ──
+    chase_risk = ChaseRiskResult()
+    prefer_atm = False
+    if direction != "neutral" and vwap > 0:
+        cfg = chase_risk_cfg or {}
+        now_hkt = datetime.now(timezone(timedelta(hours=8)))
+        is_afternoon = now_hkt.hour >= 12
+        chase_risk = assess_chase_risk(
+            price=price,
+            vwap=vwap,
+            vp=vp,
+            direction=direction,
+            is_afternoon=is_afternoon,
+            vwap_moderate_pct=cfg.get("vwap_moderate_pct", 2.0),
+            vwap_high_pct=cfg.get("vwap_high_pct", 3.5),
+            va_moderate_pct=cfg.get("va_moderate_pct", 2.5),
+            va_high_pct=cfg.get("va_high_pct", 4.0),
+            afternoon_tighten_pct=cfg.get("afternoon_tighten_pct", 0.5),
+        )
+        if chase_risk.level == "high":
+            dir_hint = "看多" if direction == "bullish" else "看空"
+            risk_parts = [f"方向偏{dir_hint}, 但价格已过度延伸"]
+            risk_parts.extend(chase_risk.reasons)
+            return OptionRecommendation(
+                action="wait",
+                direction=direction,
+                rationale=f"方向偏{dir_hint}, 但追高风险过大",
+                risk_note="\n".join(risk_parts),
+                wait_conditions=[
+                    f"等待回调至 VWAP {chase_risk.pullback_target:,.2f} 附近再入场",
+                ],
+            )
+        if chase_risk.level == "moderate":
+            prefer_atm = True
+
+    # Expiry + DTE
     expiry = select_expiry(expiry_dates or [])
+    dte = 0
+    if expiry:
+        try:
+            exp_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+            dte = (exp_date - date.today()).days
+        except (ValueError, TypeError):
+            pass
 
     # No expiry or no chain → wait (recommendations require specific strike + expiry)
     if not expiry or not has_chain:
@@ -382,24 +296,35 @@ def recommend(
     # Liquidity check
     liq_warn = _check_liquidity(chain_df, price)
 
-    # Try spread for RANGE regime with high IV
-    if regime.regime == RegimeType.RANGE:
+    # Try spread for RANGE regime (skip if DTE <= 3 — gamma risk too high for spreads)
+    if regime.regime == RegimeType.RANGE and dte > 3:
         spread_legs = recommend_spread(direction, chain_df, price, expiry)
         if spread_legs:
             spread_action = "bull_put_spread" if direction == "bullish" else "bear_call_spread"
-            return OptionRecommendation(
-                action=spread_action,
-                direction=direction,
-                expiry=expiry,
-                legs=spread_legs,
-                moneyness=spread_legs[0].moneyness,
-                rationale=_build_rationale(regime, vp, direction, spread=True),
-                risk_note=_build_risk_note(regime, vp, direction),
-                liquidity_warning=liq_warn,
-            )
+            metrics = _calculate_spread_metrics(spread_legs, spread_action)
+            # P1: Check EV before recommending spread
+            if metrics and _is_positive_ev(metrics):
+                return OptionRecommendation(
+                    action=spread_action,
+                    direction=direction,
+                    expiry=expiry,
+                    legs=spread_legs,
+                    moneyness=spread_legs[0].moneyness,
+                    rationale=_build_rationale(regime, vp, direction, spread=True),
+                    risk_note=_build_risk_note(regime, vp, direction, chase_risk=chase_risk, dte=dte),
+                    liquidity_warning=liq_warn,
+                    spread_metrics=metrics,
+                    dte=dte,
+                )
+            else:
+                logger.info(
+                    "Spread rejected for %s: R:R=%.3f, falling through to single leg",
+                    regime.price,
+                    metrics.risk_reward_ratio if metrics else 0.0,
+                )
 
     # Single leg
-    leg = recommend_single_leg(direction, chain_df, price, expiry)
+    leg = recommend_single_leg(direction, chain_df, price, expiry, prefer_atm=prefer_atm)
     if leg:
         action = "call" if direction == "bullish" else "put"
         return OptionRecommendation(
@@ -409,8 +334,9 @@ def recommend(
             legs=[leg],
             moneyness=leg.moneyness,
             rationale=_build_rationale(regime, vp, direction),
-            risk_note=_build_risk_note(regime, vp, direction),
+            risk_note=_build_risk_note(regime, vp, direction, chase_risk=chase_risk, dte=dte),
             liquidity_warning=liq_warn,
+            dte=dte,
         )
 
     # No suitable strike found → wait
@@ -447,7 +373,10 @@ def _build_rationale(
             parts.append(f"价格 {regime.price:,.2f} 突破 VAH {vp.vah:,.2f}")
         else:
             parts.append(f"价格 {regime.price:,.2f} 跌破 VAL {vp.val:,.2f}")
-        parts.append(f"RVOL {regime.rvol:.2f} 量能配合")
+        if "Momentum" in (regime.details or ""):
+            parts.append(f"RVOL {regime.rvol:.2f} 偏低但价格动量确认")
+        else:
+            parts.append(f"RVOL {regime.rvol:.2f} 量能配合")
 
     elif regime.regime == RegimeType.RANGE:
         if direction == "bullish":
@@ -460,16 +389,47 @@ def _build_rationale(
     return "; ".join(parts)
 
 
-def _build_risk_note(regime: RegimeResult, vp: VolumeProfileResult, direction: str) -> str:
+def _build_risk_note(
+    regime: RegimeResult,
+    vp: VolumeProfileResult,
+    direction: str,
+    chase_risk: ChaseRiskResult | None = None,
+    dte: int = 0,
+) -> str:
     """Build risk note / defense line."""
     parts = []
     if regime.regime == RegimeType.BREAKOUT:
-        parts.append(f"防守线: VWAP, 跌破建议止损")
-        parts.append(f"失效条件: RVOL 回落至 1.0 以下")
+        parts.append("防守线: VWAP, 跌破建议止损")
+        if "Momentum" in (regime.details or ""):
+            parts.append("失效条件: 量能持续萎缩且价格回落至 VA 内")
+        else:
+            parts.append("失效条件: RVOL 回落至 1.0 以下")
     elif regime.regime == RegimeType.RANGE:
         if direction == "bullish":
             parts.append(f"止损: 跌破 VAL {vp.val:,.2f}")
         else:
             parts.append(f"止损: 突破 VAH {vp.vah:,.2f}")
         parts.append("失效条件: 带量突破 VA 边界转为 BREAKOUT")
+
+    # DTE risk warnings
+    if dte > 0:
+        if dte <= 3:
+            parts.append(f"仅剩 {dte} DTE, Gamma 风险极高, 价格小幅波动可能导致大幅亏损")
+        elif dte <= 5:
+            parts.append(f"仅剩 {dte} DTE, Theta 衰减加速, 持仓过夜风险偏高")
+
+    # Chase risk warnings
+    if chase_risk and chase_risk.level == "moderate":
+        chase_parts = []
+        if chase_risk.vwap_dev_pct > 0:
+            chase_parts.append(f"VWAP 偏离 {chase_risk.vwap_dev_pct:.1f}%")
+        if chase_risk.va_dist_pct > 0:
+            chase_parts.append(f"VA 边界距离 {chase_risk.va_dist_pct:.1f}%")
+        parts.append("⚠️ 追高警告: " + ", ".join(chase_parts))
+        parts.append("建议 ATM 而非 OTM，降低 Theta 风险")
+        for r in chase_risk.reasons:
+            if "午后" in r:
+                parts.append("午后信号可靠性较低，建议缩小仓位")
+                break
+
     return "; ".join(parts)

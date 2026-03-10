@@ -87,8 +87,9 @@ class HKCollector:
         start = (today - timedelta(days=days + 3)).strftime("%Y-%m-%d")  # Extra buffer for weekends/holidays
         end = today.strftime("%Y-%m-%d")
 
-        # 331 bars/day * days, plus buffer
-        max_count = min(days * 340 + 100, 5000)
+        # Futu returns OLDEST max_count bars when start+end given
+        # Need room for (days) historical + today + weekend/holiday buffer
+        max_count = min((days + 3) * 340, 5000)
 
         ret, data, _ = ctx.request_history_kline(
             symbol, ktype=KLType.K_1M, start=start, end=end, max_count=max_count,
@@ -116,31 +117,39 @@ class HKCollector:
     def get_option_chain_with_oi(
         self,
         symbol: str,
-        index_option_type: str = "NORMAL",
+        index_option_type: str | None = None,
         strike_time: str | None = None,
     ) -> pd.DataFrame:
         """Get option chain with real OI from snapshot.
 
         Args:
             symbol: underlying symbol
-            index_option_type: NORMAL or MINI
+            index_option_type: NORMAL or MINI (index options only); None for stock options
             strike_time: optional expiry date filter (e.g. "2026-03-18") to reduce API calls
 
         Returns DataFrame with columns: code, option_type, strike_price, strike_time,
         open_interest, implied_volatility, delta, gamma, theta, vega, last_price, volume.
+        Falls back to chain structure without OI/Greeks if snapshot fails.
         """
         ctx = self._ensure_ctx()
-        idx_type = getattr(IndexOptionType, index_option_type, IndexOptionType.NORMAL)
 
-        # Get chain structure
-        kwargs = {"index_option_type": idx_type}
+        # Get chain structure — only pass index_option_type for index options
+        kwargs: dict = {}
+        if index_option_type:
+            idx_type = getattr(IndexOptionType, index_option_type, IndexOptionType.NORMAL)
+            kwargs["index_option_type"] = idx_type
         if strike_time:
-            kwargs["strike_time"] = strike_time
+            kwargs["start"] = strike_time
+            kwargs["end"] = strike_time
         ret, chain = ctx.get_option_chain(symbol, **kwargs)
         if ret != RET_OK:
-            raise RuntimeError(f"get_option_chain failed: {chain}")
-        if chain is None or chain.empty:
+            logger.warning("get_option_chain failed for %s: %s", symbol, chain)
             return pd.DataFrame()
+        if chain is None or chain.empty:
+            logger.warning("get_option_chain returned empty for %s (kwargs=%s)", symbol, kwargs)
+            return pd.DataFrame()
+
+        logger.debug("get_option_chain for %s: %d codes", symbol, len(chain))
 
         # Get real OI + Greeks from snapshot (batch in groups of 200)
         all_codes = chain["code"].tolist()
@@ -162,26 +171,46 @@ class HKCollector:
                         "last_price": float(row.get("last_price", 0) or 0),
                         "snap_volume": int(row.get("volume", 0) or 0),
                     })
+            else:
+                logger.warning("get_market_snapshot failed for %s option batch %d: ret=%s", symbol, i, ret2)
+
+        base_cols = ["code", "option_type", "strike_price", "strike_time"]
 
         if not snapshot_rows:
-            return pd.DataFrame()
+            # Fallback: return chain structure without OI/Greeks
+            logger.warning(
+                "No snapshot data for %s options (%d codes) — returning chain structure only",
+                symbol, len(all_codes),
+            )
+            result = chain[base_cols].copy()
+            for col in ["open_interest", "implied_volatility", "delta", "gamma", "theta", "vega", "last_price", "snap_volume"]:
+                result[col] = 0
+            return result
 
         snap_df = pd.DataFrame(snapshot_rows)
 
         # Merge chain info with snapshot
-        merged = chain[["code", "option_type", "strike_price", "strike_time"]].merge(
-            snap_df, on="code", how="left",
-        )
+        merged = chain[base_cols].merge(snap_df, on="code", how="left")
         return merged
 
-    def get_option_expiration_dates(self, symbol: str, index_option_type: str = "NORMAL") -> list[dict]:
-        """Get available option expiration dates."""
+    def get_option_expiration_dates(self, symbol: str, index_option_type: str | None = None) -> list[dict]:
+        """Get available option expiration dates.
+
+        Args:
+            symbol: underlying symbol
+            index_option_type: NORMAL or MINI (index options only); None for stock options
+        """
         ctx = self._ensure_ctx()
-        idx_type = getattr(IndexOptionType, index_option_type, IndexOptionType.NORMAL)
-        ret, data = ctx.get_option_expiration_date(symbol, index_option_type=idx_type)
+        kwargs: dict = {}
+        if index_option_type:
+            idx_type = getattr(IndexOptionType, index_option_type, IndexOptionType.NORMAL)
+            kwargs["index_option_type"] = idx_type
+        ret, data = ctx.get_option_expiration_date(symbol, **kwargs)
         if ret != RET_OK:
-            raise RuntimeError(f"get_option_expiration_date failed: {data}")
+            logger.warning("get_option_expiration_date failed for %s: %s", symbol, data)
+            return []
         if data is None or data.empty:
+            logger.warning("get_option_expiration_date returned empty for %s", symbol)
             return []
         return data.to_dict("records")
 
