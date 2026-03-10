@@ -9,7 +9,7 @@ futu:
 
 redis:
   url: "redis://localhost:6379"
-  max_connections: 50
+  max_connections: 100
 
 polling:
   stock_quote_interval_seconds: 10

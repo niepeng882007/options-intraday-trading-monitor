@@ -31,6 +31,7 @@ class RedisStore:
         self._pubsub: aioredis.client.PubSub | None = None
         self._backoff_base = 1
         self._backoff_max = 60
+        self._semaphore = asyncio.Semaphore(max_connections // 2 or 5)
 
     async def connect(self) -> None:
         self._pool = aioredis.ConnectionPool.from_url(
@@ -58,12 +59,14 @@ class RedisStore:
     # ── Quote operations ──
 
     async def publish_quote(self, quote: Any) -> None:
-        client = await self._ensure_connected()
-        data = asdict(quote) if hasattr(quote, "__dataclass_fields__") else quote
-        key = f"{QUOTE_HASH_PREFIX}{data['symbol']}"
-        await client.hset(key, mapping={k: json.dumps(v) for k, v in data.items()})
-        channel = f"{QUOTE_CHANNEL_PREFIX}{data['symbol']}"
-        await client.publish(channel, json.dumps(data))
+        async with self._semaphore:
+            client = await self._ensure_connected()
+            data = asdict(quote) if hasattr(quote, "__dataclass_fields__") else quote
+            key = f"{QUOTE_HASH_PREFIX}{data['symbol']}"
+            pipe = client.pipeline()
+            pipe.hset(key, mapping={k: json.dumps(v) for k, v in data.items()})
+            pipe.publish(f"{QUOTE_CHANNEL_PREFIX}{data['symbol']}", json.dumps(data))
+            await pipe.execute()
 
     async def get_quote(self, symbol: str) -> dict | None:
         client = await self._ensure_connected()
@@ -97,19 +100,22 @@ class RedisStore:
     # ── History (K-line) operations ──
 
     async def publish_history(self, symbol: str, history_json: str) -> None:
-        client = await self._ensure_connected()
-        channel = f"{HISTORY_CHANNEL_PREFIX}{symbol}"
-        await client.publish(channel, history_json)
+        async with self._semaphore:
+            client = await self._ensure_connected()
+            channel = f"{HISTORY_CHANNEL_PREFIX}{symbol}"
+            await client.publish(channel, history_json)
 
     # ── Indicator operations ──
 
     async def publish_indicators(self, symbol: str, timeframe: str, indicators: dict) -> None:
-        client = await self._ensure_connected()
-        key = f"{INDICATOR_HASH_PREFIX}{symbol}:{timeframe}"
-        await client.hset(key, mapping={k: json.dumps(v) for k, v in indicators.items()})
-        channel = f"{INDICATOR_CHANNEL_PREFIX}{symbol}"
-        payload = {"symbol": symbol, "timeframe": timeframe, **indicators}
-        await client.publish(channel, json.dumps(payload))
+        async with self._semaphore:
+            client = await self._ensure_connected()
+            key = f"{INDICATOR_HASH_PREFIX}{symbol}:{timeframe}"
+            payload = {"symbol": symbol, "timeframe": timeframe, **indicators}
+            pipe = client.pipeline()
+            pipe.hset(key, mapping={k: json.dumps(v) for k, v in indicators.items()})
+            pipe.publish(f"{INDICATOR_CHANNEL_PREFIX}{symbol}", json.dumps(payload))
+            await pipe.execute()
 
     async def get_indicators(self, symbol: str, timeframe: str) -> dict | None:
         client = await self._ensure_connected()
@@ -121,14 +127,16 @@ class RedisStore:
     # ── Cooldown / rate-limit ──
 
     async def set_cooldown(self, strategy_id: str, symbol: str, ttl_seconds: int) -> None:
-        client = await self._ensure_connected()
-        key = f"{COOLDOWN_KEY_PREFIX}{strategy_id}:{symbol}"
-        await client.set(key, "1", ex=ttl_seconds)
+        async with self._semaphore:
+            client = await self._ensure_connected()
+            key = f"{COOLDOWN_KEY_PREFIX}{strategy_id}:{symbol}"
+            await client.set(key, "1", ex=ttl_seconds)
 
     async def is_in_cooldown(self, strategy_id: str, symbol: str) -> bool:
-        client = await self._ensure_connected()
-        key = f"{COOLDOWN_KEY_PREFIX}{strategy_id}:{symbol}"
-        return await client.exists(key) > 0
+        async with self._semaphore:
+            client = await self._ensure_connected()
+            key = f"{COOLDOWN_KEY_PREFIX}{strategy_id}:{symbol}"
+            return await client.exists(key) > 0
 
     # ── Pub/Sub subscription ──
 
