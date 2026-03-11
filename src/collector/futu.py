@@ -202,7 +202,7 @@ class FutuCollector(BaseCollector):
             self._reset_thread_pool()
             raise
 
-    async def _retry(self, fn, *args, retries: int = MAX_RETRIES):
+    async def _retry(self, fn, *args, retries: int = MAX_RETRIES, reconnect_on_fail: bool = True):
         backoff = BACKOFF_BASE_SECONDS
         last_exc: Exception | None = None
         for attempt in range(retries):
@@ -216,8 +216,8 @@ class FutuCollector(BaseCollector):
                     retries,
                     exc,
                 )
-                # Reset connection on failure
-                self._ctx = None
+                if reconnect_on_fail:
+                    self._ctx = None
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
         raise RuntimeError(
@@ -301,13 +301,21 @@ class FutuCollector(BaseCollector):
         if not option_codes:
             return []
 
-        # Fetch snapshots for quotes + Greeks/IV (no subscription needed)
+        # Fetch snapshots in batches of 200 (Futu API limit is 400, use 200 for safety)
+        BATCH_SIZE = 200
         snapshot_map: dict[str, dict] = {}
-        ret2, snapshot_data = ctx.get_market_snapshot(option_codes)
-        if ret2 != RET_OK:
-            raise RuntimeError(f"get_market_snapshot for options failed: {snapshot_data}")
-        if not snapshot_data.empty:
-            snapshot_map = {row["code"]: row for _, row in snapshot_data.iterrows()}
+        for i in range(0, len(option_codes), BATCH_SIZE):
+            batch = option_codes[i : i + BATCH_SIZE]
+            ret2, snapshot_data = ctx.get_market_snapshot(batch)
+            if ret2 != RET_OK:
+                logger.warning(
+                    "get_market_snapshot for options batch %d failed: %s",
+                    i // BATCH_SIZE, snapshot_data,
+                )
+                continue
+            if not snapshot_data.empty:
+                for _, row in snapshot_data.iterrows():
+                    snapshot_map[row["code"]] = row
 
         results: list[OptionQuote] = []
         now = time.time()
@@ -369,7 +377,7 @@ class FutuCollector(BaseCollector):
         cached = cache.get(symbol)
         if cached and now - cached[0] < self._EXPIRY_CACHE_TTL:
             return cached[1]
-        dates = await self._retry(self._fetch_option_expiration_dates, symbol)
+        dates = await self._retry(self._fetch_option_expiration_dates, symbol, reconnect_on_fail=False)
         cache[symbol] = (now, dates)
         return dates
 
@@ -379,7 +387,8 @@ class FutuCollector(BaseCollector):
         expiration: str | None = None,
     ) -> list[OptionQuote]:
         options: list[OptionQuote] = await self._retry(
-            self._fetch_option_chain, symbol, expiration
+            self._fetch_option_chain, symbol, expiration,
+            reconnect_on_fail=False,
         )
         logger.debug(
             "Option chain %s exp=%s: %d contracts",

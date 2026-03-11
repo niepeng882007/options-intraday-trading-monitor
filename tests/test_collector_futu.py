@@ -180,12 +180,18 @@ class TestGetOptionChain:
             "option_area_type": 0,
         }])
         mock_ctx.get_option_chain.return_value = (RET_OK, chain_df)
-        mock_ctx.get_stock_quote.return_value = (RET_OK, pd.DataFrame([{
+        mock_ctx.get_market_snapshot.return_value = (RET_OK, pd.DataFrame([{
             "code": "US.AAPL250321C00150000",
             "last_price": 2.50,
             "bid_price": 2.45,
             "ask_price": 2.55,
             "volume": 5000,
+            "option_implied_volatility": 0,
+            "option_open_interest": 0,
+            "option_delta": None,
+            "option_gamma": None,
+            "option_theta": None,
+            "option_vega": None,
         }]))
 
         options = await c.get_option_chain("AAPL")
