@@ -8,6 +8,59 @@ from src.utils.logger import setup_logger
 logger = setup_logger("us_regime")
 
 
+def detect_regime_transition(
+    original: USRegimeResult,
+    current_rvol: float,
+    current_price: float,
+    vp: VolumeProfileResult,
+    spy_regime: USRegimeType | None = None,
+    prev_close: float = 0.0,
+    pmh: float = 0.0,
+    pml: float = 0.0,
+    gap_and_go_rvol: float = 1.5,
+    trend_day_rvol: float = 1.2,
+    fade_chop_rvol: float = 1.0,
+    rvol_profile=None,
+    gap_significance_threshold: float = 0.3,
+    pm_source: str = "futu",
+) -> tuple[bool, USRegimeResult | None]:
+    """Detect if regime has transitioned from original classification.
+
+    Returns (transitioned, new_regime) — only returns True for meaningful
+    upgrades (UNCLEAR/FADE_CHOP → TREND_DAY/GAP_AND_GO).
+    """
+    if original.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+        return False, None  # already in strong regime, no upgrade needed
+
+    new_regime = classify_us_regime(
+        price=current_price,
+        prev_close=prev_close,
+        rvol=current_rvol,
+        pmh=pmh,
+        pml=pml,
+        vp=vp,
+        spy_regime=spy_regime,
+        gap_and_go_rvol=gap_and_go_rvol,
+        trend_day_rvol=trend_day_rvol,
+        fade_chop_rvol=fade_chop_rvol,
+        rvol_profile=rvol_profile,
+        gap_significance_threshold=gap_significance_threshold,
+        pm_source=pm_source,
+    )
+
+    # Only signal meaningful upgrades
+    upgrades = {
+        USRegimeType.UNCLEAR: (USRegimeType.TREND_DAY, USRegimeType.GAP_AND_GO),
+        USRegimeType.FADE_CHOP: (USRegimeType.TREND_DAY, USRegimeType.GAP_AND_GO),
+    }
+    valid_targets = upgrades.get(original.regime, ())
+    if new_regime.regime in valid_targets and new_regime.confidence >= 0.60:
+        new_regime.details = f"Regime transition: {original.regime.value} → {new_regime.regime.value}; {new_regime.details}"
+        return True, new_regime
+
+    return False, None
+
+
 def regime_to_signal_type(regime: USRegimeType, direction: str) -> str | None:
     """Map US regime + direction to auto-scan signal type.
 
@@ -106,11 +159,11 @@ def classify_us_regime(
     if rvol >= gap_and_go_rvol and pm_breakout:
         direction = "above PMH" if above_pm else "below PML"
         confidence = min(1.0, (rvol - gap_and_go_rvol) / 0.5 * 0.3 + 0.6)
-        # SPY context adjustment
+        # SPY context adjustment (P1-3: asymmetric — boost stronger, penalty milder)
         if spy_regime == USRegimeType.FADE_CHOP:
-            confidence = max(0.1, confidence - 0.2)
-        elif spy_regime == USRegimeType.GAP_AND_GO:
-            confidence = min(1.0, confidence + 0.1)
+            confidence = max(0.1, confidence - 0.15)
+        elif spy_regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+            confidence = min(1.0, confidence + 0.15)
         result = USRegimeResult(
             regime=USRegimeType.GAP_AND_GO, confidence=confidence,
             rvol=rvol, price=price, gap_pct=gap_pct,
@@ -123,8 +176,11 @@ def classify_us_regime(
     if result is None and rvol >= trend_day_rvol and small_gap and outside_va:
         direction = "above VAH" if price > vp.vah else "below VAL"
         confidence = min(1.0, (rvol - trend_day_rvol) / 0.5 * 0.3 + 0.5)
+        # P1-3: SPY context — milder penalty + new boost branch
         if spy_regime == USRegimeType.FADE_CHOP:
-            confidence = max(0.1, confidence - 0.15)
+            confidence = max(0.1, confidence - 0.12)
+        elif spy_regime in (USRegimeType.TREND_DAY, USRegimeType.GAP_AND_GO):
+            confidence = min(1.0, confidence + 0.10)
         result = USRegimeResult(
             regime=USRegimeType.TREND_DAY, confidence=confidence,
             rvol=rvol, price=price, gap_pct=gap_pct,
@@ -145,21 +201,36 @@ def classify_us_regime(
             details=f"RVOL {rvol:.2f} < {fade_chop_rvol:.2f} ({threshold_label}), price {reason}",
         )
 
-    # ── UNCLEAR ──
+    # ── UNCLEAR (P0-3: sub-type differentiation) ──
     if result is None:
         parts = []
-        if trend_day_rvol > rvol >= fade_chop_rvol:
-            parts.append(f"RVOL {rvol:.2f} in neutral zone")
+        lean = "neutral"
+        confidence = 0.30  # default
+
         if inside_va and rvol >= trend_day_rvol:
+            # Sub-type 2: high volume but price in VA — potential breakout buildup
             parts.append("High volume but price in value area")
-        if outside_va and rvol < fade_chop_rvol:
+            confidence = 0.40
+            lean = "bullish" if price > vp.poc else "bearish"
+        elif outside_va and rvol < fade_chop_rvol:
+            # Sub-type 3: price outside VA but low volume — likely false breakout
             parts.append("Price outside VA but low volume")
+            confidence = 0.25
+            lean = "bearish" if price > vp.vah else "bullish"  # lean reversal
+        elif trend_day_rvol > rvol >= fade_chop_rvol:
+            # Sub-type 1: RVOL in neutral zone — could go either way
+            parts.append(f"RVOL {rvol:.2f} in neutral zone")
+            confidence = 0.30
+        else:
+            parts.append("Mixed signals")
+
         result = USRegimeResult(
-            regime=USRegimeType.UNCLEAR, confidence=0.3,
+            regime=USRegimeType.UNCLEAR, confidence=confidence,
             rvol=rvol, price=price, gap_pct=gap_pct,
             spy_regime=spy_regime,
             adaptive_thresholds=adaptive_info,
             details="; ".join(parts) if parts else "Mixed signals",
+            lean=lean,
         )
 
     # ── VP thin data penalty ──
