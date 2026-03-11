@@ -18,6 +18,10 @@ logger = setup_logger("common_telegram")
 
 _esc = html.escape
 
+# Well-known bot_data keys for predictors (used by build_combined_keyboard)
+_US_PREDICTOR_KEY = "us_predictor"
+_HK_PREDICTOR_KEY = "hk_predictor"
+
 
 async def _retry_send(coro_fn, max_retries=3):
     """Retry a Telegram send on transient network errors."""
@@ -121,10 +125,12 @@ async def handle_add_base(
     if added:
         display = f"{name} ({symbol})" if name else symbol
         hint = symbol_hint or symbol
+        markup = _refreshed_keyboard(context.bot_data)
         await update.message.reply_text(
             f"✅ 已添加 <b>{_esc(display)}</b> 到{market_label}监控列表\n"
             f"现在直接发送 <code>{hint}</code> 即可查看完整剧本。",
             parse_mode="HTML",
+            reply_markup=markup,
         )
     else:
         await update.message.reply_text(
@@ -150,9 +156,11 @@ async def handle_remove_base(
     removed = predictor.watchlist.remove(symbol)
     if removed:
         display = f"{name} ({symbol})" if name != symbol else symbol
+        markup = _refreshed_keyboard(context.bot_data)
         await update.message.reply_text(
             f"✅ 已移除 <b>{_esc(display)}</b>",
             parse_mode="HTML",
+            reply_markup=markup,
         )
     else:
         await update.message.reply_text(f"{_esc(symbol)} 不在监控列表中")
@@ -203,6 +211,45 @@ async def handle_watchlist_base(
     )
 
 
+def _refreshed_keyboard(bot_data: dict) -> ReplyKeyboardMarkup | None:
+    """Return updated combined keyboard if previously activated, else None."""
+    if not bot_data.get("_kb_active"):
+        return None
+    _, markup = build_combined_keyboard(
+        us_predictor_key=_US_PREDICTOR_KEY,
+        hk_predictor_key=_HK_PREDICTOR_KEY,
+        bot_data=bot_data,
+    )
+    if isinstance(markup, ReplyKeyboardRemove):
+        return None
+    return markup
+
+
+def _append_symbol_rows(
+    rows: list[list[KeyboardButton]],
+    items: list[dict],
+    cols: int = 4,
+    strip_prefix: str = "",
+) -> list[str]:
+    """Append keyboard button rows for a list of watchlist items.
+
+    Returns list of display symbols (for text message).
+    """
+    symbols: list[str] = []
+    row: list[KeyboardButton] = []
+    for item in items:
+        symbol = item["symbol"]
+        display = symbol.removeprefix(strip_prefix) if strip_prefix else symbol
+        symbols.append(display)
+        row.append(KeyboardButton(display))
+        if len(row) == cols:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return symbols
+
+
 def build_combined_keyboard(
     us_predictor_key: str = "",
     hk_predictor_key: str = "",
@@ -213,50 +260,33 @@ def build_combined_keyboard(
     Returns (message_text, reply_markup).
     """
     rows: list[list[KeyboardButton]] = []
-    sections: list[str] = []
+    lines: list[str] = ["⌨️ <b>快捷键盘已开启</b>", ""]
 
     # US symbols
     us_pred = bot_data.get(us_predictor_key) if bot_data and us_predictor_key else None
     if us_pred:
         us_items = us_pred.watchlist.list_all()
         if us_items:
-            sections.append(f"🇺🇸 US: {len(us_items)} 个标的")
-            row: list[KeyboardButton] = []
-            for item in us_items:
-                row.append(KeyboardButton(item["symbol"]))
-                if len(row) == 4:
-                    rows.append(row)
-                    row = []
-            if row:
-                rows.append(row)
+            # Section header row in keyboard
+            rows.append([KeyboardButton("── US ──")])
+            symbols = _append_symbol_rows(rows, us_items, cols=4)
+            lines.append(f"🇺🇸 <b>US</b>: {', '.join(symbols)}")
 
     # HK symbols
     hk_pred = bot_data.get(hk_predictor_key) if bot_data and hk_predictor_key else None
     if hk_pred:
         hk_items = hk_pred.watchlist.list_all()
         if hk_items:
-            sections.append(f"🇭🇰 HK: {len(hk_items)} 个标的")
-            row = []
-            for item in hk_items:
-                # Use numeric code for cleaner display (09988 instead of HK.09988)
-                symbol = item["symbol"]
-                display = symbol.replace("HK.", "") if symbol.startswith("HK.") else symbol
-                row.append(KeyboardButton(display))
-                if len(row) == 4:
-                    rows.append(row)
-                    row = []
-            if row:
-                rows.append(row)
+            rows.append([KeyboardButton("── HK ──")])
+            symbols = _append_symbol_rows(rows, hk_items, cols=4, strip_prefix="HK.")
+            lines.append(f"🇭🇰 <b>HK</b>: {', '.join(symbols)}")
 
-    if not rows:
+    if len(rows) == 0:
         return "监控列表为空，请先添加标的。", ReplyKeyboardRemove()
 
+    lines.append("")
+    lines.append("点击按钮直接查询 | /kboff 关闭键盘")
+
     markup = ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False)
-    text = (
-        "⌨️ <b>快捷键盘已开启</b>\n"
-        + "\n".join(sections)
-        + "\n\n点击按钮直接查询，无需手动输入代码。\n"
-        "发送 /kboff 关闭键盘。"
-    )
-    return text, markup
+    return "\n".join(lines), markup
 

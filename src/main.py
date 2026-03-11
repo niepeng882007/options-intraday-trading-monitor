@@ -793,6 +793,7 @@ class OptionsMonitor:
     async def _cmd_keyboard(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """/kb or /start — show combined quick-access keyboard."""
         from src.common.telegram_handlers import build_combined_keyboard
+        context.bot_data["_kb_active"] = True
         text, markup = build_combined_keyboard(
             us_predictor_key="us_predictor",
             hk_predictor_key="hk_predictor",
@@ -803,6 +804,7 @@ class OptionsMonitor:
     async def _cmd_keyboard_off(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """/kboff — hide quick-access keyboard."""
         from telegram import ReplyKeyboardRemove
+        context.bot_data["_kb_active"] = False
         await update.message.reply_text(
             "⌨️ 快捷键盘已关闭。发送 /kb 重新开启。",
             reply_markup=ReplyKeyboardRemove(),
