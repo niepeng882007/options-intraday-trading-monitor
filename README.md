@@ -1,17 +1,16 @@
 # Options Intraday Trading Monitor
 
-美股实时策略监控 + US Playbook + HK Playbook 的 Telegram 交易辅助系统。
+US Playbook + HK Playbook 的 Telegram 期权交易辅助系统。
 
 ## 模块概览
 
-### 美股实时监控 (`src/main.py`)
+### 合并入口 (`src/main.py`)
 
-- 基于 `collector -> indicator -> strategy -> notification -> store` 的异步流水线
-- 支持 `Futu OpenD` 推送模式和 `Yahoo Finance` 轮询回退
-- 指标包含 `RSI / MACD / EMA / ATR / VWAP / Bollinger Bands / ADX / Stochastic`
-- 策略使用 `config/strategies/` 下的 YAML，支持热更新
-- 状态机覆盖 `WATCHING -> ENTRY_TRIGGERED -> HOLDING -> EXIT_TRIGGERED`
-- 通过 Telegram 推送入场/出场信号，并支持命令交互
+- 创建共享 `FutuCollector`，初始化 `USPredictor` + `HKPredictor`
+- 单一 Telegram Application 注册两个模块的 handler
+- APScheduler 调度 US + HK 自动扫描
+- `/kb` 快捷键盘、`/kboff` 关闭键盘
+- 优雅关闭 (SIGTERM/SIGINT)
 
 ### US Playbook (`src/us_playbook/`)
 
@@ -29,17 +28,16 @@
 - Regime 分类为 `BREAKOUT / RANGE / WHIPSAW / UNCLEAR`
 - 指数支持 `Gamma Wall / Max Pain`
 - 集成到 `src/main.py` 时可启用自动扫描；独立运行模式以按需查询为主
-- 盘口与 `orderbook` 分析模块已存在，当前 README 只记录公开交互入口
 
 ## 运行模式
 
 | 模式 | 命令 | 说明 |
 | ------ | ------ | ------ |
-| 集成模式 | `python -m src.main` | 启动美股实时监控，并集成 US Playbook 与 HK Playbook Telegram 入口；US/HK 自动扫描也在这里调度 |
+| 集成模式 | `python -m src.main` | 启动 US Playbook 与 HK Playbook 合并入口；US/HK 自动扫描也在这里调度 |
 | US 独立模式 | `python -m src.us_playbook` | 启动 US Predictor，支持文本查询和自动扫描 |
-| HK 独立模式 | `python -m src.hk` | 启动 HK Playbook，当前实现为按需查询模式，不做定时推送 |
-| 美股回测 | `python -m src.backtest` | 回测美股策略 |
+| HK 独立模式 | `python -m src.hk` | 启动 HK Playbook，按需查询模式，不做定时推送 |
 | HK 回测 | `python -m src.hk.backtest` | 回测 HK Playbook 的 VP / Regime / 交易模拟 |
+| US 回测 | `python -m src.us_playbook.backtest` | 回测 US Playbook 的 VP / Regime / 交易模拟 |
 
 ## 快速开始
 
@@ -73,7 +71,7 @@ python -m src.hk
 
 ```bash
 docker compose up -d
-docker compose logs -f monitor
+docker compose logs -f playbook
 ```
 
 ### 5. 测试
@@ -87,36 +85,16 @@ pytest tests/test_us_playbook.py -v
 ### 6. 回测
 
 ```bash
-# 美股
-python -m src.backtest
-
 # HK
 python -m src.hk.backtest -d 30
+
+# US
+python -m src.us_playbook.backtest -d 30
 ```
 
 ## Telegram 交互
 
-### 主监控命令
-
-| 命令 | 功能 |
-| ------ | ------ |
-| `/status` | 查看系统状态、活跃策略、持仓与静默状态 |
-| `/market` | 查看当前监控标的实时行情 |
-| `/chain AAPL 230 C 0321` | 查询单个期权合约报价 |
-| `/strategies` | 列出所有策略及启用状态 |
-| `/enable <strategy_id>` | 启用策略 |
-| `/disable <strategy_id>` | 禁用策略 |
-| `/pause 30` | 静默通知指定分钟数 |
-| `/history` | 查看今日信号记录 |
-| `/confirm <signal_id> <price>` | 确认建仓，价格填底层股票价格 |
-| `/skip <signal_id>` | 跳过待确认信号 |
-| `/detail <signal_id>` | 查看缓存中的信号指标细节 |
-| `/test` | 发送测试入场/出场提醒，验证 Telegram 链路 |
-| `/conn` | 查看 Futu 连接状态与诊断信息 |
-
 ### US Playbook 触发词
-
-US Playbook 当前以文本触发为主，公开入口如下：
 
 | 输入 | 功能 |
 | ------ | ------ |
@@ -135,8 +113,6 @@ US Playbook 当前以文本触发为主，公开入口如下：
 
 ### HK Playbook 触发词
 
-HK 模块当前同样以文本触发为主，公开入口如下：
-
 | 输入 | 功能 |
 | ------ | ------ |
 | `09988` / `HK09988` / `HK.09988` | 直接生成该标的完整 HK Playbook |
@@ -151,6 +127,13 @@ HK 模块当前同样以文本触发为主，公开入口如下：
 - 默认扫描窗口为 `09:35-12:00 HKT` 与 `13:05-15:45 HKT`
 - 默认每 `180s` 扫描一次
 - 频控规则包括同信号 `30` 分钟冷却、单 session 最多 `2` 次、单日最多 `3` 次
+
+### 快捷键盘
+
+| 命令 | 功能 |
+| ------ | ------ |
+| `/kb` 或 `/start` | 显示 US + HK 合并快捷键盘 |
+| `/kboff` | 关闭快捷键盘 |
 
 ## 动态 Watchlist
 
@@ -183,8 +166,6 @@ US 与 HK 的 watchlist 都不是只读 YAML 配置。
 
 | 文件 | 用途 |
 | ------ | ------ |
-| `config/settings.yaml` | 主监控配置，包含数据源、轮询、Telegram、Redis、SQLite 等 |
-| `config/strategies/` | 美股实时监控策略 YAML，支持热更新 |
 | `config/us_playbook_settings.yaml` | US Playbook 的 watchlist、VP、RVOL、Regime、auto-scan、期权建议参数 |
 | `config/us_calendar.yaml` | US 宏观日历与假期 |
 | `config/hk_settings.yaml` | HK 模块的 watchlist、VP、RVOL、Regime、auto-scan、simulation、gamma wall 等 |
