@@ -1,8 +1,9 @@
-"""US Playbook — format aggregated playbook messages (HK-style 4-section layout)."""
+"""US Playbook — format aggregated playbook messages (institutional-grade intraday playbook)."""
 
 from __future__ import annotations
 
 import html
+from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -28,7 +29,7 @@ from src.common.types import (
     QuoteSnapshot,
     VolumeProfileResult,
 )
-from src.us_playbook import KeyLevels, USPlaybookResult, USRegimeResult, USRegimeType
+from src.us_playbook import KeyLevels, MarketTone, USPlaybookResult, USRegimeResult, USRegimeType
 from src.utils.logger import setup_logger
 
 logger = setup_logger("us_playbook")
@@ -87,6 +88,36 @@ REGIME_STRATEGY = {
 }
 
 
+@dataclass
+class ActionPlan:
+    label: str           # "A" / "B" / "C"
+    name: str            # e.g., "趋势回调做多"
+    emoji: str           # "📈" / "📉" / "⚡"
+    is_primary: bool
+    logic: str           # 一句话逻辑
+    direction: str       # "bullish" / "bearish"
+    trigger: str         # 触发条件
+    entry: float | None
+    entry_action: str    # "做多" / "做空"
+    stop_loss: float | None
+    stop_loss_reason: str
+    tp1: float | None
+    tp1_label: str       # "VAH" / "POC" etc.
+    tp2: float | None
+    tp2_label: str
+    rr_ratio: float
+    option_line: str | None = None  # 压缩合约行
+
+
+def _calculate_rr(entry: float | None, stop_loss: float | None, take_profit: float | None) -> float:
+    """Calculate risk-reward ratio. Direction auto-detected from entry vs stop_loss."""
+    if entry is None or stop_loss is None or take_profit is None:
+        return 0.0
+    risk = abs(entry - stop_loss)
+    reward = abs(take_profit - entry)
+    return reward / risk if risk > 0 else 0.0
+
+
 def get_regime_strategy(regime: USRegimeType, direction: str) -> str:
     """Direction-aware strategy text for TREND_DAY and GAP_AND_GO."""
     if regime == USRegimeType.TREND_DAY:
@@ -120,6 +151,131 @@ def get_regime_strategy(regime: USRegimeType, direction: str) -> str:
     return REGIME_STRATEGY.get(regime, "")
 
 SECTION_SEP = "─ ─ ─ ─ ─ ─ ─ ─ ─ ─"
+
+# ── Grade bar helper ──
+
+_GRADE_BAR = {
+    "A+": "████████",
+    "A": "███████░",
+    "B+": "██████░░",
+    "B": "████░░░░",
+    "C": "██░░░░░░",
+    "D": "█░░░░░░░",
+}
+
+_GRADE_LABEL = {
+    "A+": "强势对齐",
+    "A": "多数对齐",
+    "B+": "偏向有利",
+    "B": "信号一般",
+    "C": "信号混杂",
+    "D": "高度不确定",
+}
+
+_POSITION_HINT_CN = {
+    "full": "正常仓位",
+    "reduced": "缩减仓位",
+    "minimal": "观望为主，仅参与高确定性机会",
+    "sit_out": "今日回避",
+}
+
+
+def _format_market_tone_section(tone: MarketTone) -> list[str]:
+    """Format Section 0: Market Tone for Telegram HTML."""
+    grade_bar = _GRADE_BAR.get(tone.grade, "????")
+    grade_label = _GRADE_LABEL.get(tone.grade, "")
+    lines: list[str] = []
+
+    lines.append(f"\U0001f4cb <b>市场定调: {tone.grade}</b> {grade_bar} {_esc(grade_label)}")
+
+    # Macro
+    if tone.macro_signal == "clear":
+        lines.append("├ 宏观: ✅ 无重大事件")
+    elif tone.macro_signal == "range_then_trend":
+        lines.append("├ 宏观: ⚠️ FOMC 日 (2PM 前震荡为主)")
+    elif tone.macro_signal == "data_reaction":
+        lines.append("├ 宏观: ⚠️ 数据日 (盘前发布，10AM 后交易)")
+    else:
+        lines.append("├ 宏观: ❌ 受限")
+
+    # Gap
+    gap_pct = tone.gap_pct
+    if tone.gap_signal == "gap_and_go":
+        emoji = "🚀" if gap_pct > 0 else "💥"
+        lines.append(f"├ Gap: {emoji} SPY {gap_pct:+.1f}% 大缺口")
+    elif tone.gap_signal == "gap_fill":
+        lines.append(f"├ Gap: ↔ 小幅缺口 {gap_pct:+.1f}%")
+    else:
+        lines.append(f"├ Gap: ↔ 中性 {gap_pct:+.1f}%")
+
+    # ORB
+    if tone.orb:
+        if tone.orb.confirmed and tone.orb.breakout_direction:
+            dir_label = "上轨" if tone.orb.breakout_direction == "bullish" else "下轨"
+            extra = " 10AM 确认" if tone.orb.reversal_failed else ""
+            lines.append(f"├ ORB: ✅ 突破{dir_label}{extra}")
+        elif tone.orb.high > 0:
+            lines.append(f"├ ORB: ❓ 待确认 ({tone.orb.low:.2f}-{tone.orb.high:.2f})")
+        else:
+            lines.append("├ ORB: ❓ 数据不足")
+    else:
+        lines.append("├ ORB: ❓ 待确认")
+
+    # VWAP
+    if tone.vwap_status:
+        vs = tone.vwap_status
+        slope_arrow = {"rising": "↑", "falling": "↓", "flat": "→"}.get(vs.slope_label, "")
+        pos_cn = "上方" if vs.position == "above" else "下方"
+        # Check consistency
+        consistent = (
+            (vs.slope_label == "rising" and vs.position == "above")
+            or (vs.slope_label == "falling" and vs.position == "below")
+            or vs.slope_label == "flat"
+        )
+        emoji = "✅" if consistent else "❌"
+        conflict_note = "" if consistent else " 矛盾"
+        lines.append(f"├ VWAP: {emoji} SPY 在 VWAP {pos_cn} 斜率{slope_arrow}{conflict_note}")
+    else:
+        lines.append("├ VWAP: ❓ 数据不足")
+
+    # Breadth
+    if tone.breadth:
+        b = tone.breadth
+        if b.alignment_label == "strong_aligned":
+            idx_note = " 指数共振" if b.index_aligned else ""
+            lines.append(f"├ 广度: ✅ {b.aligned_count}/{b.total_count} 同向{idx_note}")
+        elif b.alignment_label == "divergent":
+            lines.append(f"├ 广度: ❌ 分化 ({b.details})")
+        else:
+            lines.append(f"├ 广度: ⚠️ 混合 ({b.details})")
+    else:
+        lines.append("├ 广度: ❓ 数据不足")
+
+    # VIX
+    if tone.vix:
+        v = tone.vix
+        if v.signal == "caution":
+            lines.append(f"├ VIX: ⚠️ {v.level:.1f} ({v.change_pct:+.1f}%) 飙升")
+        elif v.signal == "supportive":
+            lines.append(f"├ VIX: ✅ {v.level:.1f} ({v.change_pct:+.1f}%) 回落中")
+        else:
+            lines.append(f"├ VIX: ↔ {v.level:.1f} ({v.change_pct:+.1f}%)")
+        if v.stale:
+            lines[-1] += " (延迟)"
+
+    # Position hint
+    dir_cn = {"bullish": "顺势做多", "bearish": "顺势做空", "neutral": "方向待定"}.get(
+        tone.direction, ""
+    )
+    pos_cn = _POSITION_HINT_CN.get(tone.position_size_hint, "")
+    if tone.grade in ("A+", "A"):
+        lines.append(f"仓位: {pos_cn}，{dir_cn}")
+    elif tone.grade in ("B+", "B"):
+        lines.append(f"仓位: {pos_cn}")
+    else:
+        lines.append(f"仓位: {pos_cn}")
+
+    return lines
 
 
 
@@ -355,6 +511,38 @@ def _entry_zone_text(
     return None
 
 
+def _entry_zone_distance_warning(
+    price: float,
+    entry_zone_text: str | None,
+    direction: str,
+    vp: VolumeProfileResult,
+    kl: KeyLevels | None = None,
+    gamma_wall: GammaWallResult | None = None,
+) -> str | None:
+    """Warn if current price is far (>1%) from the entry zone center."""
+    if not entry_zone_text or price <= 0:
+        return None
+
+    # Find the nearest key level that forms the entry zone
+    if direction == "bearish":
+        nearby = _nearest_levels(price, "above", vp, kl, gamma_wall, n=2)
+    else:
+        nearby = _nearest_levels(price, "below", vp, kl, gamma_wall, n=2)
+
+    if not nearby:
+        return None
+
+    if len(nearby) >= 2:
+        zone_center = (nearby[0][1] + nearby[1][1]) / 2
+    else:
+        zone_center = nearby[0][1]
+
+    dist_pct = abs(price - zone_center) / price * 100
+    if dist_pct > 1.0:
+        return f"\u26a0\ufe0f 当前价距入场区较远 ({dist_pct:.1f}%)，建议等待回调或放弃本轮"
+    return None
+
+
 def _risk_action_lines(
     rec: OptionRecommendation | None,
     regime: USRegimeResult,
@@ -406,12 +594,23 @@ def _risk_action_lines(
 
     if rec.action == "call":
         if low_dte:
-            nearby = _nearest_levels(regime.price, "below", vp, kl, gamma_wall, n=1)
-            if nearby:
-                stop_name, stop_val = nearby[0]
-                stop_line = f"止损触发: 标的跌破 {stop_name} {stop_val:,.2f} (最近支撑位)"
+            if regime.regime == USRegimeType.FADE_CHOP:
+                # P1-2: FADE_CHOP bullish — skip VAL (entry premise), use deeper support
+                all_below = _nearest_levels(regime.price, "below", vp, kl, gamma_wall, n=3)
+                deeper = [(n, v) for n, v in all_below if n not in ("VAL",)]
+                if deeper:
+                    stop_name, stop_val = deeper[0]
+                    stop_line = f"止损触发: 标的跌破 {stop_name} {stop_val:,.2f} (VAL {vp.val:,.2f} 附近允许短暂 wick)"
+                else:
+                    buffer_val = vp.val * 0.997  # VAL 下方 0.3%
+                    stop_line = f"止损触发: 标的跌破 {buffer_val:,.2f} (VAL {vp.val:,.2f} - 0.3% 缓冲)"
             else:
-                stop_line = "止损触发: 标的跌破 VWAP 或原本突破结构被破坏。"
+                nearby = _nearest_levels(regime.price, "below", vp, kl, gamma_wall, n=1)
+                if nearby:
+                    stop_name, stop_val = nearby[0]
+                    stop_line = f"止损触发: 标的跌破 {stop_name} {stop_val:,.2f} (最近支撑位)"
+                else:
+                    stop_line = "止损触发: 标的跌破 VWAP 或原本突破结构被破坏。"
         else:
             stop_line = "止损触发: 标的跌破 VWAP 或原本突破结构被破坏。"
         lines = [
@@ -425,12 +624,23 @@ def _risk_action_lines(
 
     if rec.action == "put":
         if low_dte:
-            nearby = _nearest_levels(regime.price, "above", vp, kl, gamma_wall, n=1)
-            if nearby:
-                stop_name, stop_val = nearby[0]
-                stop_line = f"止损触发: 标的突破 {stop_name} {stop_val:,.2f} (最近阻力位)"
+            if regime.regime == USRegimeType.FADE_CHOP:
+                # P1-2: FADE_CHOP bearish — skip VAH (entry premise), use deeper resistance
+                all_above = _nearest_levels(regime.price, "above", vp, kl, gamma_wall, n=3)
+                deeper = [(n, v) for n, v in all_above if n not in ("VAH",)]
+                if deeper:
+                    stop_name, stop_val = deeper[0]
+                    stop_line = f"止损触发: 标的突破 {stop_name} {stop_val:,.2f} (VAH {vp.vah:,.2f} 附近允许短暂 wick)"
+                else:
+                    buffer_val = vp.vah * 1.003  # VAH 上方 0.3%
+                    stop_line = f"止损触发: 标的突破 {buffer_val:,.2f} (VAH {vp.vah:,.2f} + 0.3% 缓冲)"
             else:
-                stop_line = "止损触发: 标的重新站回 VWAP 上方或原本下跌结构被破坏。"
+                nearby = _nearest_levels(regime.price, "above", vp, kl, gamma_wall, n=1)
+                if nearby:
+                    stop_name, stop_val = nearby[0]
+                    stop_line = f"止损触发: 标的突破 {stop_name} {stop_val:,.2f} (最近阻力位)"
+                else:
+                    stop_line = "止损触发: 标的重新站回 VWAP 上方或原本下跌结构被破坏。"
         else:
             stop_line = "止损触发: 标的重新站回 VWAP 上方或原本下跌结构被破坏。"
         lines = [
@@ -637,6 +847,431 @@ def _regime_reason_lines(
     return reasons, supports, uncertainties, invalidations
 
 
+# ── Action Plan generation engine ──
+
+
+def _generate_action_plans(
+    regime: USRegimeResult,
+    direction: str,
+    vp: VolumeProfileResult,
+    kl: KeyLevels,
+    gamma_wall: GammaWallResult | None,
+    option_rec: OptionRecommendation | None,
+) -> list[ActionPlan]:
+    """Generate A/B/C action plans based on regime and direction."""
+    price = regime.price
+    option_line = _compact_option_line(option_rec) if option_rec else None
+
+    if regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+        if direction == "bullish":
+            return _plans_trend_bullish(price, vp, kl, gamma_wall, option_line)
+        return _plans_trend_bearish(price, vp, kl, gamma_wall, option_line)
+
+    if regime.regime == USRegimeType.FADE_CHOP:
+        edge, _ = _closest_value_area_edge(price, vp)
+        if edge == "VAH":
+            return _plans_fade_bearish(price, vp, kl, gamma_wall, option_line)
+        return _plans_fade_bullish(price, vp, kl, gamma_wall, option_line)
+
+    # UNCLEAR
+    return _plans_unclear(price, vp, kl, gamma_wall, regime, option_line)
+
+
+def _plans_trend_bullish(
+    price: float, vp: VolumeProfileResult, kl: KeyLevels,
+    gamma_wall: GammaWallResult | None, option_line: str | None,
+) -> list[ActionPlan]:
+    above = _nearest_levels(price, "above", vp, kl, gamma_wall, n=3)
+    below_vwap = _nearest_levels(kl.vwap, "below", vp, kl, gamma_wall, n=1)
+    sl_a = below_vwap[0] if below_vwap else None
+    tp1_a = above[0] if above else None
+    tp2_a = above[1] if len(above) >= 2 else None
+
+    plan_a = ActionPlan(
+        label="A", name="趋势回调做多", emoji="📈", is_primary=True,
+        logic="回调至 VWAP 附近接多, 顺势而为",
+        direction="bullish",
+        trigger=f"价格回调至 VWAP {kl.vwap:,.2f} 附近企稳",
+        entry=kl.vwap, entry_action="做多",
+        stop_loss=sl_a[1] if sl_a else None,
+        stop_loss_reason=sl_a[0] if sl_a else "VWAP 下方",
+        tp1=tp1_a[1] if tp1_a else None,
+        tp1_label=tp1_a[0] if tp1_a else "",
+        tp2=tp2_a[1] if tp2_a else None,
+        tp2_label=tp2_a[0] if tp2_a else "",
+        rr_ratio=_calculate_rr(kl.vwap, sl_a[1] if sl_a else None, tp1_a[1] if tp1_a else None),
+        option_line=option_line,
+    )
+
+    # Plan B: breakout add-on
+    entry_b = tp1_a[1] if tp1_a else None
+    above_b = _nearest_levels(entry_b, "above", vp, kl, gamma_wall, n=2) if entry_b else []
+    tp1_b = above_b[0] if above_b else None
+    tp2_b = above_b[1] if len(above_b) >= 2 else None
+    plan_b = ActionPlan(
+        label="B", name="突破加仓", emoji="📈", is_primary=False,
+        logic=f"突破 {tp1_a[0] if tp1_a else '阻力'} 后追多",
+        direction="bullish",
+        trigger=f"放量突破 {tp1_a[0]} {tp1_a[1]:,.2f}" if tp1_a else "放量突破最近阻力",
+        entry=entry_b, entry_action="做多",
+        stop_loss=tp1_a[1] if tp1_a else None,
+        stop_loss_reason=f"回落 {tp1_a[0]} 下方" if tp1_a else "突破位下方",
+        tp1=tp1_b[1] if tp1_b else None,
+        tp1_label=tp1_b[0] if tp1_b else "",
+        tp2=tp2_b[1] if tp2_b else None,
+        tp2_label=tp2_b[0] if tp2_b else "",
+        rr_ratio=_calculate_rr(entry_b, tp1_a[1] if tp1_a else None, tp1_b[1] if tp1_b else None),
+    )
+
+    plan_c = ActionPlan(
+        label="C", name="失效反转", emoji="⚡", is_primary=False,
+        logic="价格跌回 VA 内 + RVOL 回落 → 转 FADE_CHOP",
+        direction="bearish",
+        trigger=f"跌破 VAH {vp.vah:,.2f} + RVOL 回落",
+        entry=None, entry_action="",
+        stop_loss=None, stop_loss_reason="",
+        tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+    )
+    return [plan_a, plan_b, plan_c]
+
+
+def _plans_trend_bearish(
+    price: float, vp: VolumeProfileResult, kl: KeyLevels,
+    gamma_wall: GammaWallResult | None, option_line: str | None,
+) -> list[ActionPlan]:
+    below = _nearest_levels(price, "below", vp, kl, gamma_wall, n=3)
+    above_vwap = _nearest_levels(kl.vwap, "above", vp, kl, gamma_wall, n=1)
+    sl_a = above_vwap[0] if above_vwap else None
+    tp1_a = below[0] if below else None
+    tp2_a = below[1] if len(below) >= 2 else None
+
+    plan_a = ActionPlan(
+        label="A", name="趋势反弹做空", emoji="📉", is_primary=True,
+        logic="反弹至 VWAP 附近接空, 顺势而为",
+        direction="bearish",
+        trigger=f"价格反弹至 VWAP {kl.vwap:,.2f} 附近受阻",
+        entry=kl.vwap, entry_action="做空",
+        stop_loss=sl_a[1] if sl_a else None,
+        stop_loss_reason=sl_a[0] if sl_a else "VWAP 上方",
+        tp1=tp1_a[1] if tp1_a else None,
+        tp1_label=tp1_a[0] if tp1_a else "",
+        tp2=tp2_a[1] if tp2_a else None,
+        tp2_label=tp2_a[0] if tp2_a else "",
+        rr_ratio=_calculate_rr(kl.vwap, sl_a[1] if sl_a else None, tp1_a[1] if tp1_a else None),
+        option_line=option_line,
+    )
+
+    entry_b = tp1_a[1] if tp1_a else None
+    below_b = _nearest_levels(entry_b, "below", vp, kl, gamma_wall, n=2) if entry_b else []
+    tp1_b = below_b[0] if below_b else None
+    tp2_b = below_b[1] if len(below_b) >= 2 else None
+    plan_b = ActionPlan(
+        label="B", name="破位加仓", emoji="📉", is_primary=False,
+        logic=f"跌破 {tp1_a[0] if tp1_a else '支撑'} 后追空",
+        direction="bearish",
+        trigger=f"放量跌破 {tp1_a[0]} {tp1_a[1]:,.2f}" if tp1_a else "放量跌破最近支撑",
+        entry=entry_b, entry_action="做空",
+        stop_loss=tp1_a[1] if tp1_a else None,
+        stop_loss_reason=f"反弹 {tp1_a[0]} 上方" if tp1_a else "破位位上方",
+        tp1=tp1_b[1] if tp1_b else None,
+        tp1_label=tp1_b[0] if tp1_b else "",
+        tp2=tp2_b[1] if tp2_b else None,
+        tp2_label=tp2_b[0] if tp2_b else "",
+        rr_ratio=_calculate_rr(entry_b, tp1_a[1] if tp1_a else None, tp1_b[1] if tp1_b else None),
+    )
+
+    plan_c = ActionPlan(
+        label="C", name="失效反转", emoji="⚡", is_primary=False,
+        logic="价格涨回 VA 内 + RVOL 回落 → 转 FADE_CHOP",
+        direction="bullish",
+        trigger=f"站回 VAL {vp.val:,.2f} + RVOL 回落",
+        entry=None, entry_action="",
+        stop_loss=None, stop_loss_reason="",
+        tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+    )
+    return [plan_a, plan_b, plan_c]
+
+
+def _plans_fade_bearish(
+    price: float, vp: VolumeProfileResult, kl: KeyLevels,
+    gamma_wall: GammaWallResult | None, option_line: str | None,
+) -> list[ActionPlan]:
+    """FADE_CHOP near VAH → short bias."""
+    above = _nearest_levels(vp.vah, "above", vp, kl, gamma_wall, n=1)
+    sl_a = above[0] if above else None
+
+    plan_a = ActionPlan(
+        label="A", name="上沿做空", emoji="📉", is_primary=True,
+        logic="价格靠近 VAH, 博均值回归做空",
+        direction="bearish",
+        trigger=f"价格触及 VAH {vp.vah:,.2f} 附近",
+        entry=vp.vah, entry_action="做空",
+        stop_loss=sl_a[1] if sl_a else None,
+        stop_loss_reason=sl_a[0] if sl_a else "VAH 上方",
+        tp1=vp.poc, tp1_label="POC",
+        tp2=vp.val, tp2_label="VAL",
+        rr_ratio=_calculate_rr(vp.vah, sl_a[1] if sl_a else None, vp.poc),
+        option_line=option_line,
+    )
+
+    # Plan B: VWAP regression
+    plan_b_entry = kl.vwap if kl.vwap > vp.poc else None
+    plan_b = ActionPlan(
+        label="B", name="VWAP 回归做空", emoji="📉", is_primary=False,
+        logic="VWAP 上方接空, 目标 POC",
+        direction="bearish",
+        trigger=f"价格反弹至 VWAP {kl.vwap:,.2f}" if plan_b_entry else "价格反弹至 VAH 附近",
+        entry=plan_b_entry, entry_action="做空",
+        stop_loss=vp.vah, stop_loss_reason="VAH",
+        tp1=vp.poc, tp1_label="POC",
+        tp2=vp.val, tp2_label="VAL",
+        rr_ratio=_calculate_rr(plan_b_entry, vp.vah, vp.poc),
+    )
+
+    plan_c = ActionPlan(
+        label="C", name="失效反转", emoji="⚡", is_primary=False,
+        logic="放量突破 VAH → 转 TREND_DAY",
+        direction="bullish",
+        trigger=f"放量站稳 VAH {vp.vah:,.2f} 上方",
+        entry=None, entry_action="",
+        stop_loss=None, stop_loss_reason="",
+        tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+    )
+    return [plan_a, plan_b, plan_c]
+
+
+def _plans_fade_bullish(
+    price: float, vp: VolumeProfileResult, kl: KeyLevels,
+    gamma_wall: GammaWallResult | None, option_line: str | None,
+) -> list[ActionPlan]:
+    """FADE_CHOP near VAL → long bias."""
+    below = _nearest_levels(vp.val, "below", vp, kl, gamma_wall, n=1)
+    sl_a = below[0] if below else None
+
+    plan_a = ActionPlan(
+        label="A", name="下沿做多", emoji="📈", is_primary=True,
+        logic="价格靠近 VAL, 博均值回归做多",
+        direction="bullish",
+        trigger=f"价格触及 VAL {vp.val:,.2f} 附近",
+        entry=vp.val, entry_action="做多",
+        stop_loss=sl_a[1] if sl_a else None,
+        stop_loss_reason=sl_a[0] if sl_a else "VAL 下方",
+        tp1=vp.poc, tp1_label="POC",
+        tp2=vp.vah, tp2_label="VAH",
+        rr_ratio=_calculate_rr(vp.val, sl_a[1] if sl_a else None, vp.poc),
+        option_line=option_line,
+    )
+
+    plan_b_entry = kl.vwap if kl.vwap < vp.poc else None
+    plan_b = ActionPlan(
+        label="B", name="VWAP 回归做多", emoji="📈", is_primary=False,
+        logic="VWAP 下方接多, 目标 POC",
+        direction="bullish",
+        trigger=f"价格回调至 VWAP {kl.vwap:,.2f}" if plan_b_entry else "价格回调至 VAL 附近",
+        entry=plan_b_entry, entry_action="做多",
+        stop_loss=vp.val, stop_loss_reason="VAL",
+        tp1=vp.poc, tp1_label="POC",
+        tp2=vp.vah, tp2_label="VAH",
+        rr_ratio=_calculate_rr(plan_b_entry, vp.val, vp.poc),
+    )
+
+    plan_c = ActionPlan(
+        label="C", name="失效反转", emoji="⚡", is_primary=False,
+        logic="放量跌破 VAL → 转 TREND_DAY",
+        direction="bearish",
+        trigger=f"放量跌破 VAL {vp.val:,.2f}",
+        entry=None, entry_action="",
+        stop_loss=None, stop_loss_reason="",
+        tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+    )
+    return [plan_a, plan_b, plan_c]
+
+
+def _plans_unclear(
+    price: float, vp: VolumeProfileResult, kl: KeyLevels,
+    gamma_wall: GammaWallResult | None, regime: USRegimeResult,
+    option_line: str | None,
+) -> list[ActionPlan]:
+    lean = getattr(regime, "lean", "neutral")
+
+    plan_a = ActionPlan(
+        label="A", name="等待确认", emoji="⏳", is_primary=True,
+        logic="多空信号混杂, 等待方向明确后入场",
+        direction="neutral",
+        trigger="Regime 转为 TREND_DAY 或 FADE_CHOP",
+        entry=None, entry_action="",
+        stop_loss=None, stop_loss_reason="",
+        tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+    )
+
+    if lean in ("bullish", "bearish"):
+        dir_cn = "做多" if lean == "bullish" else "做空"
+        plan_b = ActionPlan(
+            label="B", name=f"轻仓{dir_cn}", emoji="📈" if lean == "bullish" else "📉",
+            is_primary=False,
+            logic=f"有 {lean} 倾向, 轻仓试探",
+            direction=lean,
+            trigger=f"价格确认 VWAP {'上方' if lean == 'bullish' else '下方'}",
+            entry=kl.vwap, entry_action=dir_cn,
+            stop_loss=None, stop_loss_reason="严格止损",
+            tp1=vp.vah if lean == "bullish" else vp.val,
+            tp1_label="VAH" if lean == "bullish" else "VAL",
+            tp2=None, tp2_label="", rr_ratio=0.0,
+            option_line=option_line,
+        )
+    else:
+        plan_b = ActionPlan(
+            label="B", name="观察关键位", emoji="👀", is_primary=False,
+            logic="观察 VA 边界和 VWAP 的反应",
+            direction="neutral",
+            trigger=f"价格触及 VAH {vp.vah:,.2f} 或 VAL {vp.val:,.2f}",
+            entry=None, entry_action="",
+            stop_loss=None, stop_loss_reason="",
+            tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+        )
+
+    plan_c = ActionPlan(
+        label="C", name="保持空仓", emoji="⚡", is_primary=False,
+        logic="无明确信号时保留资金",
+        direction="neutral",
+        trigger="全天信号混杂",
+        entry=None, entry_action="",
+        stop_loss=None, stop_loss_reason="",
+        tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+    )
+    return [plan_a, plan_b, plan_c]
+
+
+# ── Formatting helpers for new layout ──
+
+
+def _alternate_regime_info(regime: USRegimeResult) -> tuple[str, int]:
+    """Infer alternate regime name and probability (no regime module changes)."""
+    conf_pct = int(regime.confidence * 100)
+    alt_map = {
+        USRegimeType.GAP_AND_GO: "趋势日",
+        USRegimeType.TREND_DAY: "震荡日",
+        USRegimeType.FADE_CHOP: "趋势日",
+        USRegimeType.UNCLEAR: "震荡日",
+    }
+    return alt_map.get(regime.regime, "震荡日"), 100 - conf_pct
+
+
+def _core_conclusion_text(
+    regime: USRegimeResult,
+    direction: str,
+    vp: VolumeProfileResult,
+    kl: KeyLevels,
+    option_rec: OptionRecommendation | None,
+) -> str:
+    """One-line action directive."""
+    if option_rec and option_rec.action == "wait":
+        if option_rec.wait_conditions:
+            return f"观望, 等待 {option_rec.wait_conditions[0]}"
+        return "观望, 等待方向明确"
+
+    price = regime.price
+    if regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+        if direction == "bullish":
+            target = _nearest_levels(price, "above", vp, kl, n=1)
+            tgt = f", 目标 {target[0][0]} {target[0][1]:,.2f}" if target else ""
+            return f"回调至 VWAP {kl.vwap:,.2f} 附近做多{tgt}"
+        target = _nearest_levels(price, "below", vp, kl, n=1)
+        tgt = f", 目标 {target[0][0]} {target[0][1]:,.2f}" if target else ""
+        return f"反弹至 VWAP {kl.vwap:,.2f} 附近做空{tgt}"
+
+    if regime.regime == USRegimeType.FADE_CHOP:
+        edge, _ = _closest_value_area_edge(price, vp)
+        if edge == "VAH":
+            return f"VAH {vp.vah:,.2f} 附近做空, 目标 POC {vp.poc:,.2f}"
+        return f"VAL {vp.val:,.2f} 附近做多, 目标 POC {vp.poc:,.2f}"
+
+    return "观望, 等待 Regime 明确后再入场"
+
+
+def _format_action_plan(plan: ActionPlan) -> list[str]:
+    """Render a single ActionPlan to Telegram HTML lines."""
+    tag = "首选" if plan.is_primary else "备选"
+    lines = [f"{plan.emoji} <b>{plan.label}: {_esc(plan.name)}</b> ({tag})"]
+    lines.append(f"逻辑: {_esc(plan.logic)}")
+
+    if plan.label == "C":
+        # Simplified format for invalidation plan
+        lines.append(f"  条件: {_esc(plan.trigger)}")
+        lines.append(f"  行动: {_esc(plan.logic)}")
+        return lines
+
+    lines.append(f"  触发: {_esc(plan.trigger)}")
+    if plan.entry is not None:
+        lines.append(f"  入场: {plan.entry:,.2f} ({plan.entry_action})")
+    else:
+        lines.append(f"  入场: 等待方向明确后入场")
+    if plan.stop_loss is not None:
+        lines.append(f"  止损: {plan.stop_loss:,.2f} ({_esc(plan.stop_loss_reason)})")
+    if plan.tp1 is not None:
+        lines.append(f"  TP1 (50%): {plan.tp1:,.2f} ({plan.tp1_label})")
+    if plan.tp2 is not None:
+        lines.append(f"  TP2 (清仓): {plan.tp2:,.2f} ({plan.tp2_label})")
+    if plan.rr_ratio > 0:
+        lines.append(f"  R:R ≈ 1:{plan.rr_ratio:.1f}")
+    if plan.option_line:
+        lines.append(plan.option_line)
+    return lines
+
+
+def _rvol_assessment(rvol: float) -> str:
+    if rvol < 0.5:
+        return "极寒"
+    if rvol < 0.8:
+        return "偏弱"
+    if rvol < 1.2:
+        return "正常"
+    if rvol < 1.5:
+        return "活跃"
+    return "趋势级"
+
+
+def _compact_option_line(option_rec: OptionRecommendation) -> str | None:
+    """Compress option recommendation to a single line."""
+    if option_rec is None or option_rec.action == "wait":
+        return None
+
+    if option_rec.action in ("bear_call_spread", "bull_put_spread"):
+        sm = option_rec.spread_metrics
+        if option_rec.legs and len(option_rec.legs) >= 2:
+            strikes = sorted(l.strike for l in option_rec.legs)
+            spread_name = "Bear Call Spread" if option_rec.action == "bear_call_spread" else "Bull Put Spread"
+            parts = [f"📋 合约: {spread_name} {_format_strike(strikes[0])}/{_format_strike(strikes[1])}"]
+            if option_rec.dte > 0:
+                parts.append(f"DTE {option_rec.dte}")
+            if sm and sm.net_credit > 0:
+                parts.append(f"净收 {sm.net_credit:.2f}")
+            if sm and sm.risk_reward_ratio > 0:
+                parts.append(f"R:R {sm.risk_reward_ratio:.1f}:1")
+            return " | ".join(parts)
+        return None
+
+    # Single leg: call / put
+    opt_type = "CALL" if option_rec.action == "call" else "PUT"
+    side = "Buy"
+    if option_rec.legs:
+        leg = option_rec.legs[0]
+        parts = [f"📋 合约: {side} {opt_type} {_format_strike(leg.strike)} ({leg.moneyness})"]
+        if option_rec.dte > 0:
+            parts.append(f"DTE {option_rec.dte}")
+        if leg.delta is not None:
+            parts.append(f"Δ{leg.delta:+.2f}")
+        if leg.open_interest is not None and leg.open_interest > 0:
+            parts.append(f"OI {leg.open_interest:,}")
+        return " | ".join(parts)
+
+    # No legs but has recommendation
+    parts = [f"📋 合约: {side} {opt_type}"]
+    if option_rec.dte > 0:
+        parts.append(f"DTE {option_rec.dte}")
+    return " | ".join(parts)
+
+
 # ── Preserved: _collect_levels (test compatible) ──
 
 
@@ -697,7 +1332,7 @@ def format_us_playbook_message(
     spy_result: USPlaybookResult | None = None,
     qqq_result: USPlaybookResult | None = None,
 ) -> str:
-    """Format US Playbook as Telegram HTML message — 4-section HK-style layout."""
+    """Format US Playbook as Telegram HTML message — institutional-grade intraday playbook."""
     r = result.regime
     regime_cn = REGIME_NAME_CN.get(r.regime, "未知")
     now = result.generated_at or datetime.now(ET)
@@ -723,268 +1358,154 @@ def format_us_playbook_message(
     lines: list[str] = []
     sep = "━" * 20
 
-    # ── Header ──
-    lines.append(sep)
-    lines.append(f"<b>{_esc(result.name)} ({_esc(result.symbol)})</b>")
-    lines.append(f"{now.strftime('%Y-%m-%d %H:%M:%S')} ET")
+    # ── Section 1: Header ──
+    lines.append(f"━━━ <b>{_esc(result.symbol)} ({_esc(result.name)})</b> | 日内交易剧本 ━━━")
+    lines.append(f"⏰ {now.strftime('%Y-%m-%d %H:%M:%S')} ET")
 
-    # 判断是否盘前
     is_premarket = now.hour < 9 or (now.hour == 9 and now.minute < 30)
     if is_premarket:
-        lines.append("⏳ <b>盘前数据</b> — RVOL/Regime 待开盘后生效")
+        lines.append("⏳ 盘前数据 — RVOL/Regime 待开盘后生效")
 
-    # Market context in header line
+    # Market context
     ctx_parts = []
     if spy_result:
-        se = REGIME_EMOJI.get(spy_result.regime.regime, "❓")
+        se = get_regime_emoji(spy_result.regime.regime, "bullish")
         sn = REGIME_NAME_CN.get(spy_result.regime.regime, "未知")
-        ctx_parts.append(f"SPY: {se} {sn}")
+        ctx_parts.append(f"SPY {se}{sn}")
     if qqq_result:
-        qe = REGIME_EMOJI.get(qqq_result.regime.regime, "❓")
+        qe = get_regime_emoji(qqq_result.regime.regime, "bullish")
         qn = REGIME_NAME_CN.get(qqq_result.regime.regime, "未知")
-        ctx_parts.append(f"QQQ: {qe} {qn}")
+        ctx_parts.append(f"QQQ {qe}{qn}")
     if ctx_parts:
-        lines.append(" | ".join(ctx_parts))
+        lines.append(f"大盘: {' | '.join(ctx_parts)}")
+
+    # Primary/alternate regime expectation
+    alt_name, alt_pct = _alternate_regime_info(r)
+    conf_pct = int(r.confidence * 100)
+    lines.append(f"预期: {emoji}{regime_cn} ({conf_pct}%) / {alt_name} ({alt_pct}%)")
     lines.append("")
 
-    # ── Section 1: Regime ──
-    lines.append(
-        f"{emoji} <b>{_esc(regime_cn)}</b>  {_confidence_bar(r.confidence)} {r.confidence:.0%}"
-    )
-    lines.append("")
-    lines.append(f"结论: {_esc(_regime_conclusion(r, vp, kl, vwap))}")
+    # ── Section 2: 核心结论 ──
+    conclusion = _core_conclusion_text(r, _direction, vp, kl, recommendation)
+    lines.append(f"🎯 <b>核心结论: {_esc(conclusion)}</b>")
+    lines.append(f"▸ 当前状态: {_esc(_price_position(r.price, vp, vwap, kl))}")
 
-    regime_reasons, regime_supports, regime_uncertainties, regime_invalidations = _regime_reason_lines(
-        r, vp, kl, vwap, gamma_wall, option_market, quote, option_rec=recommendation,
-    )
-    if regime_reasons:
-        lines.append("")
-        lines.append("判断依据:")
-        for reason in regime_reasons:
-            lines.append(f"  ▸ {_esc(reason)}")
-    if regime_supports:
-        lines.append("")
-        lines.append("加分项:")
-        for support in regime_supports:
-            lines.append(f"  ▸ {_esc(support)}")
-    if regime_uncertainties:
-        lines.append("")
-        lines.append("注意:")
-        for uncertainty in regime_uncertainties:
-            lines.append(f"  ▸ {_esc(uncertainty)}")
-    if regime_invalidations:
-        lines.append("")
-        lines.append("⚡ 失效条件:")
-        for invalidation in regime_invalidations:
-            lines.append(f"  ▸ {_esc(invalidation)}")
+    strategy_text = get_regime_strategy(r.regime, _direction)
+    first_line = strategy_text.splitlines()[0] if strategy_text else ""
+    lines.append(f"▸ 核心策略: {_esc(first_line)}")
 
     lines.append("")
     lines.append(SECTION_SEP)
+
+    # ── Section 3: 剧本推演 ──
+    lines.append("⚔️ <b>剧本推演</b>")
     lines.append("")
 
-    # ── Section 2: 实时数据 ──
-    lines.append("📊 <b>实时数据</b>" + (" (昨日收盘)" if is_premarket else ""))
-    lines.append("")
+    plans = _generate_action_plans(r, _direction, vp, kl, gamma_wall, recommendation)
+    for plan in plans:
+        for plan_line in _format_action_plan(plan):
+            lines.append(plan_line)
+        lines.append("")
 
-    if quote:
-        change_pct = _pct_change(quote.last_price, quote.prev_close)
-        spread_value = quote.ask_price - quote.bid_price if quote.ask_price > 0 and quote.bid_price > 0 else 0.0
-        spread_pct = (spread_value / quote.last_price * 100) if quote.last_price > 0 and spread_value > 0 else None
+    lines.append(SECTION_SEP)
 
-        arrow = "▼" if (change_pct is not None and change_pct < 0) else "▲"
-        pct_str = f"{abs(change_pct):.2f}%" if change_pct is not None else "N/A"
-        lines.append(f"{quote.last_price:,.2f} {arrow}{pct_str}")
+    # ── Section 4: 盘面逻辑 ──
+    lines.append("📝 <b>盘面逻辑</b>")
+    rvol_label = _rvol_assessment(r.rvol)
+    lines.append(f"▸ 量能: RVOL {r.rvol:.2f} ({rvol_label})")
 
+    # Space analysis — upside/downside distances
+    above = _nearest_levels(r.price, "above", vp, kl, gamma_wall, n=1)
+    below = _nearest_levels(r.price, "below", vp, kl, gamma_wall, n=1)
+    space_parts = []
+    if above and r.price > 0:
+        up_pct = (above[0][1] - r.price) / r.price * 100
+        space_parts.append(f"上方至{above[0][0]} {up_pct:.1f}%")
+    if below and r.price > 0:
+        dn_pct = (r.price - below[0][1]) / r.price * 100
+        space_parts.append(f"下方至{below[0][0]} {dn_pct:.1f}%")
+    if space_parts:
+        lines.append(f"▸ 空间: {' / '.join(space_parts)}")
+
+    # IV environment (compact)
+    if option_market and option_market.atm_iv > 0 and option_market.avg_iv > 0:
+        iv_label = "偏高" if option_market.iv_ratio >= 1.2 else "偏低" if option_market.iv_ratio <= 0.85 else "正常"
+        lines.append(f"▸ IV: ATM/Avg = {option_market.iv_ratio:.2f}x ({iv_label})")
+
+    # Adaptive thresholds info
+    if r.adaptive_thresholds:
+        at = r.adaptive_thresholds
         lines.append(
-            f"开 {quote.open_price:,.2f} │ 高 {quote.high_price:,.2f} │ "
-            f"低 {quote.low_price:,.2f} │ 昨收 {quote.prev_close:,.2f}"
+            f"▸ 自适应阈值: P{at.get('sample', '?')}d GAP_AND_GO={at.get('gap_and_go', 0):.2f}"
+            f" (rank {at.get('pctl_rank', 0):.0f}%)"
         )
-        if quote.bid_price > 0 or quote.ask_price > 0:
-            lines.append(
-                f"买一 {quote.bid_price:,.2f} / 卖一 {quote.ask_price:,.2f} │ "
-                f"价差 {spread_value:,.2f} ({_format_percent(spread_pct)})"
-            )
-        lines.append(
-            f"成交量 {quote.volume:,} │ 成交额 {_format_turnover_usd(quote.turnover)}"
-        )
-        day_range_pct = _pct_change(quote.high_price, quote.low_price)
-        tr_parts = []
-        if quote.turnover_rate > 0:
-            tr_parts.append(f"换手率 {_format_percent(quote.turnover_rate, signed=False)}")
-        if quote.amplitude > 0:
-            tr_parts.append(f"振幅 {_format_percent(quote.amplitude, signed=False)}")
-        elif day_range_pct is not None:
-            tr_parts.append(f"振幅 {_format_percent(day_range_pct, signed=False)}")
-        if tr_parts:
-            lines.append(" │ ".join(tr_parts))
-    else:
-        lines.append(f"{r.price:,.2f}")
 
-    # Key levels block
     lines.append("")
-    lines.append("关键位:")
-    if vwap > 0:
-        vwap_pct = _pct_change(r.price, vwap)
-        lines.append(f"  VWAP {vwap:,.2f} ({_format_percent(vwap_pct)}) │ RVOL {r.rvol:.2f}")
-    else:
-        lines.append(f"  RVOL {r.rvol:.2f}")
+    lines.append(SECTION_SEP)
+
+    # ── Section 5: 数据雷达 ──
+    price_display = quote.last_price if quote else r.price
+    lines.append(f"📊 <b>数据雷达</b> (当前: {price_display:,.2f})")
+
+    # Compact key data line
+    vwap_pct = _pct_change(r.price, vwap)
+    vwap_str = f"VWAP {vwap:,.2f} ({_format_percent(vwap_pct)})" if vwap > 0 else ""
+    amp_str = ""
+    if quote and quote.amplitude > 0:
+        amp_str = f"振幅 {_format_percent(quote.amplitude, signed=False)}"
+    compact_items = [x for x in [vwap_str, f"RVOL {r.rvol:.2f}", amp_str] if x]
+    lines.append(" | ".join(compact_items))
+
+    # VP levels
+    lines.append(f"VAH {vp.vah:,.2f} | POC {vp.poc:,.2f} | VAL {vp.val:,.2f}")
 
     # PDH/PDL
-    if kl.pdh > 0 or kl.pdl > 0:
-        pdh_str = f"PDH {kl.pdh:,.2f}" if kl.pdh > 0 else ""
-        pdl_str = f"PDL {kl.pdl:,.2f}" if kl.pdl > 0 else ""
-        parts = [p for p in [pdh_str, pdl_str] if p]
-        lines.append(f"  {' │ '.join(parts)}")
+    pd_parts = []
+    if kl.pdh > 0:
+        pd_parts.append(f"PDH {kl.pdh:,.2f}")
+    if kl.pdl > 0:
+        pd_parts.append(f"PDL {kl.pdl:,.2f}")
+    if pd_parts:
+        lines.append(" | ".join(pd_parts))
 
     # PMH/PML
-    if kl.pmh > 0 or kl.pml > 0:
+    pm_parts = []
+    if kl.pmh > 0:
+        pm_parts.append(f"PMH {kl.pmh:,.2f}")
+    if kl.pml > 0:
+        pm_parts.append(f"PML {kl.pml:,.2f}")
+    if pm_parts:
         pm_tag = ""
         if kl.pm_source == "yahoo":
             pm_tag = " (Yahoo)"
         elif kl.pm_source == "gap_estimate":
             pm_tag = " (估)"
-        pmh_str = f"PMH {kl.pmh:,.2f}" if kl.pmh > 0 else ""
-        pml_str = f"PML {kl.pml:,.2f}" if kl.pml > 0 else ""
-        parts = [p for p in [pmh_str, pml_str] if p]
-        lines.append(f"  {' │ '.join(parts)}{pm_tag}")
+        lines.append(" | ".join(pm_parts) + pm_tag)
 
-    lines.append(f"  POC {vp.poc:,.2f}")
-    lines.append(f"  VAH {vp.vah:,.2f} │ VAL {vp.val:,.2f}")
-    if vp.vah > vp.val and vp.val > 0:
-        value_area_width_pct = (vp.vah - vp.val) / vp.val * 100
-        lines.append(f"  Value Area 宽度 {vp.vah - vp.val:,.2f} ({value_area_width_pct:.2f}%)")
-    lines.append(f"  {_price_position(r.price, vp, vwap, kl)}")
+    # Gamma wall
+    if gamma_wall:
+        gw_parts = []
+        if gamma_wall.call_wall_strike > 0:
+            gw_parts.append(f"Call Wall {gamma_wall.call_wall_strike:,.0f}")
+        if gamma_wall.put_wall_strike > 0:
+            gw_parts.append(f"Put Wall {gamma_wall.put_wall_strike:,.0f}")
+        if gamma_wall.max_pain > 0:
+            gw_parts.append(f"MaxPain {gamma_wall.max_pain:,.0f}")
+        if gw_parts:
+            lines.append(" | ".join(gw_parts))
 
+    # VP thin warning
     vp_td = vp.trading_days
     if 0 < vp_td < 3:
-        lines.append(f"  ⚠️ VP 仅 {vp_td} 天数据，VAH/VAL 参考性降低")
+        lines.append(f"⚠️ VP 仅 {vp_td} 天数据")
 
-    if gamma_wall and (
-        gamma_wall.call_wall_strike > 0
-        or gamma_wall.put_wall_strike > 0
-        or gamma_wall.max_pain > 0
-    ):
-        gamma_parts = []
-        if gamma_wall.call_wall_strike > 0:
-            gamma_parts.append(f"Call Wall {gamma_wall.call_wall_strike:,.0f}")
-        if gamma_wall.put_wall_strike > 0:
-            gamma_parts.append(f"Put Wall {gamma_wall.put_wall_strike:,.0f}")
-        if gamma_wall.max_pain > 0:
-            gamma_parts.append(f"Max Pain {gamma_wall.max_pain:,.0f}")
-        lines.append(f"  Gamma / Pain: {' │ '.join(gamma_parts)}")
-
-    # Option environment
-    if option_market and option_market.expiry:
-        lines.append("")
-        lines.append("期权环境:")
-        dte_str = ""
-        if recommendation and recommendation.dte > 0:
-            dte_str = f" ({recommendation.dte} DTE)"
-        lines.append(f"  到期日 {option_market.expiry}{dte_str}")
-        lines.append(
-            f"  合约 {option_market.contract_count}"
-            f" (Call {option_market.call_contract_count} / Put {option_market.put_contract_count})"
-        )
-        if option_market.atm_iv > 0 or option_market.avg_iv > 0:
-            lines.append(
-                f"  ATM IV {option_market.atm_iv:.2f} │ 全链中位 IV {option_market.avg_iv:.2f}"
-                f" │ 比值 {option_market.iv_ratio:.2f}x"
-            )
-
-    lines.append("")
-    lines.append(SECTION_SEP)
-    lines.append("")
-
-    # ── Section 3: 期权建议 ──
-    if recommendation:
-        if recommendation.action == "wait":
-            lines.append(f"🎯 <b>建议: {_action_label(recommendation.action)}</b>")
-            lines.append("")
-            lines.append(f"白话解释: {_esc(_action_plain_language(recommendation))}")
-            if recommendation.rationale:
-                lines.append(f"当前结论: {_esc(recommendation.rationale)}")
-            for reason in _split_reason_lines(recommendation.risk_note):
-                lines.append(f"先别下单的原因: {_esc(reason)}")
-            if recommendation.wait_conditions:
-                lines.append("重新评估条件:")
-                for condition in recommendation.wait_conditions:
-                    lines.append(f"  ▸ {_esc(condition)}")
-        else:
-            lines.append(f"🎯 <b>建议: {_action_label(recommendation.action)}</b>")
-            lines.append("")
-            lines.append(f"白话解释: {_esc(_action_plain_language(recommendation))}")
-            if recommendation.expiry:
-                dte_str = f" ({recommendation.dte} DTE)" if recommendation.dte > 0 else ""
-                lines.append(f"到期日: {recommendation.expiry}{dte_str}")
-            lines.append(f"{_position_size_text(r.confidence)}")
-            lines.append("")
-            lines.append(f"入场前提: {_esc(_entry_check_text(recommendation, r, vp, kl=kl, gamma_wall=gamma_wall))}")
-            entry_zone = _entry_zone_text(r.price, _direction, r, vp, kl=kl, gamma_wall=gamma_wall)
-            if entry_zone:
-                lines.append(f"{_esc(entry_zone)}")
-            lines.append("")
-            for leg in recommendation.legs:
-                for leg_line in _format_leg_line(leg):
-                    lines.append(_esc(leg_line))
-
-            sm = recommendation.spread_metrics
-            if sm and sm.max_loss > 0:
-                lines.append("")
-                lines.append("📋 Spread 损益:")
-                lines.append(f"  净收入 {sm.net_credit:,.3f} │ 最大亏损 {sm.max_loss:,.3f}")
-                lines.append(
-                    f"  盈亏平衡 {sm.breakeven:,.3f} │ R:R {sm.risk_reward_ratio:.2f}:1"
-                )
-                if sm.win_probability > 0:
-                    lines.append(
-                        f"  到期盈利概率 ~{sm.win_probability:.0%} (基于 Delta)"
-                    )
-
-            lines.append("")
-            if recommendation.rationale:
-                lines.append(f"为什么是这单: {_esc(recommendation.rationale)}")
-            if recommendation.action in {"bull_put_spread", "bear_call_spread"}:
-                lines.append(_spread_execution_text(recommendation))
-            else:
-                lines.append("执行: 直接买入单腿期权，限价单优先，不追已经瞬间拉开价差的合约。")
-            if recommendation.liquidity_warning:
-                lines.append(f"⚠️ 流动性提醒: {_esc(recommendation.liquidity_warning)}")
-    else:
-        lines.append("🎯 <b>交易风格建议</b>")
-        strategy_text = get_regime_strategy(r.regime, _direction)
-        for strategy_line in strategy_text.splitlines():
-            lines.append(_esc(strategy_line))
-
-    lines.append("")
-    lines.append(SECTION_SEP)
-    lines.append("")
-
-    # ── Section 4: 风险 ──
-    lines.append(f"⚠️ <b>风险</b>  {_risk_status_text(result.filters)}")
-    lines.append("")
-
-    level_items = _level_distance_items(r.price, vp, kl, gamma_wall)
-    if level_items:
-        lines.append(f"距关键位: {' │ '.join(level_items)}")
+    # Filter warnings
+    for warning in result.filters.warnings:
+        lines.append(f"⚠️ {_esc(warning)}")
 
     # DTE gamma warning
     if recommendation and recommendation.dte > 0 and recommendation.dte <= 3 and recommendation.action != "wait":
-        lines.append(f"⚠️ 仅剩 {recommendation.dte} DTE, Gamma 风险极高, 价格小幅波动可能导致大幅亏损")
-
-    for warning in result.filters.warnings:
-        lines.append(f"风险提示: {_esc(warning)}")
-
-    if recommendation and recommendation.risk_note and recommendation.action != "wait":
-        for risk_line in _split_reason_lines(recommendation.risk_note):
-            if "DTE" in risk_line and "Gamma" in risk_line:
-                continue
-            if "DTE" in risk_line and "Theta" in risk_line:
-                continue
-            lines.append(_esc(risk_line))
-
-    lines.append("")
-    for risk_action_line in _risk_action_lines(recommendation, r, vp, kl=kl, gamma_wall=gamma_wall):
-        lines.append(_esc(risk_action_line))
+        lines.append(f"⚠️ 仅剩 {recommendation.dte} DTE, Gamma 风险极高")
 
     lines.append(sep)
     return "\n".join(lines)

@@ -407,6 +407,7 @@ class TelegramNotifier:
         self._app.add_handler(CommandHandler("detail", self._cmd_detail))
         self._app.add_handler(CommandHandler("test", self._cmd_test))
         self._app.add_handler(CommandHandler("conn", self._cmd_conn))
+        self._app.add_handler(CommandHandler("messages", self._cmd_messages))
         self._app.add_handler(
             CallbackQueryHandler(self._on_callback_query, pattern=r"^(cfm|skip|dtl|noop)")
         )
@@ -432,6 +433,19 @@ class TelegramNotifier:
         logger.error("Telegram handler error: %s", context.error, exc_info=context.error)
 
     # ── Notification sending ──
+
+    async def _reply_and_log(
+        self,
+        update: Update,
+        text: str,
+        trigger: str,
+        market: str = "us",
+        **kwargs,
+    ) -> None:
+        """Reply to user and log the message to archive."""
+        await update.message.reply_text(text, **kwargs)  # type: ignore[union-attr]
+        from src.store import message_archive
+        message_archive.log("us_pipeline", trigger, text, market)
 
     async def send_entry_signal(
         self,
@@ -533,7 +547,10 @@ class TelegramNotifier:
         })
 
         keyboard = _build_entry_keyboard(signal_id)
-        return await self._send_message(message, reply_markup=keyboard)
+        return await self._send_message(
+            message, reply_markup=keyboard,
+            source="us_pipeline", trigger="entry_signal", market="us",
+        )
 
     async def send_exit_signal(
         self,
@@ -583,7 +600,9 @@ class TelegramNotifier:
             cooldown_line=cooldown_line,
             daily_pnl=daily_pnl_str,
         )
-        return await self._send_message(message)
+        return await self._send_message(
+            message, source="us_pipeline", trigger="exit_signal", market="us",
+        )
 
     async def send_strategy_update(
         self, strategy_id: str, strategy_name: str, status: str
@@ -593,10 +612,20 @@ class TelegramNotifier:
             strategy_id=_esc(strategy_id),
             status=_esc(status),
         )
-        return await self._send_message(message)
+        return await self._send_message(
+            message, source="us_pipeline", trigger="strategy_update", market="us",
+        )
 
-    async def send_text(self, text: str) -> bool:
-        return await self._send_message(text)
+    async def send_text(
+        self,
+        text: str,
+        source: str = "system",
+        trigger: str = "generic",
+        market: str = "us",
+    ) -> bool:
+        return await self._send_message(
+            text, source=source, trigger=trigger, market=market,
+        )
 
     # ── Signal cache for /detail ──
 
@@ -608,7 +637,12 @@ class TelegramNotifier:
     _STRIP_HTML_RE = re.compile(r"<[^>]+>")
 
     async def _send_message(
-        self, text: str, reply_markup: InlineKeyboardMarkup | None = None,
+        self,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+        source: str = "system",
+        trigger: str = "generic",
+        market: str = "us",
     ) -> bool:
         if not (self._app and self._app.bot):
             return False
@@ -620,6 +654,8 @@ class TelegramNotifier:
                 reply_markup=reply_markup,
             )
             self._send_timestamps.append(time.time())
+            from src.store import message_archive
+            message_archive.log(source, trigger, text, market)
             return True
         except BadRequest as exc:
             logger.warning("HTML parse failed, retrying as plain text: %s", exc)
@@ -630,6 +666,8 @@ class TelegramNotifier:
                     text=plain,
                 )
                 self._send_timestamps.append(time.time())
+                from src.store import message_archive
+                message_archive.log(source, trigger, plain, market)
                 return True
             except Exception:
                 logger.exception("Plain-text fallback also failed")
@@ -673,20 +711,20 @@ class TelegramNotifier:
         lines.append(f"\n⏸ 静默: {paused}")
         lines.append(f"⏱ {datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ET")
 
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")  # type: ignore[union-attr]
+        await self._reply_and_log(update, "\n".join(lines), "cmd_status", parse_mode="HTML")
 
     async def _cmd_market(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Show real-time trading info for all monitored symbols."""
         if self._collector is None:
-            await update.message.reply_text("数据采集器未初始化")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "数据采集器未初始化", "cmd_market")
             return
         if self._strategy_loader is None:
-            await update.message.reply_text("策略管理器未初始化")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "策略管理器未初始化", "cmd_market")
             return
 
         symbols = sorted(self._strategy_loader.get_all_symbols())
         if not symbols:
-            await update.message.reply_text("监控列表为空")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "监控列表为空", "cmd_market")
             return
 
         lines = ["📊 <b>实时行情</b>", "━━━━━━━━━━━━━━━━━━━━"]
@@ -739,7 +777,7 @@ class TelegramNotifier:
             f"⏱ {datetime.now(ET).strftime('%H:%M:%S')} ET"
             f" | {self._data_source_label}{cache_note}"
         )
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")  # type: ignore[union-attr]
+        await self._reply_and_log(update, "\n".join(lines), "cmd_market", parse_mode="HTML")
 
     async def _cmd_chain(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not context.args or len(context.args) < 4:
@@ -753,16 +791,15 @@ class TelegramNotifier:
                 "• 第3位: 类型 C 或 P (Call/Put)\n"
                 "• 第4位: 到期日 MMDD (如 0321)"
             )
-            await update.message.reply_text(text, parse_mode="HTML")
+            await self._reply_and_log(update, text, "cmd_chain", parse_mode="HTML")
             return
 
         symbol = context.args[0].upper()
         strike = context.args[1]
         opt_type = context.args[2].upper()
-        exp_mmdd = context.args[3]
 
         if self._collector is None:
-            await update.message.reply_text("数据采集器未初始化")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "数据采集器未初始化", "cmd_chain")
             return
 
         try:
@@ -794,16 +831,16 @@ class TelegramNotifier:
         except Exception as exc:
             text = f"查询失败: {exc}"
 
-        await update.message.reply_text(text, parse_mode="HTML")  # type: ignore[union-attr]
+        await self._reply_and_log(update, text, "cmd_chain", parse_mode="HTML")
 
     async def _cmd_strategies(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if self._strategy_loader is None:
-            await update.message.reply_text("策略管理器未初始化")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "策略管理器未初始化", "cmd_strategies")
             return
 
         strategies = self._strategy_loader.strategies
         if not strategies:
-            await update.message.reply_text("暂无策略配置")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "暂无策略配置", "cmd_strategies")
             return
 
         lines = ["📋 <b>所有策略</b>", "━━━━━━━━━━━━━━━━━━━━"]
@@ -813,27 +850,27 @@ class TelegramNotifier:
             lines.append(f"   ID: <code>{sid}</code>")
             lines.append(f"   标的: {', '.join(s.underlyings)}")
 
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")  # type: ignore[union-attr]
+        await self._reply_and_log(update, "\n".join(lines), "cmd_strategies", parse_mode="HTML")
 
     async def _cmd_enable(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not context.args:
-            await update.message.reply_text("用法: /enable <strategy_id>")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "用法: /enable <strategy_id>", "cmd_enable")
             return
         sid = context.args[0]
         if self._strategy_loader and self._strategy_loader.set_enabled(sid, True):
-            await update.message.reply_text(f"✅ 策略 {sid} 已启用")  # type: ignore[union-attr]
+            await self._reply_and_log(update, f"✅ 策略 {sid} 已启用", "cmd_enable")
         else:
-            await update.message.reply_text(f"❌ 策略 {sid} 不存在")  # type: ignore[union-attr]
+            await self._reply_and_log(update, f"❌ 策略 {sid} 不存在", "cmd_enable")
 
     async def _cmd_disable(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not context.args:
-            await update.message.reply_text("用法: /disable <strategy_id>")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "用法: /disable <strategy_id>", "cmd_disable")
             return
         sid = context.args[0]
         if self._strategy_loader and self._strategy_loader.set_enabled(sid, False):
-            await update.message.reply_text(f"✅ 策略 {sid} 已禁用")  # type: ignore[union-attr]
+            await self._reply_and_log(update, f"✅ 策略 {sid} 已禁用", "cmd_disable")
         else:
-            await update.message.reply_text(f"❌ 策略 {sid} 不存在")  # type: ignore[union-attr]
+            await self._reply_and_log(update, f"❌ 策略 {sid} 不存在", "cmd_disable")
 
     async def _cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         minutes = 30
@@ -843,19 +880,21 @@ class TelegramNotifier:
             except ValueError:
                 pass
         self._paused_until = time.time() + minutes * 60
-        await update.message.reply_text(  # type: ignore[union-attr]
+        await self._reply_and_log(
+            update,
             f"⏸ 通知已静默 {minutes} 分钟 (至 "
-            f"{datetime.now(ET).strftime('%H:%M')} ET + {minutes}min)"
+            f"{datetime.now(ET).strftime('%H:%M')} ET + {minutes}min)",
+            "cmd_pause",
         )
 
     async def _cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if self._sqlite_store is None:
-            await update.message.reply_text("存储未初始化")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "存储未初始化", "cmd_history")
             return
 
         signals = self._sqlite_store.get_today_signals()
         if not signals:
-            await update.message.reply_text("📭 今日暂无信号记录")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "📭 今日暂无信号记录", "cmd_history")
             return
 
         lines = ["📜 <b>今日信号记录</b>", "━━━━━━━━━━━━━━━━━━━━"]
@@ -864,13 +903,15 @@ class TelegramNotifier:
             t = datetime.fromtimestamp(s.get("timestamp", 0), tz=ET).strftime("%H:%M:%S")
             lines.append(f"{icon} {t} | {s.get('strategy_name', '')} | {s.get('symbol', '')}")
 
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")  # type: ignore[union-attr]
+        await self._reply_and_log(update, "\n".join(lines), "cmd_history", parse_mode="HTML")
 
     async def _cmd_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not context.args or len(context.args) < 2:
-            await update.message.reply_text(  # type: ignore[union-attr]
+            await self._reply_and_log(
+                update,
                 "用法: /confirm <signal_id> <股票价格>\n"
-                "  请输入建仓时底层股票价格（非期权价格）"
+                "  请输入建仓时底层股票价格（非期权价格）",
+                "cmd_confirm",
             )
             return
 
@@ -878,43 +919,49 @@ class TelegramNotifier:
         try:
             entry_price = float(context.args[1])
         except ValueError:
-            await update.message.reply_text("价格格式错误")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "价格格式错误", "cmd_confirm")
             return
 
         if self._state_manager is None:
-            await update.message.reply_text("状态管理器未初始化")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "状态管理器未初始化", "cmd_confirm")
             return
 
         if self._state_manager.confirm_entry(signal_id, entry_price):
-            await update.message.reply_text(  # type: ignore[union-attr]
-                f"✅ 已确认建仓 {signal_id} @ ${entry_price:.2f} (股票价格)\n开始追踪出场条件"
+            await self._reply_and_log(
+                update,
+                f"✅ 已确认建仓 {signal_id} @ ${entry_price:.2f} (股票价格)\n开始追踪出场条件",
+                "cmd_confirm",
             )
         else:
-            await update.message.reply_text(  # type: ignore[union-attr]
-                f"❌ 信号 {signal_id} 无法确认 (不存在或已过期)"
+            await self._reply_and_log(
+                update,
+                f"❌ 信号 {signal_id} 无法确认 (不存在或已过期)",
+                "cmd_confirm",
             )
 
     async def _cmd_skip(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not context.args:
-            await update.message.reply_text("用法: /skip <signal_id>")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "用法: /skip <signal_id>", "cmd_skip")
             return
 
         signal_id = context.args[0]
         if self._state_manager and self._state_manager.skip_entry(signal_id):
-            await update.message.reply_text(f"⏭ 已跳过信号 {signal_id}")  # type: ignore[union-attr]
+            await self._reply_and_log(update, f"⏭ 已跳过信号 {signal_id}", "cmd_skip")
         else:
-            await update.message.reply_text(f"❌ 信号 {signal_id} 不存在或已处理")  # type: ignore[union-attr]
+            await self._reply_and_log(update, f"❌ 信号 {signal_id} 不存在或已处理", "cmd_skip")
 
     async def _cmd_detail(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Show full indicator snapshot for a cached signal."""
         if not context.args:
-            await update.message.reply_text("用法: /detail <signal_id>")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "用法: /detail <signal_id>", "cmd_detail")
             return
 
         signal_id = context.args[0]
         cached = self._signal_cache.get(signal_id)
         if not cached:
-            await update.message.reply_text(f"❌ 信号 {signal_id} 详情已过期或不存在")  # type: ignore[union-attr]
+            await self._reply_and_log(
+                update, f"❌ 信号 {signal_id} 详情已过期或不存在", "cmd_detail",
+            )
             return
 
         sig: Signal = cached["signal"]
@@ -937,7 +984,7 @@ class TelegramNotifier:
             for c in sig.conditions_detail:
                 lines.append(f"   {_esc(c)}")
 
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")  # type: ignore[union-attr]
+        await self._reply_and_log(update, "\n".join(lines), "cmd_detail", parse_mode="HTML")
 
     async def _cmd_test(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """发送模拟入场与出场提醒，用于验证 Telegram 推送链路是否正常。"""
@@ -1040,7 +1087,7 @@ class TelegramNotifier:
     async def _cmd_conn(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Show Futu connection status and diagnostics."""
         if self._collector is None:
-            await update.message.reply_text("数据采集器未初始化")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "数据采集器未初始化", "cmd_conn")
             return
 
         try:
@@ -1049,10 +1096,10 @@ class TelegramNotifier:
                 timeout=COMMAND_TIMEOUT_SECONDS,
             )
         except TimeoutError:
-            await update.message.reply_text("⏱ 连接状态查询超时")  # type: ignore[union-attr]
+            await self._reply_and_log(update, "⏱ 连接状态查询超时", "cmd_conn")
             return
         except Exception as exc:
-            await update.message.reply_text(f"❌ 查询失败: {exc}")  # type: ignore[union-attr]
+            await self._reply_and_log(update, f"❌ 查询失败: {exc}", "cmd_conn")
             return
 
         connected = info.get("connected", False)
@@ -1099,7 +1146,73 @@ class TelegramNotifier:
 
         lines.append(f"\n⏱ {datetime.now(ET).strftime('%H:%M:%S')} ET")
 
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")  # type: ignore[union-attr]
+        await self._reply_and_log(update, "\n".join(lines), "cmd_conn", parse_mode="HTML")
+
+    # ── /messages command ──
+
+    async def _cmd_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show archived messages from the previous trading day."""
+        from src.common.trading_days import previous_trading_day, trading_day_range
+        from src.store import message_archive
+
+        market = "us"
+        if context.args and context.args[0].lower() in ("hk", "us"):
+            market = context.args[0].lower()
+
+        prev_day = previous_trading_day(market)
+        start_ts, end_ts = trading_day_range(prev_day, market)
+        messages = message_archive.query(start_ts, end_ts, market)
+
+        day_str = prev_day.strftime("%Y-%m-%d")
+        weekday = prev_day.strftime("%a")
+        market_upper = market.upper()
+
+        if not messages:
+            await self._reply_and_log(
+                update,
+                f"📋 上一交易日消息归档\n{day_str} ({weekday}) · {market_upper} · 共 0 条",
+                "cmd_messages",
+                market=market,
+            )
+            return
+
+        lines = [
+            f"📋 <b>上一交易日消息归档</b>",
+            f"{day_str} ({weekday}) · {market_upper} · 共 {len(messages)} 条",
+            "",
+        ]
+
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/New_York") if market == "us" else ZoneInfo("Asia/Hong_Kong")
+
+        for msg in messages:
+            ts = msg["timestamp"]
+            t_str = datetime.fromtimestamp(ts, tz=tz).strftime("%H:%M")
+            source = msg["source"]
+            trigger = msg["trigger"]
+            content = msg["content"]
+            # Truncate long content — strip HTML tags for preview
+            preview = self._STRIP_HTML_RE.sub("", content)[:80]
+            if len(self._STRIP_HTML_RE.sub("", content)) > 80:
+                preview += "…"
+            lines.append(f"{t_str} [{source}/{trigger}]")
+            lines.append(preview)
+            lines.append("")
+
+        # Split into chunks if total is too long
+        full_text = "\n".join(lines)
+        if len(full_text) <= 4000:
+            await self._reply_and_log(update, full_text, "cmd_messages", market=market)
+        else:
+            # Send in chunks
+            chunk = ""
+            for line in lines:
+                if len(chunk) + len(line) + 1 > 4000:
+                    await self._reply_and_log(update, chunk, "cmd_messages", market=market)
+                    chunk = ""
+                chunk += line + "\n"
+            if chunk.strip():
+                await self._reply_and_log(update, chunk, "cmd_messages", market=market)
 
     # ── Inline keyboard callback handlers ──
 

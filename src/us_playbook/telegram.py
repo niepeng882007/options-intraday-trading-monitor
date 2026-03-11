@@ -95,6 +95,7 @@ async def _handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         not_in_list_text="未在美股监控列表中",
         add_hint_template="+{symbol}",
         wl_command="wl",
+        market="us",
     )
 
 
@@ -111,6 +112,7 @@ async def _handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         normalize_fn=normalize_us_symbol,
         market_label="美股",
         symbol_hint=symbol or m.group(1).upper(),
+        market="us",
     )
 
 
@@ -124,6 +126,7 @@ async def _handle_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         predictor_key=_PREDICTOR_KEY,
         raw_code=m.group(1),
         normalize_fn=normalize_us_symbol,
+        market="us",
     )
 
 
@@ -134,6 +137,7 @@ async def _handle_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         market_label="US",
         empty_hint="+SPY S&amp;P 500",
         format_fn=_format_watchlist_message,
+        market="us",
     )
 
 
@@ -141,6 +145,8 @@ async def _handle_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def _cmd_us_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/us_help — show available commands."""
+    from src.common.telegram_handlers import _log_to_archive
+
     text = (
         "<b>US 期权监控使用说明</b>\n"
         + "━" * 20 + "\n"
@@ -176,3 +182,4 @@ async def _cmd_us_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• 本系统仅提供参考，不构成投资建议"
     )
     await update.message.reply_text(text, parse_mode="HTML")
+    _log_to_archive("us_playbook", "cmd_us_help", text, "us")

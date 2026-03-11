@@ -74,6 +74,12 @@ chase_risk:
   afternoon_tighten_pct: 0.3
   fade_entry_stale_moderate: 0.35
   fade_entry_stale_high: 0.55
+  fade_momentum_lookback: 8
+  fade_momentum_threshold: 0.03
+  fade_direction_cooldown_minutes: 15
+  local_trend_lookback: 30
+  local_trend_threshold: 0.02
+  min_va_width_pct: 0.80
 
 option_recommend:
   dte_min: 1
@@ -81,6 +87,66 @@ option_recommend:
   delta_min: 0.30
   delta_max: 0.50
   min_oi: 100
+  range_reversal:
+    dte_min: 3
+    dte_preferred_max: 10
+    prefer_atm: true
+    delta_min: 0.45
+    delta_max: 0.65
+
+market_tone:
+  enabled: true
+  cache_ttl: 120                    # 定调缓存 TTL (秒)
+
+  orb:
+    window_minutes: 30              # 开盘区间时长
+    reversal_check_time: "10:00"    # 反转检查时间
+    reversal_window_minutes: 15     # 反转窗口
+
+  vwap:
+    slope_lookback: 15              # 斜率回归 bar 数
+    slope_flat_threshold: 0.005     # %/bar 以下视为 flat
+
+  gap:
+    small_threshold: 0.5            # <0.5% = gap fill
+    large_threshold: 1.0            # >1.0% = gap and go
+
+  breadth:
+    basket:
+      - SPY
+      - QQQ
+      - IWM
+      - AAPL
+      - MSFT
+      - GOOGL
+      - AMZN
+      - NVDA
+      - META
+      - TSLA
+    alignment_strong: 0.75
+    alignment_weak: 0.50
+
+  vix:
+    enabled: true
+    caution_surge_pct: 5.0
+    supportive_drop_pct: 3.0
+    cache_ttl: 300
+
+  grade:
+    fomc_max_grade: "B"
+    confidence_modifiers:
+      "A+": 0.10
+      "A": 0.05
+      "B+": 0.0
+      "B": -0.05
+      "C": -0.10
+      "D": -0.15
+    auto_scan_gates:
+      "D": "skip"
+      "C": "range_reversal_only"
+    event_day:
+      fomc_trend_unlock_time: "14:00"
+      data_scan_start_time: "10:00"
 
 hist_cache_ttl: 120  # VP/历史 K 线缓存 TTL（秒）
 

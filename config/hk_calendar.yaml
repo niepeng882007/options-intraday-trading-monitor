@@ -2,6 +2,24 @@
 # risk_level: high = avoid new entries / tighten stops
 #              medium = reduce size / widen filters
 
+# Market holidays (exchange closed) — used by trading_days.py
+market_holidays:
+  - "2026-01-01"  # New Year's Day
+  - "2026-02-17"  # Lunar New Year Day 1
+  - "2026-02-18"  # Lunar New Year Day 2
+  - "2026-02-19"  # Lunar New Year Day 3
+  - "2026-04-03"  # Good Friday
+  - "2026-04-05"  # Ching Ming Festival
+  - "2026-04-06"  # Easter Monday
+  - "2026-05-01"  # Labour Day
+  - "2026-05-24"  # Buddha's Birthday
+  - "2026-06-19"  # Tuen Ng Festival
+  - "2026-07-01"  # HKSAR Establishment Day
+  - "2026-10-01"  # National Day
+  - "2026-10-07"  # Chung Yeung Festival
+  - "2026-12-25"  # Christmas Day
+  - "2026-12-26"  # Boxing Day
+
 events:
   # ── FOMC Meetings 2026 ──
   - date: "2026-03-19"

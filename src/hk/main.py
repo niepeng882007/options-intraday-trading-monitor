@@ -35,7 +35,7 @@ from src.hk.indicators import (
 )
 from src.hk.option_recommend import recommend, select_expiry
 from src.hk.playbook import format_playbook_message, generate_playbook
-from src.hk.regime import classify_regime
+from src.hk.regime import classify_regime, _intraday_trend
 from src.hk.volume_profile import calculate_volume_profile
 from src.hk.watchlist import HKWatchlist
 from src.utils.logger import setup_logger
@@ -162,6 +162,18 @@ class HKPredictor:
     async def close(self) -> None:
         await self._run_sync(self._collector.close)
         self._connected = False
+
+    async def _ensure_connected(self) -> None:
+        """Ensure Futu connection is active; attempt reconnect if needed."""
+        if self._connected:
+            return
+        logger.info("HKPredictor not connected, attempting reconnect...")
+        try:
+            await self._run_sync(self._collector.connect)
+            self._connected = True
+            logger.info("HKPredictor reconnected successfully")
+        except Exception as e:
+            raise ConnectionError(f"HK Futu 连接不可用，请检查 FutuOpenD: {e}") from e
 
     # ── Sync → Async bridge ──
 
@@ -307,6 +319,12 @@ class HKPredictor:
             intraday_range=intraday_range,
             has_volume_surge=has_surge,
             momentum_min_dist_pct=regime_cfg.get("momentum_min_dist_pct", 1.0),
+            vwap=vwap,
+            open_price=quote_snapshot.open_price,
+            prev_close=quote_snapshot.prev_close,
+            today_bars=today_bars,
+            gap_warning_pct=regime_cfg.get("gap_warning_pct", 3.0),
+            va_penetration_min_pct=regime_cfg.get("va_penetration_min_pct", 0.3),
         )
 
         # 9. Option recommendation
@@ -355,6 +373,7 @@ class HKPredictor:
 
     async def generate_playbook_for_symbol(self, symbol: str) -> PlaybookResponse:
         """Generate aggregated playbook for a single symbol. Returns PlaybookResponse with HTML + chart."""
+        await self._ensure_connected()
         regime, vp, vwap, _filters, _opt_rec, gw, playbook, today_bars = (
             await self._run_analysis_pipeline(symbol)
         )
@@ -453,6 +472,9 @@ class HKPredictor:
         # Volume surge (before regime, feeds into classify_regime)
         has_surge = _has_volume_surge(today_bars)
 
+        # L1 VWAP (lightweight, ~1ms)
+        l1_vwap = calculate_vwap(today_bars) if not today_bars.empty else 0.0
+
         # Preliminary regime (no option chain / gamma wall — lightweight)
         regime_cfg = self._cfg.get("regime", {})
         regime = classify_regime(
@@ -463,6 +485,12 @@ class HKPredictor:
             range_rvol=regime_cfg.get("range_rvol", 0.8),
             has_volume_surge=has_surge,
             momentum_min_dist_pct=regime_cfg.get("momentum_min_dist_pct", 1.0),
+            vwap=l1_vwap,
+            open_price=quote.get("open_price", 0.0),
+            prev_close=quote.get("prev_close", 0.0),
+            today_bars=today_bars,
+            gap_warning_pct=regime_cfg.get("gap_warning_pct", 3.0),
+            va_penetration_min_pct=regime_cfg.get("va_penetration_min_pct", 0.3),
         )
 
         # ── BREAKOUT L1 check (both sessions) ──
@@ -488,6 +516,25 @@ class HKPredictor:
 
             if magnitude >= bo_min_mag or has_surge:
                 direction = "bullish" if price > vp.vah else "bearish"
+
+                # Step 6: Explicit trend + VWAP filter (double safeguard)
+                trend_dir, trend_strength = _intraday_trend(today_bars)
+                if trend_strength >= 0.5:
+                    if direction == "bullish" and trend_dir == "falling":
+                        logger.info("L1 reject %s: BREAKOUT bullish but intraday falling", symbol)
+                        return None
+                    if direction == "bearish" and trend_dir == "rising":
+                        logger.info("L1 reject %s: BREAKOUT bearish but intraday rising", symbol)
+                        return None
+
+                if l1_vwap > 0:
+                    if direction == "bullish" and price < l1_vwap:
+                        logger.info("L1 reject %s: BREAKOUT bullish but below VWAP", symbol)
+                        return None
+                    if direction == "bearish" and price > l1_vwap:
+                        logger.info("L1 reject %s: BREAKOUT bearish but above VWAP", symbol)
+                        return None
+
                 triggers = []
                 if magnitude >= bo_min_mag:
                     boundary = "VAH" if price > vp.vah else "VAL"
@@ -764,6 +811,8 @@ class HKPredictor:
         scan_cfg = self._cfg.get("auto_scan", {})
         if not scan_cfg.get("enabled", False):
             return
+        if not self._connected:
+            return
 
         # Window check
         now_hkt = datetime.now(HKT)
@@ -895,6 +944,8 @@ class HKPredictor:
 
 async def _main() -> None:
     """Run HKPredictor as standalone with Telegram bot polling (no scheduled pushes)."""
+    from src.store import message_archive
+    message_archive.init("data/monitor.db")
 
     predictor = HKPredictor()
 
@@ -945,6 +996,7 @@ async def _main() -> None:
             pass
 
     await predictor.close()
+    message_archive.close()
     logger.info("HKPredictor shutdown")
 
 

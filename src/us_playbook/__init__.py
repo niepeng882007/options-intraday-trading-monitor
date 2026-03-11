@@ -55,6 +55,70 @@ class USRegimeResult:
 
 
 @dataclass
+class ORBRange:
+    """Opening Range Breakout — SPY first N minutes."""
+    high: float
+    low: float
+    breakout_direction: str | None = None  # "bullish" / "bearish" / None
+    confirmed: bool = False
+    reversal_failed: bool = False
+
+
+@dataclass
+class VWAPStatus:
+    """SPY VWAP position and slope."""
+    value: float
+    position: str              # "above" / "below"
+    slope: float               # %/bar
+    slope_label: str           # "rising" / "falling" / "flat"
+
+
+@dataclass
+class BreadthProxy:
+    """Multi-stock alignment proxy for market breadth."""
+    aligned_count: int
+    total_count: int
+    alignment_ratio: float
+    alignment_label: str       # "strong_aligned" / "mixed" / "divergent"
+    index_aligned: bool        # SPY+QQQ+IWM all same direction
+    details: str = ""
+
+
+@dataclass
+class VIXContext:
+    """VIX level and intraday change context."""
+    level: float
+    change_pct: float
+    signal: str                # "caution" / "neutral" / "supportive"
+    stale: bool = False
+    timestamp: float = 0.0
+
+
+@dataclass
+class MarketTone:
+    """Market-level tone assessment — produced by MarketToneEngine."""
+    grade: str                     # "A+" / "A" / "B+" / "B" / "C" / "D"
+    grade_score: int               # 0-5
+    direction: str                 # "bullish" / "bearish" / "neutral"
+    day_type: str                  # "trend" / "chop" / "event"
+    confidence_modifier: float
+    position_size_hint: str        # "full" / "reduced" / "minimal" / "sit_out"
+
+    macro_signal: str = "clear"
+    gap_signal: str = "neutral"
+    gap_pct: float = 0.0
+    vix: VIXContext | None = None
+    orb: ORBRange | None = None
+    vwap_status: VWAPStatus | None = None
+    breadth: BreadthProxy | None = None
+
+    components_aligned: list[str] = field(default_factory=list)
+    components_conflicting: list[str] = field(default_factory=list)
+    computed_at: datetime | None = None
+    details: str = ""
+
+
+@dataclass
 class USPlaybookResult:
     symbol: str
     name: str
@@ -68,6 +132,7 @@ class USPlaybookResult:
     option_rec: OptionRecommendation | None = None
     quote: QuoteSnapshot | None = None
     option_market: OptionMarketSnapshot | None = None
+    market_tone: MarketTone | None = None
 
 
 @dataclass

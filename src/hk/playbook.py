@@ -333,6 +333,39 @@ def _regime_reason_lines(
             vwap_relation = "高于" if regime.price > vwap else "低于"
             direction_text = "多头" if regime.price > vwap else "空头"
             reasons.append(f"当前价{vwap_relation} VWAP {vwap:,.2f}，盘中 {direction_text} 结构仍在。")
+
+            # VWAP contradiction warning
+            if regime.price > vp.vah and regime.price < vwap:
+                uncertainties.append(
+                    "⚠️ 矛盾信号: 价格在 VAH 上方但 VWAP 下方，"
+                    "突破方向与盘中动量不一致，建议谨慎。"
+                )
+                invalidations.append(
+                    "若价格无法回到 VWAP 上方并站稳，高位突破逻辑将逐步弱化。"
+                )
+            elif regime.price < vp.val and regime.price > vwap:
+                uncertainties.append(
+                    "⚠️ 矛盾信号: 价格在 VAL 下方但 VWAP 上方，"
+                    "跌破方向与盘中动量不一致，建议谨慎。"
+                )
+                invalidations.append(
+                    "若价格无法跌破 VWAP 下方并站稳，低位突破逻辑将逐步弱化。"
+                )
+
+        # Gap fade warning
+        if quote and quote.open_price > 0 and quote.prev_close > 0:
+            gap_pct = (quote.open_price - quote.prev_close) / quote.prev_close * 100
+            if gap_pct >= 3.0 and regime.price < quote.open_price:
+                uncertainties.append(
+                    f"⚠️ 高开回落: 今日跳空高开 {gap_pct:.1f}%，"
+                    f"当前价已低于开盘价 {quote.open_price:,.2f}，注意利好出尽风险。"
+                )
+            elif gap_pct <= -3.0 and regime.price > quote.open_price:
+                uncertainties.append(
+                    f"⚠️ 低开反弹: 今日跳空低开 {abs(gap_pct):.1f}%，"
+                    f"当前价已高于开盘价 {quote.open_price:,.2f}，空头力度可能减弱。"
+                )
+
         invalidations.append("若后续量能明显回落，同时价格重新回到价值区内，需要重新定调。")
 
     elif regime.regime == RegimeType.RANGE:

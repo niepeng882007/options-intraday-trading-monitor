@@ -81,14 +81,19 @@ def select_expiry(expiry_dates: list[dict], today: date | None = None) -> str | 
 def _decide_direction(
     regime: RegimeResult,
     vp: VolumeProfileResult,
+    vwap: float = 0.0,
 ) -> str:
     """Decide bullish / bearish / neutral based on regime + price position."""
     price = regime.price
 
     if regime.regime == RegimeType.BREAKOUT:
         if price > vp.vah:
+            if vwap > 0 and price < vwap:
+                return "neutral"  # VWAP contradiction
             return "bullish"
         if price < vp.val:
+            if vwap > 0 and price > vwap:
+                return "neutral"  # VWAP contradiction
             return "bearish"
         return "bullish" if price > vp.poc else "bearish"
 
@@ -200,7 +205,7 @@ def recommend(
     has_expiry = bool(expiry_dates)
 
     # Direction first — needed for degraded recommendations
-    direction = _decide_direction(regime, vp)
+    direction = _decide_direction(regime, vp, vwap=vwap)
 
     # Check regime/filter-based wait conditions first.
     # Chain/expiry availability is handled explicitly below

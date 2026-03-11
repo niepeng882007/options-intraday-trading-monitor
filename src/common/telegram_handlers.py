@@ -36,6 +36,15 @@ async def _retry_send(coro_fn, max_retries=3):
             await asyncio.sleep(delay)
 
 
+def _log_to_archive(source: str, trigger: str, content: str, market: str) -> None:
+    """Log a message to the archive (best-effort, no-op if not initialized)."""
+    try:
+        from src.store import message_archive
+        message_archive.log(source, trigger, content, market)
+    except Exception:
+        pass
+
+
 async def handle_query_base(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -45,6 +54,7 @@ async def handle_query_base(
     not_in_list_text: str,
     add_hint_template: str,
     wl_command: str,
+    market: str = "us",
 ) -> None:
     """Base handler for symbol query → playbook generation."""
     predictor = context.bot_data[predictor_key]
@@ -52,6 +62,8 @@ async def handle_query_base(
     symbol = normalize_fn(text)
     if not symbol:
         return
+
+    source = f"{market}_playbook"
 
     wl = predictor.watchlist
     if not wl.contains(symbol):
@@ -92,6 +104,7 @@ async def handle_query_base(
         await _retry_send(lambda: update.message.reply_text(
             result.html, parse_mode="HTML", read_timeout=30, write_timeout=30,
         ))
+        _log_to_archive(source, "playbook_query", result.html, market)
     except Exception as e:
         logger.exception("Playbook generation failed for %s", symbol)
         try:
@@ -99,6 +112,7 @@ async def handle_query_base(
             await _retry_send(lambda: update.message.reply_text(
                 err_msg, parse_mode="HTML", read_timeout=15, write_timeout=15,
             ))
+            _log_to_archive(source, "playbook_query", err_msg, market)
         except Exception:
             logger.warning("Failed to send error message for %s", symbol)
 
@@ -111,6 +125,7 @@ async def handle_add_base(
     normalize_fn: Callable[[str], str | None],
     market_label: str,
     symbol_hint: str = "",
+    market: str = "us",
 ) -> None:
     """Base handler for +SYMBOL [name] → add to watchlist."""
     predictor = context.bot_data[predictor_key]
@@ -121,21 +136,24 @@ async def handle_add_base(
         await update.message.reply_text("❌ 无效的代码格式")
         return
 
+    source = f"{market}_playbook"
     added = predictor.watchlist.add(symbol, name)
     if added:
         display = f"{name} ({symbol})" if name else symbol
         hint = symbol_hint or symbol
         markup = _refreshed_keyboard(context.bot_data)
-        await update.message.reply_text(
+        reply = (
             f"✅ 已添加 <b>{_esc(display)}</b> 到{market_label}监控列表\n"
-            f"现在直接发送 <code>{hint}</code> 即可查看完整剧本。",
-            parse_mode="HTML",
-            reply_markup=markup,
+            f"现在直接发送 <code>{hint}</code> 即可查看完整剧本。"
         )
-    else:
         await update.message.reply_text(
-            f"{_esc(symbol)} 已在监控列表中",
+            reply, parse_mode="HTML", reply_markup=markup,
         )
+        _log_to_archive(source, "watchlist_add", reply, market)
+    else:
+        reply = f"{_esc(symbol)} 已在监控列表中"
+        await update.message.reply_text(reply)
+        _log_to_archive(source, "watchlist_add", reply, market)
 
 
 async def handle_remove_base(
@@ -144,6 +162,7 @@ async def handle_remove_base(
     predictor_key: str,
     raw_code: str,
     normalize_fn: Callable[[str], str | None],
+    market: str = "us",
 ) -> None:
     """Base handler for -SYMBOL → remove from watchlist."""
     predictor = context.bot_data[predictor_key]
@@ -152,18 +171,21 @@ async def handle_remove_base(
         await update.message.reply_text("❌ 无效的代码格式")
         return
 
+    source = f"{market}_playbook"
     name = predictor.watchlist.get_name(symbol)
     removed = predictor.watchlist.remove(symbol)
     if removed:
         display = f"{name} ({symbol})" if name != symbol else symbol
         markup = _refreshed_keyboard(context.bot_data)
+        reply = f"✅ 已移除 <b>{_esc(display)}</b>"
         await update.message.reply_text(
-            f"✅ 已移除 <b>{_esc(display)}</b>",
-            parse_mode="HTML",
-            reply_markup=markup,
+            reply, parse_mode="HTML", reply_markup=markup,
         )
+        _log_to_archive(source, "watchlist_remove", reply, market)
     else:
-        await update.message.reply_text(f"{_esc(symbol)} 不在监控列表中")
+        reply = f"{_esc(symbol)} 不在监控列表中"
+        await update.message.reply_text(reply)
+        _log_to_archive(source, "watchlist_remove", reply, market)
 
 
 async def handle_watchlist_base(
@@ -173,17 +195,21 @@ async def handle_watchlist_base(
     market_label: str,
     empty_hint: str,
     format_fn: Callable[[list[dict]], str],
+    market: str = "us",
 ) -> None:
     """Base handler for watchlist view."""
     predictor = context.bot_data[predictor_key]
     items = predictor.watchlist.list_all()
 
+    source = f"{market}_playbook"
+
     if not items:
-        await update.message.reply_text(
+        reply = (
             "监控列表为空\n"
-            f"发送 <code>{empty_hint}</code> 添加标的。",
-            parse_mode="HTML",
+            f"发送 <code>{empty_hint}</code> 添加标的。"
         )
+        await update.message.reply_text(reply, parse_mode="HTML")
+        _log_to_archive(source, "watchlist_view", reply, market)
         return
 
     # Build keyboard layout: 3 or 4 symbols per row
@@ -204,11 +230,11 @@ async def handle_watchlist_base(
         one_time_keyboard=False,
     )
 
+    reply = format_fn(items)
     await update.message.reply_text(
-        format_fn(items),
-        parse_mode="HTML",
-        reply_markup=reply_markup
+        reply, parse_mode="HTML", reply_markup=reply_markup,
     )
+    _log_to_archive(source, "watchlist_view", reply, market)
 
 
 def _refreshed_keyboard(bot_data: dict) -> ReplyKeyboardMarkup | None:

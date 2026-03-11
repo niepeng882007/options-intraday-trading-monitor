@@ -108,7 +108,13 @@ def _is_monthly_opex(d: date) -> bool:
 
 
 def _check_calendar(today: date, calendar_path: str) -> tuple[list[str], bool]:
-    """Check US economic calendar. Returns (warnings, is_blocked)."""
+    """Check US economic calendar. Returns (warnings, is_blocked).
+
+    Events with ``behavior`` (range_then_trend / data_reaction) are treated
+    as elevated rather than blocked — MarketTone handles the fine-grained
+    time-window control.  Events without ``behavior`` (e.g. holidays) remain
+    blocked.
+    """
     try:
         with open(calendar_path, "r") as f:
             cal = yaml.safe_load(f)
@@ -119,7 +125,7 @@ def _check_calendar(today: date, calendar_path: str) -> tuple[list[str], bool]:
         return [], False
 
     events = cal.get("events", [])
-    warnings = []
+    warnings: list[str] = []
     blocked = False
 
     for event in events:
@@ -132,13 +138,71 @@ def _check_calendar(today: date, calendar_path: str) -> tuple[list[str], bool]:
 
         name = event.get("name", "Unknown")
         risk = event.get("risk_level", "medium")
+        behavior = event.get("behavior", "")
 
         if event_date == today:
-            warnings.append(f"今日宏观事件 [{risk.upper()}]: {name}")
             if risk == "high":
-                blocked = True
+                if behavior in ("range_then_trend", "data_reaction"):
+                    # Macro data day — elevated, not blocked
+                    warnings.append(f"⚠️ 宏观事件日 [{name}] — 定调建议参考")
+                else:
+                    # Holiday or unspecified — fully blocked
+                    warnings.append(f"今日宏观事件 [{risk.upper()}]: {name}")
+                    blocked = True
+            else:
+                warnings.append(f"今日宏观事件 [{risk.upper()}]: {name}")
 
     return warnings, blocked
+
+
+def get_today_macro_context(
+    calendar_path: str = "config/us_calendar.yaml",
+    today: date | None = None,
+) -> dict:
+    """Return structured macro event context for today.
+
+    Returns::
+
+        {"event_name": str | None, "risk": str, "behavior": str}
+
+    ``behavior``:
+        - ``"clear"`` — no high-risk event today
+        - ``"range_then_trend"`` — FOMC: range before 2PM, trend after
+        - ``"data_reaction"`` — NFP/CPI: data released pre-market, trade after 10AM
+    """
+    if today is None:
+        today = datetime.now(ET).date()
+
+    try:
+        with open(calendar_path, "r") as f:
+            cal = yaml.safe_load(f)
+    except Exception:
+        return {"event_name": None, "risk": "normal", "behavior": "clear"}
+
+    for event in cal.get("events", []):
+        event_date = event.get("date", "")
+        if isinstance(event_date, str):
+            try:
+                event_date = datetime.strptime(event_date, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+
+        if event_date == today and event.get("risk_level") == "high":
+            behavior = event.get("behavior", "")
+            if behavior in ("range_then_trend", "data_reaction"):
+                return {
+                    "event_name": event.get("name", "Unknown"),
+                    "risk": "elevated",
+                    "behavior": behavior,
+                }
+            # Holiday or no behavior — blocked
+            return {
+                "event_name": event.get("name", "Unknown"),
+                "risk": "blocked",
+                "behavior": "blocked",
+            }
+
+    return {"event_name": None, "risk": "normal", "behavior": "clear"}
 
 
 def _load_earnings_cache() -> dict:

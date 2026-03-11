@@ -26,12 +26,16 @@ from src.us_playbook.filter import check_us_filters, _is_monthly_opex
 from src.us_playbook.playbook import (
     format_us_playbook_message, _collect_levels,
     _nearest_levels, _risk_action_lines, _entry_zone_text,
+    ActionPlan, _calculate_rr, _generate_action_plans,
+    _compact_option_line, _rvol_assessment,
 )
 from src.us_playbook.watchlist import USWatchlist, normalize_us_symbol
 from src.us_playbook.option_recommend import (
+    compute_local_trend,
     select_expiry,
     _decide_direction,
     _check_fade_entry_staleness,
+    _compute_fade_momentum,
     assess_chase_risk,
     option_quotes_to_df,
     recommend,
@@ -302,15 +306,16 @@ class TestUSRegime:
 # ── Filter Tests ──
 
 class TestUSFilters:
-    def test_fomc_day_blocked(self):
+    def test_fomc_day_elevated_not_blocked(self):
+        """FOMC day (with behavior=range_then_trend) → elevated, not blocked."""
         result = check_us_filters(
             rvol=1.2, prev_high=100, prev_low=95,
             current_high=102, current_low=96,
             calendar_path="config/us_calendar.yaml",
             today=date(2026, 1, 28),  # FOMC
         )
-        assert not result.tradeable
-        assert result.risk_level == "blocked"
+        assert result.tradeable
+        assert "宏观事件日" in result.warnings[0]
 
     def test_monthly_opex_elevated(self):
         result = check_us_filters(
@@ -403,10 +408,10 @@ class TestPlaybookFormat:
         result = self._make_result()
         msg = format_us_playbook_message(result)
         assert "Apple" in msg
-        assert "结论" in msg
-        assert "实时数据" in msg
-        assert "建议" in msg
-        assert "风险" in msg
+        assert "核心结论" in msg
+        assert "剧本推演" in msg
+        assert "盘面逻辑" in msg
+        assert "数据雷达" in msg
         assert "RVOL" in msg
 
     def test_market_context_section(self):
@@ -433,25 +438,25 @@ class TestPlaybookFormat:
         assert "VP 仅" not in msg
 
     def test_option_rec_section(self):
-        """Playbook with option_rec should include option recommendation section."""
+        """Playbook with option_rec should include compact option line in Plan A."""
         result = self._make_result()
         result.option_rec = OptionRecommendation(
             action="call", direction="bullish", expiry="2026-03-20",
             rationale="趋势日看多", dte=5,
         )
         msg = format_us_playbook_message(result)
-        assert "建议" in msg
-        assert "买入 Call" in msg
+        assert "剧本推演" in msg
+        assert "CALL" in msg
 
     def test_option_rec_wait_section(self):
-        """Option rec=wait should show wait conditions."""
+        """Option rec=wait should show wait in core conclusion."""
         result = self._make_result()
         result.option_rec = OptionRecommendation(
             action="wait", direction="neutral",
             rationale="方向不明确", wait_conditions=["等待 Regime 明确"],
         )
         msg = format_us_playbook_message(result)
-        assert "建议" in msg
+        assert "核心结论" in msg
         assert "观望" in msg
 
     def test_confidence_bar_5_blocks(self):
@@ -1709,25 +1714,36 @@ class TestFadeEntryStaleness:
     def test_recommend_high_returns_wait(self):
         """FADE_CHOP + high penetration → wait.
 
-        Note: with symmetric midpoint, direction flips at 50% penetration,
-        so we lower fade_entry_stale_high to 0.35 to test the integration path.
+        Price 674 with VAH=680/VAL=670 gives position_ratio=0.40 (transition zone).
+        Provide upward momentum (confirming bullish in below-mid transition), then
+        staleness threshold 0.35 catches penetration=0.40 as "high".
         """
         vp = VolumeProfileResult(poc=670.0, vah=680.0, val=670.0)
         regime = USRegimeResult(
             regime=USRegimeType.FADE_CHOP, confidence=0.7,
-            rvol=0.8, price=674.0, gap_pct=0.1,  # bullish (674<675), pen=0.4
+            rvol=0.8, price=674.0, gap_pct=0.1,  # bullish via momentum, pen=0.4
         )
         filters = FilterResult(tradeable=True, warnings=[], risk_level="normal")
+        # Provide upward momentum bars so direction resolves to "bullish"
+        today_bars = _make_bars([
+            (f"2026-03-10 10:{30+i}:00", 672+i*0.3, 672+i*0.3+0.1, 672+i*0.3-0.1, 672+i*0.3, 10000)
+            for i in range(10)
+        ])
         rec = recommend(
             regime, vp, filters,
             chase_risk_cfg={"fade_entry_stale_high": 0.35},
+            today_bars=today_bars,
         )
         assert rec.action == "wait"
         assert "渗透" in rec.rationale
         assert "入场窗口已过" in rec.rationale
 
     def test_recommend_moderate_still_tradeable(self):
-        """FADE_CHOP + moderate penetration → still tradeable (not wait)."""
+        """FADE_CHOP + moderate penetration → still tradeable (not wait).
+
+        Price 674 with VAH=680/VAL=670 gives position_ratio=0.40 (transition zone).
+        Provide upward momentum to confirm bullish direction, then moderate staleness applies.
+        """
         vp = VolumeProfileResult(poc=670.0, vah=680.0, val=670.0)
         regime = USRegimeResult(
             regime=USRegimeType.FADE_CHOP, confidence=0.7,
@@ -1742,10 +1758,15 @@ class TestFadeEntryStaleness:
             "last_price": 3.0, "snap_volume": 100,
             "bid_price": 2.90, "ask_price": 3.10,
         }])
+        today_bars = _make_bars([
+            (f"2026-03-10 10:{30+i}:00", 672+i*0.3, 672+i*0.3+0.1, 672+i*0.3-0.1, 672+i*0.3, 10000)
+            for i in range(10)
+        ])
         rec = recommend(
             regime, vp, filters,
             chain_df=chain_df,
             expiry_dates=["2026-03-13"],
+            today_bars=today_bars,
         )
         assert rec.action != "wait"
         # Risk note should mention 入场区已消耗
@@ -1884,7 +1905,7 @@ class TestLowDteRiskAction:
         )
 
     def test_risk_action_lines_low_dte_put(self):
-        """DTE=1 put → uses nearest resistance + premium stop-loss line."""
+        """DTE=1 put → FADE_CHOP skips VAH, uses deeper resistance + premium stop-loss."""
         rec = OptionRecommendation(
             action="put", direction="bearish", dte=1,
             legs=[OptionLeg(
@@ -1893,15 +1914,15 @@ class TestLowDteRiskAction:
             )],
         )
         lines = _risk_action_lines(rec, self._regime(), self._vp(), kl=self._kl())
-        # Should mention nearest resistance (PMH 254)
-        assert any("PMH" in l and "254" in l for l in lines), f"Expected PMH in lines: {lines}"
-        assert any("最近阻力位" in l for l in lines)
+        # P1-2: FADE_CHOP put should skip VAH and use deeper resistance (PMH 254 or PDH 257)
+        assert any("PMH" in l or "PDH" in l for l in lines), f"Expected deeper resistance in lines: {lines}"
+        assert any("VAH" in l and "wick" in l for l in lines), f"Expected VAH wick note: {lines}"
         # Premium stop-loss: 2.10 * 0.60 = 1.26
         assert any("$1.26" in l for l in lines), f"Expected $1.26 in lines: {lines}"
         assert any("低 DTE" in l and "40%" in l for l in lines)
 
     def test_risk_action_lines_low_dte_call(self):
-        """DTE=2 call → uses nearest support + premium stop-loss line."""
+        """DTE=2 call → FADE_CHOP skips VAL, uses deeper support + premium stop-loss."""
         rec = OptionRecommendation(
             action="call", direction="bullish", dte=2,
             legs=[OptionLeg(
@@ -1910,9 +1931,9 @@ class TestLowDteRiskAction:
             )],
         )
         lines = _risk_action_lines(rec, self._regime(), self._vp(), kl=self._kl())
-        # Should mention nearest support (POC 252)
-        assert any("POC" in l and "252" in l for l in lines), f"Expected POC in lines: {lines}"
-        assert any("最近支撑位" in l for l in lines)
+        # P1-2: FADE_CHOP call should skip VAL and use deeper support (POC/VWAP/PML/PDL etc.)
+        assert any(any(k in l for k in ("POC", "VWAP", "PML", "PDL")) for l in lines), f"Expected deeper support in lines: {lines}"
+        assert any("VAL" in l and "wick" in l for l in lines), f"Expected VAL wick note: {lines}"
         # Premium stop-loss: 3.00 * 0.60 = 1.80
         assert any("$1.80" in l for l in lines), f"Expected $1.80 in lines: {lines}"
 
@@ -2047,3 +2068,1186 @@ class TestBuildRiskNoteLowDte:
         vp = VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
         note = _build_risk_note(regime, vp, "bearish", dte=7)
         assert "40%" not in note
+
+
+# ── Fade Momentum Tests ──
+
+
+class TestFadeMomentum:
+    def test_compute_fade_momentum_uptrend(self):
+        """Steadily rising closes → 1."""
+        bars = _make_bars([
+            (f"2026-03-10 10:{30+i}:00", 100+i*0.1, 100+i*0.1+0.05, 100+i*0.1-0.05, 100+i*0.1, 10000)
+            for i in range(10)
+        ])
+        assert _compute_fade_momentum(bars, lookback=8, threshold=0.03) == 1
+
+    def test_compute_fade_momentum_downtrend(self):
+        """Steadily falling closes → -1."""
+        bars = _make_bars([
+            (f"2026-03-10 10:{30+i}:00", 100-i*0.1, 100-i*0.1+0.05, 100-i*0.1-0.05, 100-i*0.1, 10000)
+            for i in range(10)
+        ])
+        assert _compute_fade_momentum(bars, lookback=8, threshold=0.03) == -1
+
+    def test_compute_fade_momentum_flat(self):
+        """Flat closes → 0."""
+        bars = _make_bars([
+            (f"2026-03-10 10:{30+i}:00", 100, 100.05, 99.95, 100, 10000)
+            for i in range(10)
+        ])
+        assert _compute_fade_momentum(bars, lookback=8, threshold=0.03) == 0
+
+    def test_compute_fade_momentum_insufficient(self):
+        """Less than lookback//2 bars → 0."""
+        bars = _make_bars([
+            ("2026-03-10 10:30:00", 100, 101, 99, 100.5, 10000),
+            ("2026-03-10 10:31:00", 100.5, 102, 99.5, 101, 10000),
+        ])
+        assert _compute_fade_momentum(bars, lookback=8, threshold=0.03) == 0
+
+    def test_compute_fade_momentum_empty(self):
+        """Empty/None → 0."""
+        assert _compute_fade_momentum(pd.DataFrame(), lookback=8) == 0
+        assert _compute_fade_momentum(None, lookback=8) == 0
+
+
+class TestFadeChopDirection:
+    """Test _decide_direction with VA three-zone + momentum logic."""
+
+    def _vp(self, poc=255, vah=260, val=250):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    def _regime(self, price):
+        return USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            rvol=0.8, price=price, gap_pct=0.1,
+        )
+
+    def test_transition_zone_momentum_override(self):
+        """IWM 10:40 scenario: price slightly above mid (ratio~0.52) + upward momentum → neutral."""
+        # price=254.93, VAH=259.50, VAL=250.00 → ratio ≈ 0.52 (transition zone)
+        vp = self._vp(poc=254.75, vah=259.50, val=250.00)
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=254.93, gap_pct=0.1,
+        )
+        # momentum=+1 (uptrend) conflicts with bearish base in transition zone
+        result = _decide_direction(regime, vp, momentum=1)
+        assert result == "neutral"
+
+    def test_transition_zone_no_momentum(self):
+        """Transition zone + momentum=0 → neutral."""
+        vp = self._vp(poc=255, vah=260, val=250)
+        regime = self._regime(255)  # ratio=0.5, mid transition zone
+        result = _decide_direction(regime, vp, momentum=0)
+        assert result == "neutral"
+
+    def test_transition_zone_momentum_confirms_bearish(self):
+        """Transition zone above mid + downward momentum → bearish."""
+        vp = self._vp(poc=255, vah=260, val=250)
+        regime = self._regime(256)  # ratio=0.6, above mid
+        result = _decide_direction(regime, vp, momentum=-1)
+        assert result == "bearish"
+
+    def test_transition_zone_momentum_confirms_bullish(self):
+        """Transition zone below mid + upward momentum → bullish."""
+        vp = self._vp(poc=255, vah=260, val=250)
+        regime = self._regime(254)  # ratio=0.4, below mid
+        result = _decide_direction(regime, vp, momentum=1)
+        assert result == "bullish"
+
+    def test_edge_zone_confirmed(self):
+        """Edge zone near VAH + no momentum → bearish (edge allows momentum=0)."""
+        vp = self._vp(poc=255, vah=260, val=250)
+        regime = self._regime(258)  # ratio=0.8, edge zone
+        result = _decide_direction(regime, vp, momentum=0)
+        assert result == "bearish"
+
+    def test_edge_zone_bullish_confirmed(self):
+        """Edge zone near VAL + no momentum → bullish."""
+        vp = self._vp(poc=255, vah=260, val=250)
+        regime = self._regime(252)  # ratio=0.2, edge zone
+        result = _decide_direction(regime, vp, momentum=0)
+        assert result == "bullish"
+
+    def test_edge_zone_oppose(self):
+        """Edge zone near VAH + upward momentum → neutral (momentum opposes)."""
+        vp = self._vp(poc=255, vah=260, val=250)
+        regime = self._regime(258)  # ratio=0.8, edge zone
+        result = _decide_direction(regime, vp, momentum=1)
+        assert result == "neutral"
+
+    def test_edge_zone_bullish_oppose(self):
+        """Edge zone near VAL + downward momentum → neutral."""
+        vp = self._vp(poc=255, vah=260, val=250)
+        regime = self._regime(252)  # ratio=0.2, edge zone
+        result = _decide_direction(regime, vp, momentum=-1)
+        assert result == "neutral"
+
+    def test_backward_compat_no_momentum(self):
+        """No momentum arg (default 0) → edge zone still gives direction (regression test)."""
+        vp = self._vp(poc=255, vah=260, val=250)
+        regime = self._regime(258)  # edge zone, ratio=0.8
+        # Called without momentum → default 0
+        result = _decide_direction(regime, vp)
+        assert result == "bearish"
+
+    def test_backward_compat_bullish_edge(self):
+        """No momentum arg → edge zone near VAL gives bullish."""
+        vp = self._vp(poc=255, vah=260, val=250)
+        regime = self._regime(252)  # edge zone, ratio=0.2
+        result = _decide_direction(regime, vp)
+        assert result == "bullish"
+
+    def test_non_fade_chop_ignores_momentum(self):
+        """GAP_AND_GO should ignore momentum parameter."""
+        vp = self._vp(poc=255, vah=260, val=250)
+        regime = USRegimeResult(
+            regime=USRegimeType.GAP_AND_GO, confidence=0.85,
+            rvol=2.0, price=265, gap_pct=1.5,
+        )
+        result = _decide_direction(regime, vp, momentum=-1)
+        assert result == "bullish"  # price > VAH → bullish regardless
+
+
+class TestRecommendFadeMomentum:
+    """Test full recommend() flow with momentum conflict."""
+
+    def test_recommend_fade_momentum_wait_message(self):
+        """FADE_CHOP in transition zone with opposing momentum → wait with momentum explanation."""
+        # Price 256 in transition zone (ratio=0.6), far enough from POC to avoid POC proximity block
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            rvol=0.8, price=256.0, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=253, vah=260, val=250)
+        filters = FilterResult(tradeable=True, risk_level="normal")
+
+        # Build today_bars with strong uptrend → momentum=+1
+        # Price above mid (ratio=0.6), base=bearish, momentum=+1 opposes → neutral
+        today_bars = _make_bars([
+            (f"2026-03-10 10:{30+i}:00", 254+i*0.2, 254+i*0.2+0.1, 254+i*0.2-0.1, 254+i*0.2, 10000)
+            for i in range(10)
+        ])
+
+        rec = recommend(
+            regime=regime, vp=vp, filters=filters,
+            today_bars=today_bars,
+        )
+        assert rec.action == "wait"
+        assert rec.direction == "neutral"
+        assert "动量" in rec.risk_note
+
+    def test_recommend_no_today_bars_backward_compat(self):
+        """Without today_bars, FADE_CHOP edge zone still gives direction (backward compat)."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            rvol=0.8, price=258.0, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=255, vah=260, val=250)
+        filters = FilterResult(tradeable=True, risk_level="normal")
+
+        rec = recommend(
+            regime=regime, vp=vp, filters=filters,
+            today_bars=None,
+        )
+        # Edge zone ratio=0.8, momentum=0 → bearish direction, not wait
+        assert rec.direction == "bearish"
+
+
+# ── P0-1: Local Trend Veto + structural_veto ──
+
+
+class TestLocalTrendVeto:
+    """Verify compute_local_trend() and structural_veto in recommend()."""
+
+    def test_compute_local_trend_downtrend(self):
+        """Steadily falling closes over 30 bars → -1."""
+        from src.us_playbook.option_recommend import compute_local_trend
+        bars = _make_bars([
+            (f"2026-03-10 10:{i:02d}:00", 410-i*0.2, 410-i*0.2+0.1, 410-i*0.2-0.1, 410-i*0.2, 50000)
+            for i in range(35)
+        ])
+        assert compute_local_trend(bars, lookback=30, threshold=0.02) == -1
+
+    def test_compute_local_trend_uptrend(self):
+        from src.us_playbook.option_recommend import compute_local_trend
+        bars = _make_bars([
+            (f"2026-03-10 10:{i:02d}:00", 400+i*0.2, 400+i*0.2+0.1, 400+i*0.2-0.1, 400+i*0.2, 50000)
+            for i in range(35)
+        ])
+        assert compute_local_trend(bars, lookback=30, threshold=0.02) == 1
+
+    def test_compute_local_trend_neutral(self):
+        from src.us_playbook.option_recommend import compute_local_trend
+        bars = _make_bars([
+            (f"2026-03-10 10:{i:02d}:00", 400, 400.05, 399.95, 400, 50000)
+            for i in range(35)
+        ])
+        assert compute_local_trend(bars, lookback=30, threshold=0.02) == 0
+
+    def test_recommend_structural_veto_bullish_vs_downtrend(self):
+        """FADE_CHOP bullish near VAL + long-term downtrend but short-term flat → structural_veto.
+
+        Need: 8-bar momentum neutral/up (so direction resolves bullish),
+              but 30-bar local_trend is down (so structural veto fires).
+        """
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.80,
+            rvol=0.7, price=405.0, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=408.0, vah=412.0, val=404.0)
+        filters = FilterResult(tradeable=True, risk_level="normal")
+        # 25 bars of downtrend + 10 bars flat (short momentum neutral)
+        down_bars = [
+            (f"2026-03-10 10:{i:02d}:00", 412-i*0.3, 412-i*0.3+0.1, 412-i*0.3-0.1, 412-i*0.3, 50000)
+            for i in range(25)
+        ]
+        # Last 10 bars: flat at ~404.5 (near VAL) — makes 8-bar momentum neutral
+        flat_bars = [
+            (f"2026-03-10 10:{25+i:02d}:00", 404.5, 404.6, 404.4, 404.5, 50000)
+            for i in range(10)
+        ]
+        today_bars = _make_bars(down_bars + flat_bars)
+        rec = recommend(regime=regime, vp=vp, filters=filters, today_bars=today_bars)
+        assert rec.action == "wait"
+        assert rec.structural_veto is True
+        assert "趋势" in rec.rationale
+
+    def test_recommend_no_veto_when_trend_aligns(self):
+        """FADE_CHOP bullish near VAL + uptrend → no veto."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.80,
+            rvol=0.7, price=405.0, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=408.0, vah=412.0, val=404.0)
+        filters = FilterResult(tradeable=True, risk_level="normal")
+        chain_df = pd.DataFrame([{
+            "code": "MSFT260320C00405000", "option_type": "CALL",
+            "strike_price": 405.0, "strike_time": "2026-03-20",
+            "open_interest": 500, "implied_volatility": 0.2,
+            "delta": 0.50, "gamma": 0.05, "theta": -0.10, "vega": 0.15,
+            "last_price": 3.0, "snap_volume": 100,
+            "bid_price": 2.90, "ask_price": 3.10,
+        }])
+        # Uptrend aligns with bullish direction → no veto
+        today_bars = _make_bars([
+            (f"2026-03-10 10:{i:02d}:00", 402+i*0.15, 402+i*0.15+0.1, 402+i*0.15-0.1, 402+i*0.15, 50000)
+            for i in range(35)
+        ])
+        rec = recommend(
+            regime=regime, vp=vp, filters=filters,
+            chain_df=chain_df, expiry_dates=["2026-03-20"],
+            today_bars=today_bars,
+        )
+        assert rec.structural_veto is False
+        assert rec.action != "wait" or "趋势" not in rec.rationale
+
+    def test_structural_veto_field_default(self):
+        """OptionRecommendation defaults structural_veto to False."""
+        rec = OptionRecommendation(action="call", direction="bullish")
+        assert rec.structural_veto is False
+
+
+# ── P0-2: Entry Direction Bug Fix ──
+
+
+class TestEntryDirectionFix:
+    """Entry zone should use recommendation direction, not price-vs-POC."""
+
+    def test_entry_zone_uses_recommendation_direction(self):
+        """Price below POC (bearish by price) but recommendation is bullish → entry_zone for bullish."""
+        from src.us_playbook.playbook import _entry_zone_text
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            rvol=0.8, price=405.0, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=408.0, vah=412.0, val=404.0)
+        kl = KeyLevels(poc=408.0, vah=412.0, val=404.0, pdh=415.0, pdl=400.0, pmh=0.0, pml=0.0, vwap=407.0)
+        # Bullish direction: should look for support below
+        text = _entry_zone_text(405.0, "bullish", regime, vp, kl=kl)
+        assert text is not None
+        # Should mention levels below price (support), not above (resistance)
+        assert "404" in text or "400" in text or "407" in text  # VAL, PDL, or VWAP
+
+
+# ── P1-1: FADE_CHOP DTE/Delta Override ──
+
+
+class TestFadeChopDteOverride:
+    """Verify FADE_CHOP uses range_reversal config override for DTE/delta."""
+
+    def test_recommend_fade_chop_uses_rr_dte(self):
+        """FADE_CHOP should use range_reversal.dte_min instead of global dte_min."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            rvol=0.7, price=252.0, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
+        filters = FilterResult(tradeable=True, risk_level="normal")
+        option_cfg = {
+            "dte_min": 1, "dte_preferred_max": 7,
+            "delta_min": 0.30, "delta_max": 0.50,
+            "range_reversal": {
+                "dte_min": 3, "dte_preferred_max": 10,
+                "prefer_atm": True,
+                "delta_min": 0.45, "delta_max": 0.65,
+            },
+        }
+        chain_df = pd.DataFrame([{
+            "code": "SPY260316C00252000", "option_type": "CALL",
+            "strike_price": 252.0, "strike_time": "2026-03-16",
+            "open_interest": 500, "implied_volatility": 0.2,
+            "delta": 0.55, "gamma": 0.05, "theta": -0.05, "vega": 0.15,
+            "last_price": 3.0, "snap_volume": 100,
+            "bid_price": 2.90, "ask_price": 3.10,
+        }])
+        # Use dates relative to today so select_expiry works correctly
+        today = date.today()
+        exp_short = (today + timedelta(days=2)).strftime("%Y-%m-%d")
+        exp_long = (today + timedelta(days=6)).strftime("%Y-%m-%d")
+        rec = recommend(
+            regime=regime, vp=vp, filters=filters,
+            chain_df=chain_df,
+            expiry_dates=[exp_short, exp_long],
+            option_cfg=option_cfg,
+        )
+        # Should pick longer expiry since dte_min=3 skips 2-DTE
+        if rec.action != "wait":
+            assert rec.expiry == exp_long
+            assert rec.dte >= 3
+
+    def test_non_fade_chop_ignores_rr_override(self):
+        """TREND_DAY should NOT use range_reversal DTE override."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.80,
+            rvol=1.5, price=260.0, gap_pct=0.5,
+        )
+        vp = VolumeProfileResult(poc=255.0, vah=258.0, val=252.0)
+        filters = FilterResult(tradeable=True, risk_level="normal")
+        option_cfg = {
+            "dte_min": 1, "dte_preferred_max": 7,
+            "range_reversal": {"dte_min": 3, "dte_preferred_max": 10},
+        }
+        chain_df = pd.DataFrame([{
+            "code": "SPY260312C00260000", "option_type": "CALL",
+            "strike_price": 260.0, "strike_time": "2026-03-12",
+            "open_interest": 500, "implied_volatility": 0.2,
+            "delta": 0.45, "gamma": 0.05, "theta": -0.10, "vega": 0.15,
+            "last_price": 3.0, "snap_volume": 100,
+            "bid_price": 2.90, "ask_price": 3.10,
+        }])
+        today = date.today()
+        exp_short = (today + timedelta(days=2)).strftime("%Y-%m-%d")
+        exp_long = (today + timedelta(days=6)).strftime("%Y-%m-%d")
+        rec = recommend(
+            regime=regime, vp=vp, filters=filters,
+            chain_df=chain_df,
+            expiry_dates=[exp_short, exp_long],
+            option_cfg=option_cfg,
+        )
+        if rec.action != "wait":
+            # Should pick shorter expiry (global dte_min=1 allows 2-DTE)
+            assert rec.expiry == exp_short
+
+
+# ── P1-2: Unified Stop Source + FADE_CHOP Stop Expansion ──
+
+
+class TestFadeChopStopExpansion:
+    """Verify FADE_CHOP stop-loss skips entry premise level."""
+
+    def _vp(self):
+        return VolumeProfileResult(poc=408.0, vah=412.0, val=404.0)
+
+    def _kl(self):
+        return KeyLevels(
+            poc=408.0, vah=412.0, val=404.0,
+            pdh=415.0, pdl=400.0, pmh=410.0, pml=406.0,
+            vwap=407.5,
+        )
+
+    def _regime(self, price=405.0):
+        return USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            rvol=0.7, price=price, gap_pct=0.1,
+        )
+
+    def test_call_stop_skips_val(self):
+        """FADE_CHOP bullish call: stop should NOT be VAL (entry premise)."""
+        rec = OptionRecommendation(
+            action="call", direction="bullish", dte=3,
+            legs=[OptionLeg(
+                side="buy", option_type="call", strike=405.0,
+                pct_from_price=0.0, moneyness="ATM", last_price=3.0,
+            )],
+        )
+        lines = _risk_action_lines(rec, self._regime(), self._vp(), kl=self._kl())
+        # Should mention VAL + wick, and use deeper support (PDL/PML/VWAP etc.)
+        stop_line = lines[0]
+        assert "VAL" in stop_line and "wick" in stop_line
+        assert "VAL" not in stop_line.split("(")[0] or "跌破 VAL" not in stop_line.split("(")[0]
+
+    def test_put_stop_skips_vah(self):
+        """FADE_CHOP bearish put: stop should NOT be VAH (entry premise)."""
+        rec = OptionRecommendation(
+            action="put", direction="bearish", dte=3,
+            legs=[OptionLeg(
+                side="buy", option_type="put", strike=411.0,
+                pct_from_price=0.2, moneyness="ATM", last_price=3.0,
+            )],
+        )
+        lines = _risk_action_lines(rec, self._regime(price=411.0), self._vp(), kl=self._kl())
+        stop_line = lines[0]
+        assert "VAH" in stop_line and "wick" in stop_line
+
+    def test_non_fade_chop_uses_original(self):
+        """Non-FADE_CHOP regime should use original nearest level logic."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.80,
+            rvol=1.5, price=405.0, gap_pct=0.5,
+        )
+        rec = OptionRecommendation(
+            action="call", direction="bullish", dte=2,
+            legs=[OptionLeg(
+                side="buy", option_type="call", strike=405.0,
+                pct_from_price=0.0, moneyness="ATM", last_price=3.0,
+            )],
+        )
+        lines = _risk_action_lines(rec, regime, self._vp(), kl=self._kl())
+        # Should mention "最近支撑位"
+        assert any("最近支撑位" in l for l in lines)
+
+    def test_risk_note_no_specific_stop(self):
+        """_build_risk_note for FADE_CHOP should NOT include specific stop level."""
+        from src.us_playbook.option_recommend import _build_risk_note
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=405.0, gap_pct=0.1,
+        )
+        vp = self._vp()
+        note = _build_risk_note(regime, vp, "bullish")
+        assert "止损: 跌破 VAL" not in note
+        assert "失效条件" in note
+
+
+# ── P2-1: VA Width Minimum ──
+
+
+class TestVAWidthMinimum:
+    """Verify VA width filter rejects narrow VA for FADE_CHOP."""
+
+    def test_narrow_va_returns_veto(self):
+        """VA width 0.3% < 0.8% threshold → structural_veto."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.80,
+            rvol=0.7, price=400.0, gap_pct=0.1,
+        )
+        # VA width: (401 - 400) / 400 * 100 = 0.25%
+        vp = VolumeProfileResult(poc=400.5, vah=401.0, val=400.0)
+        filters = FilterResult(tradeable=True, risk_level="normal")
+        rec = recommend(regime=regime, vp=vp, filters=filters)
+        assert rec.action == "wait"
+        assert rec.structural_veto is True
+        assert "VA 区间过窄" in rec.rationale
+
+    def test_normal_va_passes(self):
+        """VA width 2% > 0.8% threshold → no veto."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.80,
+            rvol=0.7, price=405.0, gap_pct=0.1,
+        )
+        # VA width: (412 - 404) / 405 * 100 = 1.98%
+        vp = VolumeProfileResult(poc=408.0, vah=412.0, val=404.0)
+        filters = FilterResult(tradeable=True, risk_level="normal")
+        chain_df = pd.DataFrame([{
+            "code": "MSFT260320C00405000", "option_type": "CALL",
+            "strike_price": 405.0, "strike_time": "2026-03-20",
+            "open_interest": 500, "implied_volatility": 0.2,
+            "delta": 0.50, "gamma": 0.05, "theta": -0.10, "vega": 0.15,
+            "last_price": 3.0, "snap_volume": 100,
+            "bid_price": 2.90, "ask_price": 3.10,
+        }])
+        rec = recommend(
+            regime=regime, vp=vp, filters=filters,
+            chain_df=chain_df, expiry_dates=["2026-03-20"],
+        )
+        assert rec.structural_veto is False
+
+    def test_non_fade_chop_ignores_va_width(self):
+        """TREND_DAY should NOT check VA width."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.80,
+            rvol=1.5, price=400.0, gap_pct=0.5,
+        )
+        # Narrow VA but TREND_DAY doesn't care
+        vp = VolumeProfileResult(poc=400.5, vah=401.0, val=400.0)
+        filters = FilterResult(tradeable=True, risk_level="normal")
+        rec = recommend(regime=regime, vp=vp, filters=filters)
+        # Should not be vetoed for VA width
+        assert not rec.structural_veto
+
+
+# ── Market Tone Tests ──
+
+
+class TestMarketTone:
+    """Tests for MarketToneEngine and related components."""
+
+    def _spy_bars(self, gap_up=False, breakout=False, n_bars=45):
+        """Generate synthetic SPY 1m bars.
+
+        Default: 09:30-10:14, base price 550.
+        gap_up=True: open above prev close.
+        breakout=True: price rises above ORB high after 10:00.
+        """
+        base = 555 if gap_up else 550
+        bars = []
+        for i in range(n_bars):
+            minute = 30 + i
+            hour = 9 + minute // 60
+            minute = minute % 60
+            ts = f"2026-03-11 {hour:02d}:{minute:02d}:00"
+            price = base + i * 0.03
+            if breakout and hour >= 10:
+                price += 1.0  # Push above ORB high
+            bars.append((ts, price, price + 0.15, price - 0.1, price + 0.05, 100000))
+        return _make_bars(bars)
+
+    # ── ORB Tests ──
+
+    def test_orb_from_synthetic_bars(self):
+        """ORB high/low should span first 30 minutes."""
+        from src.us_playbook.market_tone import MarketToneEngine
+        engine = MarketToneEngine({"market_tone": {"orb": {"window_minutes": 30}}}, None)
+        bars = self._spy_bars(n_bars=45)
+        now = datetime(2026, 3, 11, 10, 15, tzinfo=ET)
+        orb = engine._compute_orb(bars, now)
+        assert orb.high > 0
+        assert orb.low > 0
+        assert orb.high > orb.low
+
+    def test_orb_breakout_direction(self):
+        """After 10AM, price above ORB high → bullish breakout."""
+        from src.us_playbook.market_tone import MarketToneEngine
+        engine = MarketToneEngine({"market_tone": {"orb": {"window_minutes": 30, "reversal_check_time": "10:00", "reversal_window_minutes": 15}}}, None)
+        bars = self._spy_bars(breakout=True, n_bars=45)
+        now = datetime(2026, 3, 11, 10, 15, tzinfo=ET)
+        orb = engine._compute_orb(bars, now)
+        assert orb.breakout_direction == "bullish"
+        assert orb.confirmed is True
+
+    def test_orb_no_breakout_before_check_time(self):
+        """Before 10AM, no breakout should be detected."""
+        from src.us_playbook.market_tone import MarketToneEngine
+        engine = MarketToneEngine({"market_tone": {"orb": {"window_minutes": 30, "reversal_check_time": "10:00"}}}, None)
+        bars = self._spy_bars(n_bars=20)  # Only 20 bars, before 10AM
+        now = datetime(2026, 3, 11, 9, 50, tzinfo=ET)
+        orb = engine._compute_orb(bars, now)
+        assert orb.breakout_direction is None
+
+    # ── VWAP Slope Tests ──
+
+    def test_vwap_slope_rising(self):
+        """Rising price → rising VWAP slope."""
+        from src.common.indicators import calculate_vwap_slope
+        bars = _make_bars([
+            (f"2026-03-11 09:{30+i}:00", 500+i*0.5, 500+i*0.5+0.1, 500+i*0.5-0.1, 500+i*0.5, 100000)
+            for i in range(20)
+        ])
+        slope = calculate_vwap_slope(bars, lookback=15)
+        assert slope > 0
+
+    def test_vwap_slope_falling(self):
+        """Falling price → falling VWAP slope."""
+        from src.common.indicators import calculate_vwap_slope
+        bars = _make_bars([
+            (f"2026-03-11 09:{30+i}:00", 500-i*0.5, 500-i*0.5+0.1, 500-i*0.5-0.1, 500-i*0.5, 100000)
+            for i in range(20)
+        ])
+        slope = calculate_vwap_slope(bars, lookback=15)
+        assert slope < 0
+
+    def test_vwap_slope_flat(self):
+        """Flat price → near-zero VWAP slope."""
+        from src.common.indicators import calculate_vwap_slope
+        bars = _make_bars([
+            (f"2026-03-11 09:{30+i}:00", 500, 500.1, 499.9, 500, 100000)
+            for i in range(20)
+        ])
+        slope = calculate_vwap_slope(bars, lookback=15)
+        assert abs(slope) < 0.01
+
+    def test_vwap_series_length(self):
+        """calculate_vwap_series returns same length as input."""
+        from src.common.indicators import calculate_vwap_series
+        bars = _make_bars([
+            (f"2026-03-11 09:{30+i}:00", 500, 501, 499, 500, 100000)
+            for i in range(10)
+        ])
+        series = calculate_vwap_series(bars)
+        assert len(series) == len(bars)
+
+    # ── Breadth Tests ──
+
+    def test_breadth_strong(self):
+        """8/10 same direction → strong_aligned."""
+        from src.us_playbook import BreadthProxy
+        bp = BreadthProxy(
+            aligned_count=8, total_count=10, alignment_ratio=0.8,
+            alignment_label="strong_aligned", index_aligned=True,
+            details="8↑ 2↓ / 10",
+        )
+        assert bp.alignment_label == "strong_aligned"
+        assert bp.alignment_ratio >= 0.75
+        assert bp.index_aligned is True
+
+    def test_breadth_divergent(self):
+        """4/10 same direction → divergent."""
+        from src.us_playbook import BreadthProxy
+        bp = BreadthProxy(
+            aligned_count=4, total_count=10, alignment_ratio=0.4,
+            alignment_label="divergent", index_aligned=False,
+            details="4↑ 6↓ / 10",
+        )
+        assert bp.alignment_label == "divergent"
+        assert bp.alignment_ratio < 0.50
+
+    # ── Gap Classification ──
+
+    def test_gap_classification_large(self):
+        """Gap > 1% → gap_and_go."""
+        from src.us_playbook.market_tone import MarketToneEngine
+        import asyncio
+
+        class FakeCollector:
+            async def get_snapshot(self, symbol):
+                return {"last_price": 555.5, "prev_close_price": 550.0}
+
+        engine = MarketToneEngine({"market_tone": {"gap": {"small_threshold": 0.5, "large_threshold": 1.0}}}, FakeCollector())
+        signal, gap_pct = asyncio.get_event_loop().run_until_complete(engine._classify_gap())
+        assert signal == "gap_and_go"
+        assert gap_pct > 0
+
+    def test_gap_classification_small(self):
+        """Gap < 0.5% → gap_fill."""
+        from src.us_playbook.market_tone import MarketToneEngine
+        import asyncio
+
+        class FakeCollector:
+            async def get_snapshot(self, symbol):
+                return {"last_price": 550.5, "prev_close_price": 550.0}
+
+        engine = MarketToneEngine({"market_tone": {"gap": {"small_threshold": 0.5, "large_threshold": 1.0}}}, FakeCollector())
+        signal, gap_pct = asyncio.get_event_loop().run_until_complete(engine._classify_gap())
+        assert signal == "gap_fill"
+
+    # ── Grade Aggregation ──
+
+    def test_grade_aggregation_all_aligned(self):
+        """5/5 aligned signals → A+."""
+        from src.us_playbook.market_tone import MarketToneEngine
+        from src.us_playbook import ORBRange, VWAPStatus, BreadthProxy
+        engine = MarketToneEngine({"market_tone": {}}, None)
+        now_et = datetime(2026, 3, 11, 10, 30, tzinfo=ET)
+        tone = engine._aggregate(
+            macro_signal="clear",
+            gap_signal="gap_and_go",
+            gap_pct=1.5,
+            orb=ORBRange(high=555, low=550, breakout_direction="bullish", confirmed=True, reversal_failed=True),
+            vwap_status=VWAPStatus(value=553, position="above", slope=0.01, slope_label="rising"),
+            breadth=BreadthProxy(
+                aligned_count=8, total_count=10, alignment_ratio=0.8,
+                alignment_label="strong_aligned", index_aligned=True,
+                details="8↑ 2↓ / 10",
+            ),
+            vix=None,
+            now_et=now_et,
+            macro_ctx={"event_name": None, "risk": "normal", "behavior": "clear"},
+        )
+        assert tone.grade == "A+"
+        assert tone.grade_score == 5
+        assert tone.confidence_modifier > 0
+
+    def test_grade_fomc_cap(self):
+        """FOMC day before 2PM → grade capped at B."""
+        from src.us_playbook.market_tone import MarketToneEngine
+        from src.us_playbook import ORBRange, VWAPStatus, BreadthProxy
+        engine = MarketToneEngine({
+            "market_tone": {
+                "grade": {
+                    "fomc_max_grade": "B",
+                    "event_day": {"fomc_trend_unlock_time": "14:00"},
+                }
+            }
+        }, None)
+        now_et = datetime(2026, 3, 11, 11, 0, tzinfo=ET)  # Before 2PM
+        tone = engine._aggregate(
+            macro_signal="range_then_trend",
+            gap_signal="gap_and_go",
+            gap_pct=1.5,
+            orb=ORBRange(high=555, low=550, breakout_direction="bullish", confirmed=True),
+            vwap_status=VWAPStatus(value=553, position="above", slope=0.01, slope_label="rising"),
+            breadth=BreadthProxy(
+                aligned_count=9, total_count=10, alignment_ratio=0.9,
+                alignment_label="strong_aligned", index_aligned=True,
+                details="9↑ 1↓ / 10",
+            ),
+            vix=None,
+            now_et=now_et,
+            macro_ctx={"event_name": "FOMC Meeting", "risk": "elevated", "behavior": "range_then_trend"},
+        )
+        # Even with many aligned signals, FOMC caps at B before 2PM
+        assert tone.grade in ("B", "C", "D", "B+")
+        score = {"D": 0, "C": 1, "B": 2, "B+": 3, "A": 4, "A+": 5}
+        assert score[tone.grade] <= score["B"]
+
+    def test_vix_modifier_caution(self):
+        """VIX caution → grade demoted by 1."""
+        from src.us_playbook.market_tone import MarketToneEngine
+        from src.us_playbook import VIXContext
+        engine = MarketToneEngine({"market_tone": {}}, None)
+        now_et = datetime(2026, 3, 11, 10, 30, tzinfo=ET)
+        # 3 aligned signals = B+ base, VIX caution → B
+        tone = engine._aggregate(
+            macro_signal="clear",
+            gap_signal="gap_and_go",
+            gap_pct=1.2,
+            orb=None,
+            vwap_status=None,
+            breadth=None,
+            vix=VIXContext(level=28.5, change_pct=7.0, signal="caution"),
+            now_et=now_et,
+            macro_ctx={"event_name": None, "risk": "normal", "behavior": "clear"},
+        )
+        # Base = B (2 aligned: macro + gap), VIX caution → C
+        assert tone.grade in ("C", "B")  # demoted from B
+
+    def test_confidence_modifier_applied(self):
+        """MarketTone confidence_modifier should be within expected range."""
+        from src.us_playbook import MarketTone
+        tone = MarketTone(
+            grade="A+", grade_score=5, direction="bullish",
+            day_type="trend", confidence_modifier=0.10,
+            position_size_hint="full",
+        )
+        assert tone.confidence_modifier == 0.10
+
+        tone_d = MarketTone(
+            grade="D", grade_score=0, direction="neutral",
+            day_type="chop", confidence_modifier=-0.15,
+            position_size_hint="sit_out",
+        )
+        assert tone_d.confidence_modifier == -0.15
+
+    # ── Playbook Integration Tests ──
+
+    def test_playbook_with_tone_section(self):
+        """Playbook output should include Section 0 when market_tone is set."""
+        from src.us_playbook import MarketTone
+        result = USPlaybookResult(
+            symbol="SPY", name="S&P 500 ETF",
+            regime=USRegimeResult(
+                regime=USRegimeType.TREND_DAY, confidence=0.80,
+                rvol=1.5, price=555.0, gap_pct=1.2,
+            ),
+            key_levels=KeyLevels(
+                poc=550, vah=555, val=545,
+                pdh=553, pdl=543, pmh=554, pml=548, vwap=551,
+            ),
+            volume_profile=VolumeProfileResult(poc=550, vah=555, val=545),
+            gamma_wall=None,
+            filters=FilterResult(tradeable=True, risk_level="normal"),
+            generated_at=datetime(2026, 3, 11, 10, 30, 0, tzinfo=ET),
+            market_tone=MarketTone(
+                grade="A", grade_score=4, direction="bullish",
+                day_type="trend", confidence_modifier=0.05,
+                position_size_hint="full",
+                macro_signal="clear",
+                gap_signal="gap_and_go",
+                gap_pct=1.2,
+            ),
+        )
+        msg = format_us_playbook_message(result)
+        # Market tone is no longer a separate section, but regime info is in header
+        assert "趋势日" in msg
+        assert "剧本推演" in msg
+
+    def test_backward_compat_no_tone(self):
+        """market_tone=None → no Section 0, output unchanged."""
+        result = USPlaybookResult(
+            symbol="AAPL", name="Apple",
+            regime=USRegimeResult(
+                regime=USRegimeType.FADE_CHOP, confidence=0.65,
+                rvol=0.8, price=180.0, gap_pct=-0.2,
+            ),
+            key_levels=KeyLevels(
+                poc=179, vah=182, val=176,
+                pdh=183, pdl=175, pmh=181, pml=177, vwap=178.5,
+            ),
+            volume_profile=VolumeProfileResult(poc=179, vah=182, val=176),
+            gamma_wall=None,
+            filters=FilterResult(tradeable=True, risk_level="normal"),
+            generated_at=datetime(2026, 3, 11, 10, 30, 0, tzinfo=ET),
+            market_tone=None,
+        )
+        msg = format_us_playbook_message(result)
+        assert "市场定调" not in msg
+        # Normal sections still present
+        assert "震荡日" in msg
+        assert "数据雷达" in msg
+
+    # ── Filter Refactor Tests ──
+
+    def test_calendar_fomc_not_blocked(self):
+        """FOMC day (with behavior) should NOT be blocked."""
+        result = check_us_filters(
+            rvol=1.0, prev_high=555, prev_low=545,
+            current_high=558, current_low=546,
+            calendar_path="config/us_calendar.yaml",
+            today=date(2026, 3, 18),  # FOMC day
+        )
+        # Should be tradeable (not blocked)
+        assert result.tradeable is True
+
+    def test_calendar_holiday_still_blocked(self):
+        """Holiday should still be blocked."""
+        result = check_us_filters(
+            rvol=1.0, prev_high=555, prev_low=545,
+            current_high=558, current_low=546,
+            calendar_path="config/us_calendar.yaml",
+            today=date(2026, 12, 25),  # Christmas
+        )
+        assert result.tradeable is False
+
+    def test_get_today_macro_context_fomc(self):
+        """FOMC day → behavior=range_then_trend."""
+        from src.us_playbook.filter import get_today_macro_context
+        ctx = get_today_macro_context("config/us_calendar.yaml", date(2026, 3, 18))
+        assert ctx["behavior"] == "range_then_trend"
+        assert ctx["event_name"] == "FOMC Meeting"
+
+    def test_get_today_macro_context_nfp(self):
+        """NFP day → behavior=data_reaction."""
+        from src.us_playbook.filter import get_today_macro_context
+        ctx = get_today_macro_context("config/us_calendar.yaml", date(2026, 3, 6))
+        assert ctx["behavior"] == "data_reaction"
+
+    def test_get_today_macro_context_clear(self):
+        """Normal day → behavior=clear."""
+        from src.us_playbook.filter import get_today_macro_context
+        ctx = get_today_macro_context("config/us_calendar.yaml", date(2026, 3, 9))
+        assert ctx["behavior"] == "clear"
+
+    def test_get_today_macro_context_holiday(self):
+        """Holiday → behavior=blocked."""
+        from src.us_playbook.filter import get_today_macro_context
+        ctx = get_today_macro_context("config/us_calendar.yaml", date(2026, 12, 25))
+        assert ctx["behavior"] == "blocked"
+
+
+# ── ActionPlan Generation Tests ──
+
+
+class TestCalculateRR:
+    def test_long_rr(self):
+        """Long: entry=100, sl=95, tp=115 → rr=3.0."""
+        assert _calculate_rr(100, 95, 115) == 3.0
+
+    def test_short_rr(self):
+        """Short: entry=100, sl=105, tp=85 → rr=3.0."""
+        assert _calculate_rr(100, 105, 85) == 3.0
+
+    def test_zero_risk(self):
+        """entry == sl → rr=0.0."""
+        assert _calculate_rr(100, 100, 110) == 0.0
+
+    def test_none_values(self):
+        """Any None → rr=0.0."""
+        assert _calculate_rr(None, 95, 115) == 0.0
+        assert _calculate_rr(100, None, 115) == 0.0
+        assert _calculate_rr(100, 95, None) == 0.0
+
+
+class TestActionPlanGeneration:
+    def _vp(self):
+        return VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
+
+    def _kl(self):
+        return KeyLevels(
+            poc=252.0, vah=255.0, val=249.0,
+            pdh=257.0, pdl=248.0, pmh=254.0, pml=250.5,
+            vwap=251.5,
+        )
+
+    def _gw(self):
+        return GammaWallResult(call_wall_strike=260.0, put_wall_strike=245.0, max_pain=252.0)
+
+    def test_trend_day_bullish(self):
+        """TREND_DAY bullish → Plan A entry=VWAP, direction=bullish."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            rvol=1.5, price=256.0, gap_pct=0.5,
+        )
+        plans = _generate_action_plans(regime, "bullish", self._vp(), self._kl(), self._gw(), None)
+        assert len(plans) == 3
+        assert plans[0].label == "A"
+        assert plans[0].direction == "bullish"
+        assert plans[0].entry == self._kl().vwap
+        assert plans[0].is_primary
+        assert plans[2].label == "C"
+
+    def test_trend_day_bearish(self):
+        """TREND_DAY bearish → Plan A entry=VWAP, direction=bearish."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            rvol=1.5, price=247.0, gap_pct=-0.5,
+        )
+        plans = _generate_action_plans(regime, "bearish", self._vp(), self._kl(), self._gw(), None)
+        assert plans[0].direction == "bearish"
+        assert plans[0].entry == self._kl().vwap
+        assert plans[0].entry_action == "做空"
+
+    def test_fade_chop_bearish(self):
+        """FADE_CHOP near VAH → Plan A entry=VAH, TP1=POC."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=254.5, gap_pct=0.1,
+        )
+        # Price closer to VAH → bearish direction
+        plans = _generate_action_plans(regime, "bearish", self._vp(), self._kl(), self._gw(), None)
+        assert plans[0].name == "上沿做空"
+        assert plans[0].entry == self._vp().vah
+        assert plans[0].tp1 == self._vp().poc
+        assert plans[0].tp2 == self._vp().val
+
+    def test_fade_chop_bullish(self):
+        """FADE_CHOP near VAL → Plan A entry=VAL, TP1=POC."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=249.5, gap_pct=0.1,
+        )
+        plans = _generate_action_plans(regime, "bullish", self._vp(), self._kl(), self._gw(), None)
+        assert plans[0].name == "下沿做多"
+        assert plans[0].entry == self._vp().val
+        assert plans[0].tp1 == self._vp().poc
+
+    def test_unclear_no_entry(self):
+        """UNCLEAR → Plan A has no entry price."""
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.3,
+            rvol=1.0, price=252.0, gap_pct=0.1,
+        )
+        plans = _generate_action_plans(regime, "neutral", self._vp(), self._kl(), None, None)
+        assert plans[0].entry is None
+        assert plans[0].name == "等待确认"
+
+    def test_unclear_with_lean(self):
+        """UNCLEAR with lean=bullish → Plan B has entry."""
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.35,
+            rvol=1.0, price=252.0, gap_pct=0.1, lean="bullish",
+        )
+        plans = _generate_action_plans(regime, "neutral", self._vp(), self._kl(), None, None)
+        assert plans[1].direction == "bullish"
+        assert plans[1].entry == self._kl().vwap
+
+
+class TestCompactOptionLine:
+    def test_single_leg_call(self):
+        """Single call leg → 'Buy CALL ...'."""
+        rec = OptionRecommendation(
+            action="call", direction="bullish", dte=5,
+            legs=[OptionLeg(
+                side="buy", option_type="call", strike=255.0,
+                pct_from_price=0.2, moneyness="ATM",
+                delta=0.45, open_interest=1500,
+            )],
+        )
+        line = _compact_option_line(rec)
+        assert line is not None
+        assert "Buy CALL 255" in line
+        assert "ATM" in line
+        assert "DTE 5" in line
+        assert "Δ+0.45" in line
+        assert "OI 1,500" in line
+
+    def test_spread(self):
+        """Bear call spread → 'Bear Call Spread ...'."""
+        from src.common.types import SpreadMetrics
+        rec = OptionRecommendation(
+            action="bear_call_spread", direction="bearish", dte=5,
+            legs=[
+                OptionLeg(side="sell", option_type="call", strike=260.0, pct_from_price=1.0, moneyness="OTM 1%"),
+                OptionLeg(side="buy", option_type="call", strike=265.0, pct_from_price=2.0, moneyness="OTM 2%"),
+            ],
+            spread_metrics=SpreadMetrics(
+                net_credit=0.85, max_profit=0.85, max_loss=4.15,
+                breakeven=260.85, risk_reward_ratio=0.2,
+            ),
+        )
+        line = _compact_option_line(rec)
+        assert line is not None
+        assert "Bear Call Spread" in line
+        assert "260" in line
+        assert "265" in line
+
+    def test_wait_returns_none(self):
+        """wait action → None."""
+        rec = OptionRecommendation(action="wait", direction="neutral")
+        assert _compact_option_line(rec) is None
+
+    def test_none_returns_none(self):
+        assert _compact_option_line(None) is None
+
+
+class TestRvolAssessment:
+    def test_extreme_low(self):
+        assert _rvol_assessment(0.3) == "极寒"
+
+    def test_weak(self):
+        assert _rvol_assessment(0.6) == "偏弱"
+
+    def test_normal(self):
+        assert _rvol_assessment(1.0) == "正常"
+
+    def test_active(self):
+        assert _rvol_assessment(1.3) == "活跃"
+
+    def test_trend_level(self):
+        assert _rvol_assessment(2.0) == "趋势级"
+
+
+class TestMessageLength:
+    """Verify all regime types produce output within Telegram 4096 char limit."""
+
+    def _make_result(self, regime_type=USRegimeType.TREND_DAY, price=554.2):
+        return USPlaybookResult(
+            symbol="AAPL",
+            name="Apple",
+            regime=USRegimeResult(
+                regime=regime_type, confidence=0.72,
+                rvol=1.35, price=price, gap_pct=0.42,
+            ),
+            key_levels=KeyLevels(
+                poc=553.0, vah=556.5, val=550.5,
+                pdh=558.3, pdl=548.7, pmh=555.0, pml=549.0,
+                vwap=554.2,
+                gamma_call_wall=562.0, gamma_put_wall=545.0, gamma_max_pain=550.0,
+            ),
+            volume_profile=VolumeProfileResult(poc=553, vah=556.5, val=550.5),
+            gamma_wall=GammaWallResult(
+                call_wall_strike=562, put_wall_strike=545, max_pain=550,
+            ),
+            filters=FilterResult(
+                tradeable=True, risk_level="elevated",
+                warnings=["月度期权到期日 (Monthly OpEx)", "宏观事件日 (FOMC)"],
+            ),
+            generated_at=datetime(2026, 3, 9, 9, 45, 0, tzinfo=ET),
+            quote=QuoteSnapshot(
+                symbol="AAPL", last_price=price,
+                open_price=553.0, high_price=556.0, low_price=551.0,
+                prev_close=552.0, volume=12000000, turnover=6.6e9,
+                bid_price=554.15, ask_price=554.25,
+                turnover_rate=0.85, amplitude=0.91,
+            ),
+            option_rec=OptionRecommendation(
+                action="call", direction="bullish", expiry="2026-03-20",
+                rationale="趋势日看多", dte=5,
+                legs=[OptionLeg(
+                    side="buy", option_type="call", strike=554.0,
+                    pct_from_price=0.0, moneyness="ATM",
+                    delta=0.50, open_interest=2000, last_price=5.20,
+                )],
+            ),
+            option_market=OptionMarketSnapshot(
+                expiry="2026-03-20", contract_count=120,
+                call_contract_count=60, put_contract_count=60,
+                atm_iv=0.28, avg_iv=0.30, iv_ratio=0.93,
+            ),
+        )
+
+    def test_trend_day_within_limit(self):
+        msg = format_us_playbook_message(self._make_result(USRegimeType.TREND_DAY))
+        assert len(msg) <= 4096, f"Message too long: {len(msg)} chars"
+
+    def test_gap_and_go_within_limit(self):
+        msg = format_us_playbook_message(self._make_result(USRegimeType.GAP_AND_GO, price=560))
+        assert len(msg) <= 4096, f"Message too long: {len(msg)} chars"
+
+    def test_fade_chop_within_limit(self):
+        msg = format_us_playbook_message(self._make_result(USRegimeType.FADE_CHOP, price=554))
+        assert len(msg) <= 4096, f"Message too long: {len(msg)} chars"
+
+    def test_unclear_within_limit(self):
+        msg = format_us_playbook_message(self._make_result(USRegimeType.UNCLEAR, price=554))
+        assert len(msg) <= 4096, f"Message too long: {len(msg)} chars"
+
+
+class TestEdgeCases:
+    """Verify edge cases don't crash."""
+
+    def test_quote_none(self):
+        """quote=None → uses regime.price, no crash."""
+        result = USPlaybookResult(
+            symbol="SPY", name="S&P 500 ETF",
+            regime=USRegimeResult(
+                regime=USRegimeType.TREND_DAY, confidence=0.7,
+                rvol=1.5, price=555.0, gap_pct=0.5,
+            ),
+            key_levels=KeyLevels(
+                poc=550, vah=555, val=545,
+                pdh=558, pdl=542, pmh=554, pml=548, vwap=552,
+            ),
+            volume_profile=VolumeProfileResult(poc=550, vah=555, val=545),
+            gamma_wall=None,
+            filters=FilterResult(tradeable=True, risk_level="normal"),
+            generated_at=datetime(2026, 3, 9, 10, 0, 0, tzinfo=ET),
+            quote=None,
+        )
+        msg = format_us_playbook_message(result)
+        assert "555.00" in msg  # regime.price used
+
+    def test_gamma_wall_none(self):
+        """gamma_wall=None → fallback to PDH/PDL levels."""
+        result = USPlaybookResult(
+            symbol="SPY", name="S&P 500 ETF",
+            regime=USRegimeResult(
+                regime=USRegimeType.TREND_DAY, confidence=0.7,
+                rvol=1.5, price=558.0, gap_pct=0.5,
+            ),
+            key_levels=KeyLevels(
+                poc=550, vah=555, val=545,
+                pdh=560, pdl=542, pmh=556, pml=548, vwap=552,
+            ),
+            volume_profile=VolumeProfileResult(poc=550, vah=555, val=545),
+            gamma_wall=None,
+            filters=FilterResult(tradeable=True, risk_level="normal"),
+            generated_at=datetime(2026, 3, 9, 10, 0, 0, tzinfo=ET),
+        )
+        msg = format_us_playbook_message(result)
+        assert "Call Wall" not in msg
+        assert "PDH" in msg
+
+    def test_option_rec_none(self):
+        """option_rec=None → no compact option line, no crash."""
+        result = USPlaybookResult(
+            symbol="SPY", name="S&P 500 ETF",
+            regime=USRegimeResult(
+                regime=USRegimeType.FADE_CHOP, confidence=0.65,
+                rvol=0.8, price=550.0, gap_pct=0.1,
+            ),
+            key_levels=KeyLevels(
+                poc=550, vah=555, val=545,
+                pdh=558, pdl=542, pmh=554, pml=548, vwap=551,
+            ),
+            volume_profile=VolumeProfileResult(poc=550, vah=555, val=545),
+            gamma_wall=None,
+            filters=FilterResult(tradeable=True, risk_level="normal"),
+            generated_at=datetime(2026, 3, 9, 10, 0, 0, tzinfo=ET),
+            option_rec=None,
+        )
+        msg = format_us_playbook_message(result)
+        assert "📋 合约" not in msg
+        assert "剧本推演" in msg

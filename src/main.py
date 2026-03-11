@@ -124,6 +124,11 @@ class OptionsMonitor:
 
         await self.redis_store.connect()
         self.sqlite_store.connect()
+
+        from src.store import message_archive
+        db_path = self.config.get("sqlite", {}).get("db_path", "data/monitor.db")
+        message_archive.init(db_path)
+
         await self.collector.connect()
 
         self.strategy_loader.load_all()
@@ -145,15 +150,15 @@ class OptionsMonitor:
             logger.info("US Predictor module initialized (on-demand + auto-scan)")
 
         # HK Playbook integration (on-demand, no scheduled pushes)
+        # Register handlers first so queries get a response even if connect fails
         if self.hk_playbook:
+            from src.hk.telegram import register_hk_predictor_handlers
+            register_hk_predictor_handlers(self.notifier._app, self.hk_playbook)
             try:
                 await self.hk_playbook.connect()
-                from src.hk.telegram import register_hk_predictor_handlers
-                register_hk_predictor_handlers(self.notifier._app, self.hk_playbook)
                 logger.info("HK Playbook module initialized (on-demand mode)")
             except Exception:
-                logger.warning("Failed to connect HK Playbook", exc_info=True)
-                self.hk_playbook = None
+                logger.warning("HK Playbook connect failed — will retry on first query", exc_info=True)
 
         # /summary command — manual daily summary trigger
         from telegram.ext import CommandHandler
@@ -177,7 +182,8 @@ class OptionsMonitor:
             "🟢 <b>系统已启动</b>\n"
             f"📋 策略: {len(self.strategy_loader.get_active())} 个活跃\n"
             f"📌 标的: {', '.join(sorted(self.strategy_loader.get_all_symbols()))}\n"
-            f"⏱ {datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ET"
+            f"⏱ {datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ET",
+            source="system", trigger="startup", market="us",
         )
 
     async def stop(self) -> None:
@@ -194,6 +200,8 @@ class OptionsMonitor:
         await self.collector.close()
         await self.redis_store.close()
         self.sqlite_store.close()
+        from src.store import message_archive
+        message_archive.close()
         logger.info("Options Monitor stopped")
 
     async def run_forever(self) -> None:
@@ -224,6 +232,7 @@ class OptionsMonitor:
             BotCommand("hk_help", "港股期权监控说明"),
             BotCommand("us_help", "美股期权监控说明"),
             BotCommand("conn", "检查Futu和Redis连接状态"),
+            BotCommand("messages", "查看上一交易日消息归档"),
             BotCommand("kb", "显示快捷查询键盘"),
             BotCommand("kboff", "关闭快捷键盘"),
         ]
@@ -329,11 +338,19 @@ class OptionsMonitor:
 
     async def _us_auto_scan(self) -> None:
         """Run US auto-scan (window/weekday check is inside run_auto_scan)."""
-        await self.us_playbook.run_auto_scan(self.notifier.send_text)
+        async def send_fn(text: str, **kwargs) -> bool:
+            return await self.notifier.send_text(
+                text, source="us_playbook", trigger="auto_scan", market="us",
+            )
+        await self.us_playbook.run_auto_scan(send_fn)
 
     async def _hk_auto_scan(self) -> None:
         """Run HK auto-scan (window/weekday check is inside run_auto_scan)."""
-        await self.hk_playbook.run_auto_scan(self.notifier.send_text)
+        async def send_fn(text: str, **kwargs) -> bool:
+            return await self.notifier.send_text(
+                text, source="hk_playbook", trigger="auto_scan", market="hk",
+            )
+        await self.hk_playbook.run_auto_scan(send_fn)
 
     def _is_trading_hours(self) -> bool:
         now = datetime.now(ET)
@@ -714,7 +731,8 @@ class OptionsMonitor:
         for entry in timed_out:
             await self.notifier.send_text(
                 f"⏰ 入场信号超时: {entry.strategy_id}:{entry.symbol}\n"
-                f"信号 {entry.signal_id} 未确认，已重置为 WATCHING"
+                f"信号 {entry.signal_id} 未确认，已重置为 WATCHING",
+                source="us_pipeline", trigger="timeout", market="us",
             )
 
     async def _health_check(self) -> None:
@@ -730,13 +748,17 @@ class OptionsMonitor:
             if not self._futu_connected:
                 self._futu_connected = True
                 logger.info("Futu connection restored")
-                await self.notifier.send_text("✅ Futu 连接已恢复，信号推送已恢复")
+                await self.notifier.send_text(
+                    "✅ Futu 连接已恢复，信号推送已恢复",
+                    source="system", trigger="health_check", market="us",
+                )
         except Exception:
             logger.error("Health check failed, attempting reconnect")
             self._futu_connected = False
             if was_connected:
                 await self.notifier.send_text(
-                    "⚠️ Futu 连接断开，信号推送已暂停\n正在尝试重连..."
+                    "⚠️ Futu 连接断开，信号推送已暂停\n正在尝试重连...",
+                    source="system", trigger="health_check", market="us",
                 )
             try:
                 await self.collector.close()
@@ -746,11 +768,17 @@ class OptionsMonitor:
                 await self.collector.connect()
                 self._futu_connected = True
                 logger.info("Futu reconnect succeeded")
-                await self.notifier.send_text("✅ Futu 重连成功，信号推送已恢复")
+                await self.notifier.send_text(
+                    "✅ Futu 重连成功，信号推送已恢复",
+                    source="system", trigger="health_check", market="us",
+                )
             except Exception:
                 logger.exception("Reconnect failed")
                 if was_connected:
-                    await self.notifier.send_text("❌ Futu 重连失败，请检查 FutuOpenD")
+                    await self.notifier.send_text(
+                        "❌ Futu 重连失败，请检查 FutuOpenD",
+                        source="system", trigger="health_check", market="us",
+                    )
 
     async def _heartbeat(self) -> None:
         """Periodic heartbeat log for liveness monitoring."""
@@ -785,7 +813,10 @@ class OptionsMonitor:
     async def _send_daily_summary(self) -> None:
         from src.common.daily_report import collect_pipeline_data, format_daily_summary
         data = collect_pipeline_data(self.sqlite_store, self._daily_pnl)
-        await self.notifier.send_text(format_daily_summary(data))
+        await self.notifier.send_text(
+            format_daily_summary(data),
+            source="system", trigger="daily_summary", market="us",
+        )
 
     async def _cmd_summary(self, update, context) -> None:
         await self._send_daily_summary()

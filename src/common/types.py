@@ -78,6 +78,7 @@ class OptionRecommendation:
     liquidity_warning: str | None = None
     spread_metrics: SpreadMetrics | None = None
     dte: int = 0
+    structural_veto: bool = False   # structural veto (trend/VA width etc.) — L2 should reject push
 
 
 @dataclass

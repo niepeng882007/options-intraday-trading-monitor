@@ -22,7 +22,7 @@ from src.hk.indicators import (
     calculate_vwap, calculate_vwap_series, calculate_rvol,
     get_today_bars, get_history_bars, is_trading_time,
 )
-from src.hk.regime import classify_regime
+from src.hk.regime import classify_regime, _intraday_trend
 from src.hk.playbook import generate_playbook, format_playbook_message
 from src.hk.filter import check_filters
 from src.hk.orderbook import analyze_order_book, format_order_book_summary, format_alerts_message
@@ -37,6 +37,7 @@ from src.hk.option_recommend import (
     recommend,
     assess_chase_risk,
     _is_positive_ev,
+    _decide_direction,
 )
 
 HKT = timezone(timedelta(hours=8))
@@ -2131,6 +2132,7 @@ class TestAutoScanIntegration:
                     "afternoon_window": ["13:05", "15:45"],
                 },
             }
+            p._connected = True
             p._scan_history = {}
             p._scan_history_date = ""
 
@@ -2193,6 +2195,7 @@ class TestAutoScanIntegration:
             p.watchlist = MagicMock()
             p.watchlist.symbols.return_value = ["HK.00700"]
             p.watchlist.get_name.return_value = "Tencent"
+            p._connected = True
             p._scan_history = {}
             p._scan_history_date = ""
             p._vp_cache = {}
@@ -2537,3 +2540,202 @@ class TestExtractIVNarrowRange:
         atm_iv, avg_iv = HKPredictor._extract_iv(chain, price=100)
         # ATM (4 nearest: 100=30, 97=35, 103=28, 95=40) mean = 33.25
         assert abs(atm_iv - 33.25) < 1.0
+
+
+# ── Intraday Trend + VWAP Contradiction Tests (2026-03-11) ──
+
+
+def _make_falling_bars(n: int = 20) -> pd.DataFrame:
+    """Create N bars with a clear downtrend (open=100, falling to ~90)."""
+    prices = []
+    base = 100.0
+    for i in range(n):
+        ts = f"2026-03-11 09:{30 + i}:00"
+        o = base - i * 0.5
+        c = o - 0.3
+        h = o + 0.1
+        l = c - 0.1
+        prices.append((ts, o, h, l, c, 1000))
+    return _make_bars(prices)
+
+
+def _make_rising_bars(n: int = 20) -> pd.DataFrame:
+    """Create N bars with a clear uptrend (open=100, rising to ~110)."""
+    prices = []
+    base = 100.0
+    for i in range(n):
+        ts = f"2026-03-11 09:{30 + i}:00"
+        o = base + i * 0.5
+        c = o + 0.3
+        h = c + 0.1
+        l = o - 0.1
+        prices.append((ts, o, h, l, c, 1000))
+    return _make_bars(prices)
+
+
+def _make_flat_bars(n: int = 5) -> pd.DataFrame:
+    """Create few flat bars (< min_bars threshold)."""
+    prices = []
+    for i in range(n):
+        ts = f"2026-03-11 09:{30 + i}:00"
+        prices.append((ts, 100.0, 100.1, 99.9, 100.0, 1000))
+    return _make_bars(prices)
+
+
+class TestIntradayTrend:
+    def test_intraday_trend_falling(self):
+        """Construct declining bars → ("falling", >=0.5)."""
+        bars = _make_falling_bars(20)
+        direction, strength = _intraday_trend(bars)
+        assert direction == "falling"
+        assert strength >= 0.5
+
+    def test_intraday_trend_rising(self):
+        """Construct rising bars → ("rising", >=0.5)."""
+        bars = _make_rising_bars(20)
+        direction, strength = _intraday_trend(bars)
+        assert direction == "rising"
+        assert strength >= 0.5
+
+    def test_intraday_trend_insufficient_bars(self):
+        """< 10 bars → ("flat", 0.0)."""
+        bars = _make_flat_bars(5)
+        direction, strength = _intraday_trend(bars)
+        assert direction == "flat"
+        assert strength == 0.0
+
+    def test_intraday_trend_none_bars(self):
+        """None bars → ("flat", 0.0)."""
+        direction, strength = _intraday_trend(None)
+        assert direction == "flat"
+        assert strength == 0.0
+
+
+class TestBreakoutVwapContradiction:
+    """Tests for VWAP/trend contradiction discounts in classify_regime."""
+
+    _base_vp = VolumeProfileResult(poc=550.0, vah=556.0, val=540.0)
+
+    def test_breakout_vwap_contradiction(self):
+        """price > VAH but < VWAP → confidence reduced by 0.20."""
+        result = classify_regime(
+            price=567.0, rvol=1.5, vp=self._base_vp,
+            breakout_rvol=1.05,
+            vwap=574.0,  # price below VWAP
+        )
+        # Without VWAP contradiction, base confidence would be ~1.0
+        assert result.regime == RegimeType.BREAKOUT
+        assert result.confidence < 0.85  # 0.20 discount applied
+        assert "VWAP contradiction" in result.details
+
+    def test_breakout_no_vwap_backward_compat(self):
+        """vwap=0 → no VWAP discount applied (backward compatible)."""
+        result = classify_regime(
+            price=567.0, rvol=1.5, vp=self._base_vp,
+            breakout_rvol=1.05,
+            vwap=0.0,
+        )
+        assert result.regime == RegimeType.BREAKOUT
+        assert "VWAP contradiction" not in result.details
+
+    def test_breakout_falling_trend(self):
+        """Falling today_bars → confidence reduced."""
+        bars = _make_falling_bars(20)
+        result = classify_regime(
+            price=567.0, rvol=1.5, vp=self._base_vp,
+            breakout_rvol=1.05,
+            today_bars=bars,
+        )
+        assert result.regime == RegimeType.BREAKOUT
+        assert result.confidence < 0.85
+        assert "trend contradiction" in result.details
+
+    def test_breakout_combined_degrades_to_unclear(self):
+        """VWAP contradiction + trend contradiction → UNCLEAR."""
+        bars = _make_falling_bars(20)
+        result = classify_regime(
+            price=557.0, rvol=1.2, vp=self._base_vp,
+            breakout_rvol=1.05,
+            vwap=574.0,  # VWAP contradiction: -0.20
+            today_bars=bars,  # trend contradiction: -0.20
+            # shallow penetration (557 vs VAH 556 = 0.18%): -0.15
+        )
+        # Combined: -0.55 from ~0.65 base → <0.40 → UNCLEAR
+        assert result.regime == RegimeType.UNCLEAR
+        assert result.confidence < 0.40
+
+    def test_breakout_shallow_penetration(self):
+        """Price barely above VAH (0.1%) → shallow penetration discount."""
+        result = classify_regime(
+            price=556.5, rvol=1.5, vp=self._base_vp,
+            breakout_rvol=1.05,
+            va_penetration_min_pct=0.3,
+        )
+        assert result.regime == RegimeType.BREAKOUT
+        assert result.confidence < 0.90  # 0.15 discount for shallow penetration
+        assert "shallow penetration" in result.details
+
+    def test_breakout_gap_fade(self):
+        """Gap +5% but price < open → confidence reduced."""
+        result = classify_regime(
+            price=567.0, rvol=1.5, vp=self._base_vp,
+            breakout_rvol=1.05,
+            open_price=578.0,
+            prev_close=550.0,  # gap = +5.1%
+            gap_warning_pct=3.0,
+        )
+        assert result.regime == RegimeType.BREAKOUT
+        assert "gap fade" in result.details
+
+    def test_breakout_below_val_vwap_contradiction(self):
+        """price < VAL but > VWAP → VWAP contradiction."""
+        vp = VolumeProfileResult(poc=550.0, vah=560.0, val=540.0)
+        result = classify_regime(
+            price=535.0, rvol=1.5, vp=vp,
+            breakout_rvol=1.05,
+            vwap=530.0,  # price > VWAP → contradiction for bearish
+        )
+        assert result.regime == RegimeType.BREAKOUT
+        assert "VWAP contradiction" in result.details
+
+
+class TestDirectionVwapContradiction:
+    """Tests for _decide_direction with VWAP contradiction."""
+
+    _vp = VolumeProfileResult(poc=550.0, vah=556.0, val=540.0)
+
+    def test_direction_vwap_contradiction_neutral(self):
+        """price > VAH but < VWAP → neutral."""
+        regime = RegimeResult(
+            regime=RegimeType.BREAKOUT, confidence=0.8,
+            rvol=1.5, price=567.0, vah=556.0, val=540.0, poc=550.0,
+        )
+        direction = _decide_direction(regime, self._vp, vwap=574.0)
+        assert direction == "neutral"
+
+    def test_direction_no_vwap_compat(self):
+        """vwap=0 → normal bullish (backward compatible)."""
+        regime = RegimeResult(
+            regime=RegimeType.BREAKOUT, confidence=0.8,
+            rvol=1.5, price=567.0, vah=556.0, val=540.0, poc=550.0,
+        )
+        direction = _decide_direction(regime, self._vp, vwap=0.0)
+        assert direction == "bullish"
+
+    def test_direction_bearish_vwap_contradiction(self):
+        """price < VAL but > VWAP → neutral."""
+        regime = RegimeResult(
+            regime=RegimeType.BREAKOUT, confidence=0.8,
+            rvol=1.5, price=535.0, vah=556.0, val=540.0, poc=550.0,
+        )
+        direction = _decide_direction(regime, self._vp, vwap=530.0)
+        assert direction == "neutral"
+
+    def test_direction_aligned_vwap(self):
+        """price > VAH and > VWAP → bullish (no contradiction)."""
+        regime = RegimeResult(
+            regime=RegimeType.BREAKOUT, confidence=0.8,
+            rvol=1.5, price=567.0, vah=556.0, val=540.0, poc=550.0,
+        )
+        direction = _decide_direction(regime, self._vp, vwap=560.0)
+        assert direction == "bullish"

@@ -111,6 +111,9 @@ async def main() -> None:
 
     predictor = USPredictor(cfg, collector)
 
+    from src.store import message_archive
+    message_archive.init("data/monitor.db")
+
     # Optional: Telegram integration
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -130,6 +133,7 @@ async def main() -> None:
         async def _send_fn(text: str, parse_mode: str = "HTML") -> None:
             if app and chat_id:
                 await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+                message_archive.log("us_playbook", "auto_scan", text, "us")
             else:
                 logger.info("Auto-scan (no TG): %s", text[:200])
 
@@ -154,6 +158,7 @@ async def main() -> None:
     if app:
         await _shutdown_telegram_application(app)
     await collector.close()
+    message_archive.close()
     logger.info("US Predictor stopped")
 
 

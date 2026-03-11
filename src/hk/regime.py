@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pandas as pd
+
 from src.hk import RegimeType, RegimeResult, VolumeProfileResult, GammaWallResult
 from src.utils.logger import setup_logger
 
@@ -30,6 +32,63 @@ def _price_va_distance_factor(
     return min(1.0, max(0.0, dist_from_edge / (va_range * 0.5)))
 
 
+def _intraday_trend(
+    today_bars: pd.DataFrame,
+    min_bars: int = 10,
+) -> tuple[str, float]:
+    """Detect intraday trend direction and strength.
+
+    Returns (direction, strength).
+    direction: "rising" | "falling" | "flat"
+    strength: 0.0-1.0
+    """
+    if today_bars is None or today_bars.empty or len(today_bars) < min_bars:
+        return ("flat", 0.0)
+
+    close = today_bars["Close"]
+
+    # EMA-10 vs EMA-20 slope direction
+    ema10 = close.ewm(span=10, adjust=False).mean()
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema_bullish = float(ema10.iloc[-1]) > float(ema20.iloc[-1])
+
+    # Count lower-lows and higher-highs in recent N bars
+    recent = today_bars.iloc[-min_bars:]
+    lows = recent["Low"].values
+    highs = recent["High"].values
+    lower_lows = sum(1 for i in range(1, len(lows)) if lows[i] < lows[i - 1])
+    higher_highs = sum(1 for i in range(1, len(highs)) if highs[i] > highs[i - 1])
+    n = len(lows) - 1
+    ll_ratio = lower_lows / n if n > 0 else 0.0
+    hh_ratio = higher_highs / n if n > 0 else 0.0
+
+    # Open → current direction
+    open_price = float(close.iloc[0])
+    current_price = float(close.iloc[-1])
+    if open_price > 0:
+        move_pct = (current_price - open_price) / open_price
+    else:
+        move_pct = 0.0
+
+    # Composite scoring
+    score = 0.0
+    if ema_bullish:
+        score += 0.3
+    else:
+        score -= 0.3
+    score += (hh_ratio - ll_ratio) * 0.4
+    if move_pct > 0.002:
+        score += 0.3
+    elif move_pct < -0.002:
+        score -= 0.3
+
+    if score > 0.15:
+        return ("rising", min(1.0, score))
+    elif score < -0.15:
+        return ("falling", min(1.0, abs(score)))
+    return ("flat", abs(score))
+
+
 def classify_regime(
     price: float,
     rvol: float,
@@ -43,6 +102,12 @@ def classify_regime(
     intraday_range: float = 0.0,
     has_volume_surge: bool = False,
     momentum_min_dist_pct: float = 1.0,
+    vwap: float = 0.0,
+    open_price: float = 0.0,
+    prev_close: float = 0.0,
+    today_bars: pd.DataFrame | None = None,
+    gap_warning_pct: float = 3.0,
+    va_penetration_min_pct: float = 0.3,
 ) -> RegimeResult:
     """Classify current market regime.
 
@@ -87,10 +152,74 @@ def classify_regime(
         va_adj = _price_va_distance_factor(price, vp.vah, vp.val, "BREAKOUT") * 0.1
         gw_adj = -0.05 if near_gamma_wall else 0.0
         confidence = min(1.0, max(0.0, base + va_adj + gw_adj))
+        details = f"RVOL {rvol:.2f} > {breakout_rvol}, price {direction}"
+
+        # ── Breakout discount layers ──
+        has_vwap_contradiction = False
+        has_trend_contradiction = False
+
+        # 3a. VWAP contradiction
+        if vwap > 0:
+            if price > vp.vah and price < vwap:
+                confidence -= 0.20
+                details += ", VWAP contradiction (above VAH but below VWAP)"
+                has_vwap_contradiction = True
+            elif price < vp.val and price > vwap:
+                confidence -= 0.20
+                details += ", VWAP contradiction (below VAL but above VWAP)"
+                has_vwap_contradiction = True
+
+        # 3b. Shallow VA penetration
+        va_range = vp.vah - vp.val
+        if va_range > 0 and va_penetration_min_pct > 0:
+            if price > vp.vah:
+                penetration_pct = (price - vp.vah) / price * 100
+            else:
+                penetration_pct = (vp.val - price) / price * 100
+            if penetration_pct < va_penetration_min_pct:
+                confidence -= 0.15
+                details += f", shallow penetration ({penetration_pct:.2f}%)"
+
+        # 3c. Intraday trend contradiction
+        trend_dir, trend_strength = _intraday_trend(today_bars)
+        if trend_strength >= 0.5:
+            if price > vp.vah and trend_dir == "falling":
+                confidence -= 0.20
+                details += ", trend contradiction (falling)"
+                has_trend_contradiction = True
+            elif price < vp.val and trend_dir == "rising":
+                confidence -= 0.20
+                details += ", trend contradiction (rising)"
+                has_trend_contradiction = True
+
+        # 3d. Gap fade
+        if prev_close > 0 and open_price > 0:
+            gap_pct = (open_price - prev_close) / prev_close * 100
+            if abs(gap_pct) >= gap_warning_pct:
+                # Price faded back past open
+                if gap_pct > 0 and price < open_price:
+                    fade_pct = (open_price - price) / open_price * 100
+                    confidence -= min(0.15, fade_pct * 0.05)
+                    details += f", gap fade (gap +{gap_pct:.1f}%, faded {fade_pct:.1f}%)"
+                elif gap_pct < 0 and price > open_price:
+                    fade_pct = (price - open_price) / open_price * 100
+                    confidence -= min(0.15, fade_pct * 0.05)
+                    details += f", gap fade (gap {gap_pct:.1f}%, faded {fade_pct:.1f}%)"
+
+        confidence = max(0.0, confidence)
+
+        # 3e. Downgrade to UNCLEAR if too many contradictions
+        if confidence < 0.40 and (has_vwap_contradiction or has_trend_contradiction):
+            return RegimeResult(
+                regime=RegimeType.UNCLEAR, confidence=confidence,
+                rvol=rvol, price=price, vah=vp.vah, val=vp.val, poc=vp.poc,
+                details=details + " → downgraded to UNCLEAR",
+            )
+
         return RegimeResult(
             regime=RegimeType.BREAKOUT, confidence=confidence,
             rvol=rvol, price=price, vah=vp.vah, val=vp.val, poc=vp.poc,
-            details=f"RVOL {rvol:.2f} > {breakout_rvol}, price {direction}",
+            details=details,
         )
 
     # Style B: Range
@@ -155,10 +284,46 @@ def classify_regime(
             ]
             if has_volume_surge:
                 details_parts.append("volume surge detected")
+
+            # ── Momentum breakout discount layers (VWAP + trend) ──
+            has_vwap_contradiction = False
+            has_trend_contradiction = False
+
+            if vwap > 0:
+                if price > vp.vah and price < vwap:
+                    confidence -= 0.20
+                    details_parts.append("VWAP contradiction")
+                    has_vwap_contradiction = True
+                elif price < vp.val and price > vwap:
+                    confidence -= 0.20
+                    details_parts.append("VWAP contradiction")
+                    has_vwap_contradiction = True
+
+            trend_dir, trend_strength = _intraday_trend(today_bars)
+            if trend_strength >= 0.5:
+                if price > vp.vah and trend_dir == "falling":
+                    confidence -= 0.20
+                    details_parts.append("trend contradiction (falling)")
+                    has_trend_contradiction = True
+                elif price < vp.val and trend_dir == "rising":
+                    confidence -= 0.20
+                    details_parts.append("trend contradiction (rising)")
+                    has_trend_contradiction = True
+
+            confidence = max(0.0, confidence)
+            details = ", ".join(details_parts)
+
+            if confidence < 0.40 and (has_vwap_contradiction or has_trend_contradiction):
+                return RegimeResult(
+                    regime=RegimeType.UNCLEAR, confidence=confidence,
+                    rvol=rvol, price=price, vah=vp.vah, val=vp.val, poc=vp.poc,
+                    details=details + " → downgraded to UNCLEAR",
+                )
+
             return RegimeResult(
                 regime=RegimeType.BREAKOUT, confidence=confidence,
                 rvol=rvol, price=price, vah=vp.vah, val=vp.val, poc=vp.poc,
-                details=", ".join(details_parts),
+                details=details,
             )
 
     # Style D: Unclear

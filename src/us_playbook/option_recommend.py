@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
 from src.collector.base import OptionQuote
@@ -119,14 +120,75 @@ def select_expiry(
     return candidates[0][1]
 
 
+# ── Fade momentum ──
+
+
+def _compute_fade_momentum(
+    today_bars: pd.DataFrame,
+    lookback: int = 8,
+    threshold: float = 0.03,
+) -> int:
+    """Short-term momentum via linear regression slope.
+
+    Returns: 1 (uptrend), -1 (downtrend), 0 (neutral / insufficient data).
+    Slope is normalized to percent-per-bar; *threshold* is the cutoff (default 0.03%).
+    """
+    if today_bars is None or today_bars.empty:
+        return 0
+    if len(today_bars) < max(lookback // 2, 2):
+        return 0
+
+    closes = today_bars["Close"].iloc[-lookback:].values.astype(float)
+    if len(closes) < max(lookback // 2, 2):
+        return 0
+
+    mean_price = float(np.mean(closes))
+    if mean_price <= 0:
+        return 0
+
+    x = np.arange(len(closes), dtype=float)
+    slope = float(np.polyfit(x, closes, 1)[0])
+    slope_pct = slope / mean_price * 100  # percent per bar
+
+    if slope_pct > threshold:
+        return 1
+    if slope_pct < -threshold:
+        return -1
+    return 0
+
+
+# ── Local trend (medium-term for structural veto) ──
+
+
+def compute_local_trend(
+    today_bars: pd.DataFrame,
+    lookback: int = 30,
+    threshold: float = 0.02,
+) -> int:
+    """Medium-term trend via linear regression slope (longer lookback than fade momentum).
+
+    Returns: 1 (uptrend), -1 (downtrend), 0 (neutral / insufficient data).
+    Public function — reused by L1 screen in main.py.
+    """
+    return _compute_fade_momentum(today_bars, lookback=lookback, threshold=threshold)
+
+
 # ── Direction decision ──
 
 
 def _decide_direction(
     regime: USRegimeResult,
     vp: VolumeProfileResult,
+    momentum: int = 0,
 ) -> str:
-    """Decide bullish / bearish / neutral based on US regime + price position."""
+    """Decide bullish / bearish / neutral based on US regime + price position.
+
+    For FADE_CHOP, uses VA three-zone logic with momentum confirmation:
+    - Edge zone (position_ratio >= 0.70 or <= 0.30): gives direction;
+      momentum=0 passes, opposing momentum → neutral.
+    - Transition zone (0.30 < ratio < 0.70): requires momentum confirmation;
+      momentum=0 → neutral.
+    """
     price = regime.price
 
     if regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
@@ -137,11 +199,34 @@ def _decide_direction(
         return "bullish" if price > vp.poc else "bearish"
 
     if regime.regime == USRegimeType.FADE_CHOP:
-        # Mean reversion: near VAH → bearish, near VAL → bullish
-        if vp.vah > vp.val:
-            mid = (vp.vah + vp.val) / 2
-            return "bearish" if price > mid else "bullish"
-        return "neutral"
+        va_range = vp.vah - vp.val
+        if va_range <= 0:
+            return "neutral"
+
+        position_ratio = (price - vp.val) / va_range
+        position_ratio = max(0.0, min(1.0, position_ratio))
+
+        if position_ratio >= 0.70:
+            # Edge zone — base direction is bearish (mean reversion from VAH)
+            if momentum == 1:
+                return "neutral"  # momentum opposes
+            return "bearish"
+        elif position_ratio <= 0.30:
+            # Edge zone — base direction is bullish (mean reversion from VAL)
+            if momentum == -1:
+                return "neutral"  # momentum opposes
+            return "bullish"
+        else:
+            # Transition zone — require momentum confirmation
+            if position_ratio >= 0.50:
+                # Slightly above mid → base bearish, need momentum -1 to confirm
+                if momentum == -1:
+                    return "bearish"
+            else:
+                # Slightly below mid → base bullish, need momentum +1 to confirm
+                if momentum == 1:
+                    return "bullish"
+            return "neutral"
 
     # UNCLEAR: use lean hint if available (P0-3)
     if regime.regime == USRegimeType.UNCLEAR and hasattr(regime, "lean") and regime.lean != "neutral":
@@ -269,6 +354,7 @@ def recommend(
     vwap: float = 0.0,
     chase_risk_cfg: dict | None = None,
     option_cfg: dict | None = None,
+    today_bars: pd.DataFrame | None = None,
 ) -> OptionRecommendation:
     """Generate US option recommendation."""
     price = regime.price
@@ -276,7 +362,53 @@ def recommend(
     has_expiry = bool(expiry_dates)
     cfg = option_cfg or {}
 
-    direction = _decide_direction(regime, vp)
+    # Compute intraday momentum for FADE_CHOP direction decision
+    momentum = 0
+    if regime.regime == USRegimeType.FADE_CHOP and today_bars is not None and not today_bars.empty:
+        cr_cfg = chase_risk_cfg or {}
+        momentum = _compute_fade_momentum(
+            today_bars,
+            lookback=cr_cfg.get("fade_momentum_lookback", 8),
+            threshold=cr_cfg.get("fade_momentum_threshold", 0.03),
+        )
+
+    # P2-1: VA width minimum check (before direction decision)
+    if regime.regime == USRegimeType.FADE_CHOP:
+        cr_cfg = chase_risk_cfg or {}
+        va_width_pct = (vp.vah - vp.val) / regime.price * 100 if regime.price > 0 else 0
+        min_va_width = cr_cfg.get("min_va_width_pct", 0.80)
+        if va_width_pct < min_va_width:
+            return OptionRecommendation(
+                action="wait", direction="neutral",
+                structural_veto=True,
+                rationale=f"VA 区间过窄 ({va_width_pct:.2f}%)，均值回归空间不足",
+                risk_note=f"VA 宽度过滤: {va_width_pct:.2f}% < {min_va_width}%",
+                wait_conditions=["等待 VA 区间扩展或选择其他标的"],
+            )
+
+    direction = _decide_direction(regime, vp, momentum=momentum)
+
+    # P0-1: Local trend veto for FADE_CHOP — structural rejection
+    if regime.regime == USRegimeType.FADE_CHOP and direction != "neutral":
+        cr_cfg = chase_risk_cfg or {}
+        local_trend = compute_local_trend(
+            today_bars if today_bars is not None else pd.DataFrame(),
+            lookback=cr_cfg.get("local_trend_lookback", 30),
+            threshold=cr_cfg.get("local_trend_threshold", 0.02),
+        )
+        if (direction == "bullish" and local_trend == -1) or \
+           (direction == "bearish" and local_trend == 1):
+            trend_label = "下跌" if local_trend == -1 else "上涨"
+            return OptionRecommendation(
+                action="wait", direction=direction,
+                structural_veto=True,
+                rationale=f"日内中期趋势偏{trend_label}, 与均值回归方向矛盾",
+                risk_note=f"日内趋势过滤: 30bar linreg 趋势{trend_label}, 不宜逆势入场",
+                wait_conditions=[
+                    "等待趋势减弱或反转后再评估",
+                    f"或等待价格确认{trend_label}趋势后切换策略",
+                ],
+            )
 
     # Check wait conditions (excluding chain/expiry — handled separately)
     wait, reasons, conditions = should_wait(
@@ -294,6 +426,19 @@ def recommend(
         )
 
     if direction == "neutral":
+        # Momentum conflict explanation for FADE_CHOP
+        if regime.regime == USRegimeType.FADE_CHOP and momentum != 0:
+            momentum_label = "上涨" if momentum == 1 else "下跌"
+            return OptionRecommendation(
+                action="wait",
+                direction="neutral",
+                rationale=f"震荡日但日内动量偏{momentum_label}, 方向矛盾, 建议观望",
+                risk_note=f"FADE_CHOP 均值回归方向与短期动量({momentum_label})冲突, 入场胜率下降",
+                wait_conditions=[
+                    "等待动量衰减后价格回到 VA 边缘再入场",
+                    f"或等待价格确认{momentum_label}趋势后切换到 TREND_DAY 策略",
+                ],
+            )
         return OptionRecommendation(
             action="wait",
             direction="neutral",
@@ -366,9 +511,22 @@ def recommend(
         if chase_risk.level == "moderate":
             prefer_atm = True
 
-    # Expiry selection
+    # P1-1: FADE_CHOP option parameter override (longer DTE, prefer ATM, wider delta)
     dte_min = cfg.get("dte_min", 1)
     dte_preferred_max = cfg.get("dte_preferred_max", 7)
+    delta_min = cfg.get("delta_min", 0.30)
+    delta_max = cfg.get("delta_max", 0.50)
+    if regime.regime == USRegimeType.FADE_CHOP:
+        rr_cfg = cfg.get("range_reversal", {})
+        if rr_cfg:
+            dte_min = rr_cfg.get("dte_min", dte_min)
+            dte_preferred_max = rr_cfg.get("dte_preferred_max", dte_preferred_max)
+            if rr_cfg.get("prefer_atm", False):
+                prefer_atm = True
+            delta_min = rr_cfg.get("delta_min", delta_min)
+            delta_max = rr_cfg.get("delta_max", delta_max)
+
+    # Expiry selection
     expiry = select_expiry(
         expiry_dates or [],
         dte_min=dte_min,
@@ -433,9 +591,7 @@ def recommend(
                     dte=dte,
                 )
 
-    # Single leg
-    delta_min = cfg.get("delta_min", 0.30)
-    delta_max = cfg.get("delta_max", 0.50)
+    # Single leg (delta_min/delta_max already set above, with FADE_CHOP override)
     leg = recommend_single_leg(
         direction, chain_df, price, expiry,
         prefer_atm=prefer_atm,
@@ -523,10 +679,6 @@ def _build_risk_note(
         parts.append("防守线: VWAP, 跌破建议止损")
         parts.append("失效条件: RVOL 回落至 1.0 以下")
     elif regime.regime == USRegimeType.FADE_CHOP:
-        if direction == "bullish":
-            parts.append(f"止损: 跌破 VAL {vp.val:,.2f}")
-        else:
-            parts.append(f"止损: 突破 VAH {vp.vah:,.2f}")
         parts.append("失效条件: 带量突破 VA 边界")
 
     if dte > 0:

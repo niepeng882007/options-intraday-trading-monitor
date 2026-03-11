@@ -482,6 +482,33 @@ class FutuCollector(BaseCollector):
     async def get_snapshot(self, symbol: str) -> dict:
         return await self._retry(self._fetch_snapshot, symbol)
 
+    def _fetch_snapshots(self, symbols: list[str]) -> dict[str, dict]:
+        """Batch get_market_snapshot for multiple symbols (single API call)."""
+        ctx = self._ensure_connected()
+        futu_codes = [to_futu(s) for s in symbols]
+        ret, data = ctx.get_market_snapshot(futu_codes)
+        if ret != RET_OK:
+            raise RuntimeError(f"get_market_snapshot batch failed: {data}")
+        result: dict[str, dict] = {}
+        for _, row in data.iterrows():
+            sym = from_futu(str(row.get("code", "")))
+            result[sym] = {
+                "last_price": float(row.get("last_price", 0) or 0),
+                "open_price": float(row.get("open_price", 0) or 0),
+                "high_price": float(row.get("high_price", 0) or 0),
+                "low_price": float(row.get("low_price", 0) or 0),
+                "prev_close_price": float(row.get("prev_close_price", 0) or 0),
+                "volume": int(row.get("volume", 0) or 0),
+                "turnover": float(row.get("turnover", 0) or 0),
+                "turnover_rate": float(row.get("turnover_rate", 0) or 0),
+                "amplitude": float(row.get("amplitude", 0) or 0),
+            }
+        return result
+
+    async def get_snapshots(self, symbols: list[str]) -> dict[str, dict]:
+        """Batch market snapshot — single Futu API call for all symbols."""
+        return await self._retry(self._fetch_snapshots, symbols)
+
     @staticmethod
     def _fetch_yahoo_premarket(symbol: str) -> tuple[float, float]:
         """Fetch PMH/PML from Yahoo Finance extended-hours 1m bars."""

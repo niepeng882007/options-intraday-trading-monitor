@@ -95,6 +95,7 @@ async def _handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         not_in_list_text="不在监控列表中",
         add_hint_template="+{text}",
         wl_command="hkwl",
+        market="hk",
     )
 
 
@@ -109,6 +110,7 @@ async def _handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         regex_match_groups=(m.group(1), m.group(2)),
         normalize_fn=normalize_symbol,
         market_label="",
+        market="hk",
     )
 
 
@@ -122,6 +124,7 @@ async def _handle_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         predictor_key=_PREDICTOR_KEY,
         raw_code=m.group(1),
         normalize_fn=normalize_symbol,
+        market="hk",
     )
 
 
@@ -132,6 +135,7 @@ async def _handle_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         market_label="HK",
         empty_hint="+09988",
         format_fn=_format_watchlist_message,
+        market="hk",
     )
 
 
@@ -139,6 +143,8 @@ async def _handle_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def _cmd_hk_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/hk_help — show available commands."""
+    from src.common.telegram_handlers import _log_to_archive
+
     text = (
         "<b>HK 期权监控使用说明</b>\n"
         + "━" * 20 + "\n"
@@ -172,3 +178,4 @@ async def _cmd_hk_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• 本系统仅提供参考，不构成投资建议"
     )
     await update.message.reply_text(text, parse_mode="HTML")
+    _log_to_archive("hk_playbook", "cmd_hk_help", text, "hk")

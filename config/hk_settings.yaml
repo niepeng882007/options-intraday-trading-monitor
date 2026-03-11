@@ -56,6 +56,8 @@ regime:
   range_rvol: 0.85
   iv_spike_ratio: 1.3
   momentum_min_dist_pct: 1.0  # VA 边界距离 >= 1% 触发动量突破
+  gap_warning_pct: 3.0        # 跳空 >= 3% 触发特殊处理
+  va_penetration_min_pct: 0.3  # VA 边界最小渗透 % 才给满置信度
 
 simulation:
   tp_pct: 0.8

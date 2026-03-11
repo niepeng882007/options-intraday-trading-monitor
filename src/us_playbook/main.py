@@ -22,12 +22,14 @@ from src.common.types import FilterResult, GammaWallResult, OptionMarketSnapshot
 from src.common.gamma_wall import calculate_gamma_wall
 from src.us_playbook import (
     KeyLevels,
+    MarketTone,
     USPlaybookResult,
     USRegimeResult,
     USRegimeType,
     USScanAlertRecord,
     USScanSignal,
 )
+from src.us_playbook.market_tone import MarketToneEngine
 from src.us_playbook.filter import check_us_filters
 from src.us_playbook.indicators import calculate_us_rvol, calculate_vwap, compute_rvol_profile
 from src.us_playbook.levels import (
@@ -39,6 +41,7 @@ from src.us_playbook.levels import (
     get_today_bars,
 )
 from src.us_playbook.option_recommend import (
+    compute_local_trend,
     option_quotes_to_df,
     recommend,
     select_expiry,
@@ -103,11 +106,25 @@ class USPredictor:
         self._last_playbooks: dict[str, USPlaybookResult] = {}
         self._last_today_bars: dict[str, pd.DataFrame] = {}
 
+        # Market Tone engine
+        self._tone_engine = MarketToneEngine(config, collector)
+
         # Auto-scan state
         self._scan_history: dict[str, list[USScanAlertRecord]] = {}
         self._scan_history_date: str = ""
         # P1-4: regime transition tracking — {symbol: last_regime_result}
         self._last_scan_regimes: dict[str, USRegimeResult] = {}
+        # Fade direction cooldown — {symbol: (direction, unix_ts)}
+        self._last_fade_directions: dict[str, tuple[str, float]] = {}
+
+    # ── Market Tone ──
+
+    async def _ensure_market_tone(self) -> MarketTone | None:
+        """Get or compute market tone. Reuses cached SPY today_bars."""
+        if not self._cfg.get("market_tone", {}).get("enabled", False):
+            return None
+        spy_bars = self._last_today_bars.get("SPY")
+        return await self._tone_engine.get_tone(spy_today_bars=spy_bars)
 
     # ── Core: analysis pipeline ──
 
@@ -115,6 +132,7 @@ class USPredictor:
         self,
         symbol: str,
         spy_regime: USRegimeType | None = None,
+        market_tone: MarketTone | None = None,
     ) -> USPlaybookResult | None:
         """Run full pipeline for a single symbol."""
         cfg = self._cfg
@@ -279,7 +297,35 @@ class USPredictor:
             pm_source=pm_source,
         )
 
-        # 10. Option recommendation (reuse chain_df from step 6)
+        # 9a. Market tone confidence adjustment
+        if market_tone and market_tone.confidence_modifier != 0:
+            old_conf = regime.confidence
+            regime.confidence = max(0.0, min(1.0, regime.confidence + market_tone.confidence_modifier))
+            if abs(regime.confidence - old_conf) > 0.001:
+                tone_note = f"Tone {market_tone.grade} adj {market_tone.confidence_modifier:+.2f}"
+                regime.details = f"{regime.details}; {tone_note}" if regime.details else tone_note
+
+        # 9b. P1-1: FADE_CHOP exec chain — independent from analysis chain
+        exec_chain_df = chain_df  # default: same as analysis chain
+        rr_option = option_cfg.get("range_reversal", {})
+        if regime.regime == USRegimeType.FADE_CHOP and rr_option.get("dte_min"):
+            rr_expiry = select_expiry(
+                expiry_dates,
+                dte_min=rr_option["dte_min"],
+                dte_preferred_max=rr_option.get("dte_preferred_max", 7),
+            )
+            if rr_expiry and rr_expiry != target_expiry:
+                try:
+                    rr_options = await asyncio.wait_for(
+                        self._collector.get_option_chain(symbol, expiration=rr_expiry),
+                        timeout=10,
+                    )
+                    if rr_options:
+                        exec_chain_df = option_quotes_to_df(rr_options)
+                except Exception:
+                    logger.debug("FADE_CHOP exec chain fetch failed for %s, using analysis chain", symbol)
+
+        # 10. Option recommendation (exec chain for FADE_CHOP, analysis chain otherwise)
         chase_risk_cfg = self._cfg.get("chase_risk", {})
         option_rec: OptionRecommendation | None = None
         try:
@@ -287,12 +333,13 @@ class USPredictor:
                 regime=regime,
                 vp=vp,
                 filters=filters,
-                chain_df=chain_df if not chain_df.empty else None,
+                chain_df=exec_chain_df if not exec_chain_df.empty else None,
                 expiry_dates=expiry_dates,
                 gamma_wall=gamma_wall,
                 vwap=vwap,
                 chase_risk_cfg=chase_risk_cfg,
                 option_cfg=option_cfg,
+                today_bars=today,
             )
         except Exception:
             logger.warning("Option recommendation failed for %s", symbol, exc_info=True)
@@ -320,6 +367,7 @@ class USPredictor:
             option_rec=option_rec,
             quote=quote_snapshot,
             option_market=option_market,
+            market_tone=market_tone,
         )
         self._last_playbooks[symbol] = result
         self._last_today_bars[symbol] = today
@@ -402,6 +450,16 @@ class USPredictor:
         if not result:
             return PlaybookResponse(html=f"Failed to generate playbook for {symbol}")
 
+        # Market Tone — compute after SPY pipeline so SPY bars are available
+        tone = await self._ensure_market_tone()
+        if tone and result.market_tone is None:
+            result.market_tone = tone
+            # Apply confidence modifier if not already applied in pipeline
+            if tone.confidence_modifier != 0:
+                result.regime.confidence = max(
+                    0.0, min(1.0, result.regime.confidence + tone.confidence_modifier)
+                )
+
         # Get SPY/QQQ results for market context display
         spy_result = self._last_playbooks.get("SPY")
         qqq_result = self._last_playbooks.get("QQQ")
@@ -475,6 +533,34 @@ class USPredictor:
 
         spy_regime_type = self._spy_context[1].regime if self._spy_context[1] else None
 
+        # Phase 1b: Market Tone gating
+        tone = await self._ensure_market_tone()
+        tone_cfg = self._cfg.get("market_tone", {}).get("grade", {})
+        scan_gates = tone_cfg.get("auto_scan_gates", {})
+        gate: str | None = None
+
+        if tone:
+            gate = scan_gates.get(tone.grade)
+            if gate == "skip":
+                logger.info("Auto-scan skipped: market tone grade=%s", tone.grade)
+                return
+
+            # Event day time restrictions
+            event_day_cfg = tone_cfg.get("event_day", {})
+            if tone.macro_signal == "data_reaction":
+                data_start_str = event_day_cfg.get("data_scan_start_time", "10:00")
+                data_h, data_m = map(int, data_start_str.split(":"))
+                if now_et.hour < data_h or (now_et.hour == data_h and now_et.minute < data_m):
+                    logger.info("Auto-scan deferred: data_reaction day before %s", data_start_str)
+                    return
+
+            # FOMC day: before unlock time → range_reversal_only
+            if tone.macro_signal == "range_then_trend":
+                unlock_str = event_day_cfg.get("fomc_trend_unlock_time", "14:00")
+                unlock_h, unlock_m = map(int, unlock_str.split(":"))
+                if now_et.hour < unlock_h or (now_et.hour == unlock_h and now_et.minute < unlock_m):
+                    gate = "range_reversal_only"  # Override for FOMC pre-2PM
+
         # Phase 2: Scan remaining symbols
         for symbol in symbols:
             if symbol in context_symbols:
@@ -491,6 +577,16 @@ class USPredictor:
                 if l1_data is None:
                     continue
 
+                # Tone gate: C → range_reversal_only, D already skipped above
+                if tone and gate == "range_reversal_only":
+                    sig_type = l1_data["signal_type"]
+                    if not sig_type.startswith("RANGE_REVERSAL"):
+                        logger.debug(
+                            "Tone gate rejects %s %s (grade=%s, only RR allowed)",
+                            symbol, sig_type, tone.grade,
+                        )
+                        continue
+
                 logger.info(
                     "L1 pass %s: type=%s dir=%s price=%.2f",
                     symbol, l1_data["signal_type"], l1_data["direction"], l1_data["price"],
@@ -505,6 +601,29 @@ class USPredictor:
 
                 # Track regime for transition detection
                 self._last_scan_regimes[symbol] = signal.regime
+
+                # Fade direction cooldown — prevent contradictory FADE_CHOP pushes
+                if (
+                    signal.regime.regime == USRegimeType.FADE_CHOP
+                    and signal.signal_type.startswith("RANGE_REVERSAL")
+                ):
+                    cooldown_min = self._cfg.get("chase_risk", {}).get(
+                        "fade_direction_cooldown_minutes", 15,
+                    )
+                    last_fade = self._last_fade_directions.get(symbol)
+                    if (
+                        last_fade
+                        and last_fade[0] != signal.direction
+                        and signal.timestamp - last_fade[1] < cooldown_min * 60
+                    ):
+                        logger.info(
+                            "Fade direction cooldown: %s changed %s→%s within %dmin, skip",
+                            symbol, last_fade[0], signal.direction, cooldown_min,
+                        )
+                        continue
+                    self._last_fade_directions[symbol] = (
+                        signal.direction, signal.timestamp,
+                    )
 
                 # Frequency control
                 allowed, override_reason = self._check_frequency(
@@ -709,6 +828,24 @@ class USPredictor:
 
                 if near_boundary <= rng_prox:
                     direction = "bearish" if dist_vah < dist_val else "bullish"
+
+                    # P2-1: VA width minimum check
+                    chase_cfg = self._cfg.get("chase_risk", {})
+                    va_width_pct = (vp.vah - vp.val) / price * 100 if price > 0 else 0
+                    if va_width_pct < chase_cfg.get("min_va_width_pct", 0.80):
+                        return None  # VA too narrow for mean reversion
+
+                    # P0-1: Local trend filter
+                    if not today.empty:
+                        trend = compute_local_trend(
+                            today,
+                            lookback=chase_cfg.get("local_trend_lookback", 30),
+                            threshold=chase_cfg.get("local_trend_threshold", 0.02),
+                        )
+                        if (direction == "bullish" and trend == -1) or \
+                           (direction == "bearish" and trend == 1):
+                            return None  # trend opposes mean-reversion direction
+
                     signal_type = regime_to_signal_type(USRegimeType.FADE_CHOP, direction)
                     boundary = "VAH" if dist_vah < dist_val else "VAL"
                     triggers = [f"接近 {boundary} (距离 {near_boundary:.2f}%)"]
@@ -881,6 +1018,11 @@ class USPredictor:
                 logger.debug("L2 reject %s: bullish signal but SPY is FADE_CHOP with low conf", symbol)
                 return None
 
+        # P0-1 / P2-1: structural veto from recommend() (trend / VA width etc.)
+        if result.option_rec and result.option_rec.structural_veto:
+            logger.debug("L2 reject %s: structural veto — %s", symbol, result.option_rec.risk_note)
+            return None
+
         signal = USScanSignal(
             signal_type=signal_type,
             direction=direction,
@@ -905,6 +1047,7 @@ class USPredictor:
         if self._scan_history_date != today:
             self._scan_history.clear()
             self._last_scan_regimes.clear()
+            self._last_fade_directions.clear()
             self._scan_history_date = today
 
     def _check_frequency(
