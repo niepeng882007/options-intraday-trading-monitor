@@ -1,28 +1,13 @@
 version: "3.8"
 
 services:
-  redis:
-    image: redis:7-alpine
-    restart: always
-    ports:
-      - "127.0.0.1:6379:6379"
-    volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory 256mb
-
-  monitor:
+  playbook:
     build: .
     restart: always
-    depends_on:
-      - redis
     environment:
-      - REDIS_URL=redis://redis:6379
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - TZ=America/New_York
     volumes:
       - ./config:/app/config
       - ./data:/app/data
-
-volumes:
-  redis_data:
