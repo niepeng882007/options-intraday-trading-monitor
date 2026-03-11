@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from telegram.error import NetworkError
 
 from src.hk import VolumeProfileResult, GammaWallResult, FilterResult, OptionRecommendation, QuoteSnapshot, OptionMarketSnapshot
+from src.common.types import OptionLeg
 from src.collector.base import PremarketData
 from src.us_playbook import (
     USRegimeType, USRegimeResult, USPlaybookResult, KeyLevels,
@@ -22,14 +23,19 @@ from src.us_playbook.levels import (
 )
 from src.us_playbook.regime import classify_us_regime, regime_to_signal_type
 from src.us_playbook.filter import check_us_filters, _is_monthly_opex
-from src.us_playbook.playbook import format_us_playbook_message, _collect_levels
+from src.us_playbook.playbook import (
+    format_us_playbook_message, _collect_levels,
+    _nearest_levels, _risk_action_lines, _entry_zone_text,
+)
 from src.us_playbook.watchlist import USWatchlist, normalize_us_symbol
 from src.us_playbook.option_recommend import (
     select_expiry,
     _decide_direction,
+    _check_fade_entry_staleness,
     assess_chase_risk,
     option_quotes_to_df,
     recommend,
+    should_wait,
 )
 from src.us_playbook.main import USPredictor
 
@@ -1076,6 +1082,83 @@ class TestUSOptionRecommend:
         rec = recommend(regime=regime, vp=vp, filters=filters)
         assert rec.action == "wait"
 
+    def test_fade_chop_bypasses_inside_day_filter(self):
+        """FADE_CHOP with high confidence should bypass Inside Day + low RVOL filter
+        and correct FilterResult so risk section shows 🟡 not 🔴."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=1.0,
+            rvol=0.37, price=545, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        filters = FilterResult(
+            tradeable=False, risk_level="blocked",
+            warnings=["Inside Day + 低 RVOL (0.37 < 0.80) — 假突破概率高"],
+            block_reasons=["inside_day_rvol"],
+        )
+        # should_wait should NOT block
+        wait, reasons, _ = should_wait(regime, filters, vp, True, True)
+        assert not wait, f"FADE_CHOP should bypass Inside Day + low RVOL, got reasons: {reasons}"
+        # FilterResult should be corrected for consistent risk display
+        assert filters.tradeable is True
+        assert filters.risk_level == "elevated"
+        assert filters.block_reasons == []
+
+    def test_fade_chop_low_confidence_still_blocked(self):
+        """FADE_CHOP with low confidence should still be blocked by Inside Day filter."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.5,
+            rvol=0.37, price=545, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        filters = FilterResult(
+            tradeable=False, risk_level="blocked",
+            warnings=["Inside Day + 低 RVOL"],
+            block_reasons=["inside_day_rvol"],
+        )
+        rec = recommend(regime=regime, vp=vp, filters=filters)
+        assert rec.action == "wait"
+
+    def test_fade_chop_calendar_hard_block(self):
+        """FADE_CHOP should NOT bypass calendar (hard) blocks."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=1.0,
+            rvol=0.37, price=545, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        filters = FilterResult(
+            tradeable=False, risk_level="blocked",
+            warnings=["FOMC today"],
+            block_reasons=["calendar"],
+        )
+        rec = recommend(regime=regime, vp=vp, filters=filters)
+        assert rec.action == "wait"
+
+    def test_trend_day_still_blocked_by_inside_day(self):
+        """TREND_DAY should still be blocked by Inside Day + low RVOL."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.9,
+            rvol=0.37, price=560, gap_pct=0.5,
+        )
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        filters = FilterResult(
+            tradeable=False, risk_level="blocked",
+            warnings=["Inside Day + 低 RVOL"],
+            block_reasons=["inside_day_rvol"],
+        )
+        rec = recommend(regime=regime, vp=vp, filters=filters)
+        assert rec.action == "wait"
+
+    def test_fade_chop_bypasses_rvol_floor(self):
+        """FADE_CHOP should not be blocked by RVOL < 0.5 absolute floor."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.8,
+            rvol=0.37, price=545, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        filters = FilterResult(tradeable=True, risk_level="normal")
+        wait, reasons, _ = should_wait(regime, filters, vp, True, True)
+        assert not wait, f"FADE_CHOP should bypass RVOL floor, got reasons: {reasons}"
+
     def test_option_quotes_to_df(self):
         from src.collector.base import OptionQuote
         quotes = [
@@ -1537,3 +1620,430 @@ class TestPdhPdlWarning:
         pdl = 258.50
         # prev_close_snap < pdl * 0.998
         assert prev_close_snap < pdl * 0.998
+
+
+# ── Fade Entry Staleness ──
+
+
+class TestFadeEntryStaleness:
+    """Verify VA penetration check for FADE_CHOP mean-reversion freshness."""
+
+    # VAH=680, VAL=670 → VA range = 10
+
+    def _vp(self):
+        return VolumeProfileResult(poc=675.0, vah=680.0, val=670.0)
+
+    # ── _check_fade_entry_staleness unit tests ──
+
+    def test_bullish_none(self):
+        """Price near VAL → penetration low → none."""
+        level, pen = _check_fade_entry_staleness(671.0, self._vp(), "bullish")
+        assert level == "none"
+        assert pen < 0.20
+
+    def test_bullish_moderate(self):
+        """Price 40% into VA from VAL → moderate."""
+        level, pen = _check_fade_entry_staleness(674.0, self._vp(), "bullish")
+        assert level == "moderate"
+        assert 0.35 <= pen <= 0.45
+
+    def test_bullish_high(self):
+        """Price 60% into VA from VAL → high."""
+        level, pen = _check_fade_entry_staleness(676.0, self._vp(), "bullish")
+        assert level == "high"
+        assert pen >= 0.55
+
+    def test_bearish_none(self):
+        """Price near VAH → penetration low → none."""
+        level, pen = _check_fade_entry_staleness(679.0, self._vp(), "bearish")
+        assert level == "none"
+        assert pen < 0.20
+
+    def test_bearish_moderate(self):
+        """Price 40% into VA from VAH → moderate."""
+        level, pen = _check_fade_entry_staleness(676.0, self._vp(), "bearish")
+        assert level == "moderate"
+        assert 0.35 <= pen <= 0.45
+
+    def test_bearish_high(self):
+        """Price 60% into VA from VAH → high."""
+        level, pen = _check_fade_entry_staleness(674.0, self._vp(), "bearish")
+        assert level == "high"
+        assert pen >= 0.55
+
+    def test_neutral_skipped(self):
+        """Neutral direction → always none."""
+        level, pen = _check_fade_entry_staleness(675.0, self._vp(), "neutral")
+        assert level == "none"
+        assert pen == 0.0
+
+    def test_zero_va_range(self):
+        """VAH == VAL → no division error, returns none."""
+        flat_vp = VolumeProfileResult(poc=100.0, vah=100.0, val=100.0)
+        level, pen = _check_fade_entry_staleness(100.0, flat_vp, "bullish")
+        assert level == "none"
+
+    def test_clamp_below_zero(self):
+        """Price below VAL for bullish → clamp to 0."""
+        level, pen = _check_fade_entry_staleness(668.0, self._vp(), "bullish")
+        assert pen == 0.0
+        assert level == "none"
+
+    def test_clamp_above_one(self):
+        """Price above VAH for bullish → clamp to 1.0."""
+        level, pen = _check_fade_entry_staleness(685.0, self._vp(), "bullish")
+        assert pen == 1.0
+        assert level == "high"
+
+    def test_custom_thresholds(self):
+        """Custom moderate/high thresholds."""
+        # 25% penetration with moderate=0.20 → moderate
+        level, _ = _check_fade_entry_staleness(
+            672.5, self._vp(), "bullish",
+            stale_moderate=0.20, stale_high=0.40,
+        )
+        assert level == "moderate"
+
+    # ── recommend() integration tests ──
+
+    def test_recommend_high_returns_wait(self):
+        """FADE_CHOP + high penetration → wait.
+
+        Note: with symmetric midpoint, direction flips at 50% penetration,
+        so we lower fade_entry_stale_high to 0.35 to test the integration path.
+        """
+        vp = VolumeProfileResult(poc=670.0, vah=680.0, val=670.0)
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=674.0, gap_pct=0.1,  # bullish (674<675), pen=0.4
+        )
+        filters = FilterResult(tradeable=True, warnings=[], risk_level="normal")
+        rec = recommend(
+            regime, vp, filters,
+            chase_risk_cfg={"fade_entry_stale_high": 0.35},
+        )
+        assert rec.action == "wait"
+        assert "渗透" in rec.rationale
+        assert "入场窗口已过" in rec.rationale
+
+    def test_recommend_moderate_still_tradeable(self):
+        """FADE_CHOP + moderate penetration → still tradeable (not wait)."""
+        vp = VolumeProfileResult(poc=670.0, vah=680.0, val=670.0)
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=674.0, gap_pct=0.1,
+        )
+        filters = FilterResult(tradeable=True, warnings=[], risk_level="normal")
+        chain_df = pd.DataFrame([{
+            "code": "SPY260313C00674000", "option_type": "CALL",
+            "strike_price": 674.0, "strike_time": "2026-03-13",
+            "open_interest": 500, "implied_volatility": 0.2,
+            "delta": 0.50, "gamma": 0.05, "theta": -0.10, "vega": 0.15,
+            "last_price": 3.0, "snap_volume": 100,
+            "bid_price": 2.90, "ask_price": 3.10,
+        }])
+        rec = recommend(
+            regime, vp, filters,
+            chain_df=chain_df,
+            expiry_dates=["2026-03-13"],
+        )
+        assert rec.action != "wait"
+        # Risk note should mention 入场区已消耗
+        assert "入场区已消耗" in (rec.risk_note or "")
+
+    def test_recommend_none_shows_near_val(self):
+        """FADE_CHOP + low penetration → rationale says '靠近 VAL'."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=671.0, gap_pct=0.1,
+        )
+        vp = self._vp()
+        filters = FilterResult(tradeable=True, warnings=[], risk_level="normal")
+        chain_df = pd.DataFrame([{
+            "code": "SPY260313C00671000", "option_type": "CALL",
+            "strike_price": 671.0, "strike_time": "2026-03-13",
+            "open_interest": 500, "implied_volatility": 0.2,
+            "delta": 0.50, "gamma": 0.05, "theta": -0.10, "vega": 0.15,
+            "last_price": 3.0, "snap_volume": 100,
+            "bid_price": 2.90, "ask_price": 3.10,
+        }])
+        rec = recommend(
+            regime, vp, filters,
+            chain_df=chain_df,
+            expiry_dates=["2026-03-13"],
+        )
+        assert rec.action != "wait"
+        assert "靠近" in rec.rationale
+        assert "入场区已消耗" not in (rec.risk_note or "")
+
+    # ── rationale text verification ──
+
+    def test_rationale_mid_penetration(self):
+        """20-35% penetration → '偏远' wording."""
+        from src.us_playbook.option_recommend import _build_rationale
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=672.5, gap_pct=0.1,
+        )
+        vp = self._vp()
+        text = _build_rationale(regime, vp, "bullish", fade_penetration=0.25)
+        assert "偏远" in text
+        assert "25%" in text
+
+    def test_rationale_high_penetration(self):
+        """>=35% penetration → 'VA 中部' wording."""
+        from src.us_playbook.option_recommend import _build_rationale
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=674.0, gap_pct=0.1,
+        )
+        vp = self._vp()
+        text = _build_rationale(regime, vp, "bullish", fade_penetration=0.40)
+        assert "VA 中部" in text
+        assert "40%" in text
+
+
+# ── Nearest Levels + Low-DTE Stop-Loss + Entry Zone ──
+
+
+class TestNearestLevels:
+    """Verify _nearest_levels() finds correct key levels above/below price."""
+
+    def _vp(self):
+        return VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
+
+    def _kl(self):
+        return KeyLevels(
+            poc=252.0, vah=255.0, val=249.0,
+            pdh=257.0, pdl=248.0, pmh=254.0, pml=250.5,
+            vwap=251.5,
+        )
+
+    def test_nearest_levels_above(self):
+        """Price=253, above levels should be PMH 254, VAH 255, PDH 257 — return nearest 2."""
+        result = _nearest_levels(253.0, "above", self._vp(), kl=self._kl())
+        assert len(result) == 2
+        names = [r[0] for r in result]
+        assert names[0] == "PMH"  # 254 is closest above 253
+        assert names[1] == "VAH"  # 255 is next
+
+    def test_nearest_levels_below(self):
+        """Price=253, below levels should be POC 252, VWAP 251.5, PML 250.5, VAL 249."""
+        result = _nearest_levels(253.0, "below", self._vp(), kl=self._kl())
+        assert len(result) == 2
+        names = [r[0] for r in result]
+        assert names[0] == "POC"   # 252 is closest below 253
+        assert names[1] == "VWAP"  # 251.5 is next
+
+    def test_nearest_levels_with_gamma_wall(self):
+        """Gamma wall levels should be included."""
+        gw = GammaWallResult(call_wall_strike=256.0, put_wall_strike=247.0, max_pain=252.0)
+        result = _nearest_levels(253.0, "above", self._vp(), kl=self._kl(), gamma_wall=gw)
+        names = [r[0] for r in result]
+        assert "PMH" in names  # 254 still closest
+        # Call Wall 256 should be reachable
+        result_3 = _nearest_levels(253.0, "above", self._vp(), kl=self._kl(), gamma_wall=gw, n=3)
+        names_3 = [r[0] for r in result_3]
+        assert "Call Wall" in names_3
+
+    def test_nearest_levels_filters_noise(self):
+        """Levels within 0.05% of price are excluded."""
+        vp = VolumeProfileResult(poc=100.04, vah=105.0, val=95.0)
+        kl = KeyLevels(poc=100.04, vah=105.0, val=95.0, pdh=110.0, pdl=90.0, pmh=0.0, pml=0.0, vwap=100.03)
+        # POC=100.04 and VWAP=100.03 are within 0.05% of 100.0 → should be excluded
+        result = _nearest_levels(100.0, "above", vp, kl=kl)
+        names = [r[0] for r in result]
+        assert "POC" not in names
+        assert "VWAP" not in names
+
+    def test_nearest_levels_no_kl(self):
+        """Without KeyLevels, only VP levels are used."""
+        result = _nearest_levels(253.0, "above", self._vp())
+        names = [r[0] for r in result]
+        assert "VAH" in names
+        assert "PMH" not in names  # no KeyLevels
+
+
+class TestLowDteRiskAction:
+    """Verify _risk_action_lines() for low-DTE single legs."""
+
+    def _vp(self):
+        return VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
+
+    def _kl(self):
+        return KeyLevels(
+            poc=252.0, vah=255.0, val=249.0,
+            pdh=257.0, pdl=248.0, pmh=254.0, pml=250.5,
+            vwap=251.5,
+        )
+
+    def _regime(self, price=253.0):
+        return USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=price, gap_pct=0.1,
+        )
+
+    def test_risk_action_lines_low_dte_put(self):
+        """DTE=1 put → uses nearest resistance + premium stop-loss line."""
+        rec = OptionRecommendation(
+            action="put", direction="bearish", dte=1,
+            legs=[OptionLeg(
+                side="buy", option_type="put", strike=252.0,
+                pct_from_price=0.4, moneyness="ATM", last_price=2.10,
+            )],
+        )
+        lines = _risk_action_lines(rec, self._regime(), self._vp(), kl=self._kl())
+        # Should mention nearest resistance (PMH 254)
+        assert any("PMH" in l and "254" in l for l in lines), f"Expected PMH in lines: {lines}"
+        assert any("最近阻力位" in l for l in lines)
+        # Premium stop-loss: 2.10 * 0.60 = 1.26
+        assert any("$1.26" in l for l in lines), f"Expected $1.26 in lines: {lines}"
+        assert any("低 DTE" in l and "40%" in l for l in lines)
+
+    def test_risk_action_lines_low_dte_call(self):
+        """DTE=2 call → uses nearest support + premium stop-loss line."""
+        rec = OptionRecommendation(
+            action="call", direction="bullish", dte=2,
+            legs=[OptionLeg(
+                side="buy", option_type="call", strike=253.0,
+                pct_from_price=0.0, moneyness="ATM", last_price=3.00,
+            )],
+        )
+        lines = _risk_action_lines(rec, self._regime(), self._vp(), kl=self._kl())
+        # Should mention nearest support (POC 252)
+        assert any("POC" in l and "252" in l for l in lines), f"Expected POC in lines: {lines}"
+        assert any("最近支撑位" in l for l in lines)
+        # Premium stop-loss: 3.00 * 0.60 = 1.80
+        assert any("$1.80" in l for l in lines), f"Expected $1.80 in lines: {lines}"
+
+    def test_risk_action_lines_normal_dte_put(self):
+        """DTE=7 put → original behavior, no premium stop-loss."""
+        rec = OptionRecommendation(
+            action="put", direction="bearish", dte=7,
+            legs=[OptionLeg(
+                side="buy", option_type="put", strike=252.0,
+                pct_from_price=0.4, moneyness="ATM", last_price=2.10,
+            )],
+        )
+        lines = _risk_action_lines(rec, self._regime(), self._vp(), kl=self._kl())
+        # Should use original VWAP-based stop
+        assert any("VWAP" in l for l in lines)
+        # No premium stop-loss line
+        assert not any("低 DTE" in l for l in lines)
+        assert not any("$1.26" in l for l in lines)
+
+    def test_risk_action_lines_spread_unchanged(self):
+        """Spread actions should not get low-DTE treatment."""
+        from src.common.types import SpreadMetrics
+        rec = OptionRecommendation(
+            action="bear_call_spread", direction="bearish", dte=1,
+            legs=[
+                OptionLeg(side="sell", option_type="call", strike=255.0, pct_from_price=0.8, moneyness="OTM 0.8%"),
+                OptionLeg(side="buy", option_type="call", strike=257.0, pct_from_price=1.6, moneyness="OTM 1.6%"),
+            ],
+            spread_metrics=SpreadMetrics(
+                net_credit=0.5, max_profit=0.5, max_loss=1.5,
+                breakeven=255.5, risk_reward_ratio=0.33,
+            ),
+        )
+        lines = _risk_action_lines(rec, self._regime(), self._vp(), kl=self._kl())
+        assert any("盈亏平衡" in l for l in lines)
+        assert not any("低 DTE" in l for l in lines)
+
+
+class TestEntryZone:
+    """Verify _entry_zone_text() for different regimes and directions."""
+
+    def _vp(self):
+        return VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
+
+    def _kl(self):
+        return KeyLevels(
+            poc=252.0, vah=255.0, val=249.0,
+            pdh=257.0, pdl=248.0, pmh=254.0, pml=250.5,
+            vwap=251.5,
+        )
+
+    def test_entry_zone_fade_chop_bearish(self):
+        """FADE_CHOP bearish → entry zone uses resistance above."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=253.0, gap_pct=0.1,
+        )
+        text = _entry_zone_text(253.0, "bearish", regime, self._vp(), kl=self._kl())
+        assert text is not None
+        assert "最佳入场区间" in text
+        # Should mention PMH 254 and VAH 255 as zone boundaries
+        assert "254" in text
+        assert "255" in text
+
+    def test_entry_zone_fade_chop_bullish(self):
+        """FADE_CHOP bullish → entry zone uses support below."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=253.0, gap_pct=0.1,
+        )
+        text = _entry_zone_text(253.0, "bullish", regime, self._vp(), kl=self._kl())
+        assert text is not None
+        # Below: POC 252, VWAP 251.5, PML 250.5, VAL 249
+        assert "最佳入场区间" in text
+
+    def test_entry_zone_trend_day(self):
+        """TREND_DAY bullish → VWAP pullback suggestion."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            rvol=1.5, price=258.0, gap_pct=0.5,
+        )
+        text = _entry_zone_text(258.0, "bullish", regime, self._vp(), kl=self._kl())
+        assert text is not None
+        assert "VWAP" in text
+        assert "251.50" in text
+        assert "回调" in text
+
+    def test_entry_zone_trend_day_bearish(self):
+        """TREND_DAY bearish → VWAP bounce suggestion."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            rvol=1.5, price=247.0, gap_pct=-0.5,
+        )
+        text = _entry_zone_text(247.0, "bearish", regime, self._vp(), kl=self._kl())
+        assert text is not None
+        assert "VWAP" in text
+        assert "反弹" in text
+
+    def test_entry_zone_unclear_returns_none(self):
+        """UNCLEAR regime → no entry zone."""
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.3,
+            rvol=0.6, price=253.0, gap_pct=0.1,
+        )
+        text = _entry_zone_text(253.0, "neutral", regime, self._vp(), kl=self._kl())
+        assert text is None
+
+
+class TestBuildRiskNoteLowDte:
+    """Verify _build_risk_note includes 40% premium stop for low DTE."""
+
+    def test_build_risk_note_low_dte(self):
+        """DTE <= 3 → includes 40% stop reminder."""
+        from src.us_playbook.option_recommend import _build_risk_note
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=253.0, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
+        note = _build_risk_note(regime, vp, "bearish", dte=2)
+        assert "Gamma 风险极高" in note
+        assert "40%" in note
+        assert "止损" in note
+
+    def test_build_risk_note_normal_dte_no_premium_stop(self):
+        """DTE > 3 → no 40% stop reminder."""
+        from src.us_playbook.option_recommend import _build_risk_note
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=253.0, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
+        note = _build_risk_note(regime, vp, "bearish", dte=7)
+        assert "40%" not in note

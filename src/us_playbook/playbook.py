@@ -211,10 +211,69 @@ def _level_distance_items(
     return items
 
 
+def _nearest_levels(
+    price: float,
+    side: str,  # "above" | "below"
+    vp: VolumeProfileResult,
+    kl: KeyLevels | None = None,
+    gamma_wall: GammaWallResult | None = None,
+    n: int = 2,
+) -> list[tuple[str, float]]:
+    """Find nearest key levels above/below current price.
+
+    Returns up to *n* (name, value) tuples sorted by distance from *price*.
+    Levels closer than 0.05% are ignored (noise).
+    """
+    candidates: list[tuple[str, float]] = []
+
+    # VP levels
+    if vp.poc > 0:
+        candidates.append(("POC", vp.poc))
+    if vp.vah > 0:
+        candidates.append(("VAH", vp.vah))
+    if vp.val > 0:
+        candidates.append(("VAL", vp.val))
+
+    # KeyLevels
+    if kl:
+        if kl.vwap > 0:
+            candidates.append(("VWAP", kl.vwap))
+        if kl.pdh > 0:
+            candidates.append(("PDH", kl.pdh))
+        if kl.pdl > 0:
+            candidates.append(("PDL", kl.pdl))
+        if kl.pmh > 0:
+            candidates.append(("PMH", kl.pmh))
+        if kl.pml > 0:
+            candidates.append(("PML", kl.pml))
+
+    # Gamma Wall
+    if gamma_wall:
+        if gamma_wall.call_wall_strike > 0:
+            candidates.append(("Call Wall", gamma_wall.call_wall_strike))
+        if gamma_wall.put_wall_strike > 0:
+            candidates.append(("Put Wall", gamma_wall.put_wall_strike))
+
+    if price <= 0:
+        return []
+
+    min_dist_pct = 0.0005  # 0.05%
+
+    if side == "above":
+        filtered = [(name, val) for name, val in candidates if (val - price) / price > min_dist_pct]
+    else:
+        filtered = [(name, val) for name, val in candidates if (price - val) / price > min_dist_pct]
+
+    filtered.sort(key=lambda x: abs(x[1] - price))
+    return filtered[:n]
+
+
 def _entry_check_text(
     rec: OptionRecommendation,
     regime: USRegimeResult,
     vp: VolumeProfileResult,
+    kl: KeyLevels | None = None,
+    gamma_wall: GammaWallResult | None = None,
 ) -> str:
     if rec.action == "bear_call_spread":
         return (
@@ -227,16 +286,81 @@ def _entry_check_text(
             "如果已经放量失守支撑位，这笔单取消。"
         )
     if rec.action == "call":
+        if regime.regime == USRegimeType.FADE_CHOP:
+            nearby = _nearest_levels(regime.price, "below", vp, kl, gamma_wall, n=1)
+            if nearby:
+                name, val = nearby[0]
+                return f"只在价格回调至 {name} {val:,.2f} 附近、没有带量跌破下方时考虑买入 Call，不追已经瞬间拉高的合约。"
         return "只在价格仍沿着当前多头方向运行、没有跌回防守线下方时考虑买入，不追已经瞬间拉高很多的合约。"
     if rec.action == "put":
+        if regime.regime == USRegimeType.FADE_CHOP:
+            nearby = _nearest_levels(regime.price, "above", vp, kl, gamma_wall, n=1)
+            if nearby:
+                name, val = nearby[0]
+                return f"只在价格反弹至 {name} {val:,.2f} 附近、没有带量突破上方时考虑买入 Put，不追已经瞬间杀跌的合约。"
         return "只在价格仍沿着当前空头方向运行、没有重新站回防守线上方时考虑买入，不追已经瞬间杀跌很多的合约。"
     return "先等价格重新满足入场条件，再重新生成剧本。"
+
+
+def _entry_zone_text(
+    price: float,
+    direction: str,
+    regime: USRegimeResult,
+    vp: VolumeProfileResult,
+    kl: KeyLevels | None = None,
+    gamma_wall: GammaWallResult | None = None,
+) -> str | None:
+    """Generate best entry zone text based on nearby key levels.
+
+    Returns None for UNCLEAR/wait (no zone to show).
+    """
+    if regime.regime == USRegimeType.UNCLEAR:
+        return None
+
+    vwap = kl.vwap if kl else 0.0
+
+    if regime.regime == USRegimeType.FADE_CHOP:
+        if direction == "bearish":
+            # Put: find resistance above
+            nearby = _nearest_levels(price, "above", vp, kl, gamma_wall, n=2)
+            if len(nearby) >= 2:
+                n1, n2 = nearby[0], nearby[1]
+                lo, hi = sorted([n1[1], n2[1]])
+                lo_name = n1[0] if n1[1] == lo else n2[0]
+                hi_name = n1[0] if n1[1] == hi else n2[0]
+                return f"最佳入场区间: {lo:,.2f}-{hi:,.2f} ({lo_name} - {hi_name})"
+            if len(nearby) == 1:
+                return f"最佳入场位: {nearby[0][0]} {nearby[0][1]:,.2f} 附近"
+            return "当前价已高于主要阻力位，可直接入场"
+        else:
+            # Call: find support below
+            nearby = _nearest_levels(price, "below", vp, kl, gamma_wall, n=2)
+            if len(nearby) >= 2:
+                n1, n2 = nearby[0], nearby[1]
+                lo, hi = sorted([n1[1], n2[1]])
+                lo_name = n1[0] if n1[1] == lo else n2[0]
+                hi_name = n1[0] if n1[1] == hi else n2[0]
+                return f"最佳入场区间: {lo:,.2f}-{hi:,.2f} ({lo_name} - {hi_name})"
+            if len(nearby) == 1:
+                return f"最佳入场位: {nearby[0][0]} {nearby[0][1]:,.2f} 附近"
+            return "当前价已低于主要支撑位，可直接入场"
+
+    if regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+        if vwap > 0:
+            if direction == "bullish":
+                return f"回调至 VWAP {vwap:,.2f} 附近是更优入场时机"
+            else:
+                return f"反弹至 VWAP {vwap:,.2f} 附近是更优入场时机"
+
+    return None
 
 
 def _risk_action_lines(
     rec: OptionRecommendation | None,
     regime: USRegimeResult,
     vp: VolumeProfileResult,
+    kl: KeyLevels | None = None,
+    gamma_wall: GammaWallResult | None = None,
 ) -> list[str]:
     if rec is None:
         return ["操作建议: 没有具体期权建议时，保持轻仓，只观察关键位反应。"]
@@ -246,6 +370,8 @@ def _risk_action_lines(
             "操作建议: 当前不下单，保留资金，等重新评估条件满足后再考虑。",
         ]
 
+    dte = rec.dte
+    low_dte = dte > 0 and dte <= 3
     sm = rec.spread_metrics
 
     if rec.action == "bear_call_spread":
@@ -272,19 +398,49 @@ def _risk_action_lines(
         lines.append("新手执行: 先用最小张数，若盘口价差明显变宽，优先撤单等待，不硬做。")
         return lines
 
+    # ── Single leg: call / put ──
+    # Premium stop-loss price (40% loss) for low-DTE legs
+    premium_stop = None
+    if low_dte and rec.legs and rec.legs[0].last_price and rec.legs[0].last_price > 0:
+        premium_stop = rec.legs[0].last_price * 0.60  # 40% loss → 60% of entry
+
     if rec.action == "call":
-        return [
-            "止损触发: 标的跌破 VWAP 或原本突破结构被破坏。",
+        if low_dte:
+            nearby = _nearest_levels(regime.price, "below", vp, kl, gamma_wall, n=1)
+            if nearby:
+                stop_name, stop_val = nearby[0]
+                stop_line = f"止损触发: 标的跌破 {stop_name} {stop_val:,.2f} (最近支撑位)"
+            else:
+                stop_line = "止损触发: 标的跌破 VWAP 或原本突破结构被破坏。"
+        else:
+            stop_line = "止损触发: 标的跌破 VWAP 或原本突破结构被破坏。"
+        lines = [
+            stop_line,
             "触发后怎么做: 直接卖出平仓，不补仓摊平，不把短线单拖成长线。",
             "新手执行: 优先做 ATM 或轻度实值，不追过度虚值合约。",
         ]
+        if low_dte and premium_stop is not None:
+            lines.append(f"⚠️ 低 DTE ({dte}天): 期权跌至 ${premium_stop:.2f} 即平仓 (亏损 40%，不等标的到止损位)")
+        return lines
 
     if rec.action == "put":
-        return [
-            "止损触发: 标的重新站回 VWAP 上方或原本下跌结构被破坏。",
+        if low_dte:
+            nearby = _nearest_levels(regime.price, "above", vp, kl, gamma_wall, n=1)
+            if nearby:
+                stop_name, stop_val = nearby[0]
+                stop_line = f"止损触发: 标的突破 {stop_name} {stop_val:,.2f} (最近阻力位)"
+            else:
+                stop_line = "止损触发: 标的重新站回 VWAP 上方或原本下跌结构被破坏。"
+        else:
+            stop_line = "止损触发: 标的重新站回 VWAP 上方或原本下跌结构被破坏。"
+        lines = [
+            stop_line,
             "触发后怎么做: 直接卖出平仓，不补仓摊平，不把短线单拖成长线。",
             "新手执行: 优先做 ATM 或轻度实值，不追过度虚值合约。",
         ]
+        if low_dte and premium_stop is not None:
+            lines.append(f"⚠️ 低 DTE ({dte}天): 期权跌至 ${premium_stop:.2f} 即平仓 (亏损 40%，不等标的到止损位)")
+        return lines
 
     return ["操作建议: 出现失效信号时，先平仓，再等新的结构。"]
 
@@ -417,8 +573,23 @@ def _regime_reason_lines(
         invalidations.append(f"若价格带量突破 VAH {vp.vah:,.2f} 或跌破 VAL {vp.val:,.2f}，区间判断失效。")
         invalidations.append("若 RVOL 快速抬升并持续放大，需要重新评估是否切换到 TREND_DAY。")
 
-    else:  # UNCLEAR
-        reasons.append("当前价格、量能和位置关系没有形成一致信号。")
+    else:  # UNCLEAR (P0-3: sub-type aware guidance)
+        lean = getattr(regime, "lean", "neutral")
+        if regime.rvol >= 1.2 and vp.val <= regime.price <= vp.vah:
+            # Sub-type 2: high volume in VA — buildup
+            reasons.append("量能已达到趋势日水平，但价格仍在价值区内。")
+            lean_text = "偏多" if lean == "bullish" else "偏空" if lean == "bearish" else "方向待定"
+            reasons.append(f"可能是突破前蓄力，当前倾向: {lean_text}。")
+            supports.append("若后续带量突破 VA 边界，可转为 TREND_DAY 处理。")
+        elif (regime.price > vp.vah or regime.price < vp.val) and regime.rvol < 1.0:
+            # Sub-type 3: outside VA but low volume — likely false breakout
+            reasons.append("价格虽已脱离价值区，但量能不足，可能是假突破。")
+            lean_text = "偏空回归" if lean == "bearish" else "偏多回归" if lean == "bullish" else "等待确认"
+            reasons.append(f"倾向: {lean_text}，等待量价配合确认。")
+            uncertainties.append("低量突破后回归价值区概率较高，不宜追。")
+        else:
+            # Sub-type 1 or generic
+            reasons.append("当前价格、量能和位置关系没有形成一致信号。")
         if vwap > 0:
             reasons.append(f"先观察价格相对 VWAP {vwap:,.2f} 的站稳或跌破情况。")
         if vp.vah > 0 and vp.val > 0:
@@ -747,7 +918,10 @@ def format_us_playbook_message(
                 lines.append(f"到期日: {recommendation.expiry}{dte_str}")
             lines.append(f"{_position_size_text(r.confidence)}")
             lines.append("")
-            lines.append(f"入场前提: {_esc(_entry_check_text(recommendation, r, vp))}")
+            lines.append(f"入场前提: {_esc(_entry_check_text(recommendation, r, vp, kl=kl, gamma_wall=gamma_wall))}")
+            entry_zone = _entry_zone_text(r.price, _direction, r, vp, kl=kl, gamma_wall=gamma_wall)
+            if entry_zone:
+                lines.append(f"{_esc(entry_zone)}")
             lines.append("")
             for leg in recommendation.legs:
                 for leg_line in _format_leg_line(leg):
@@ -809,7 +983,7 @@ def format_us_playbook_message(
             lines.append(_esc(risk_line))
 
     lines.append("")
-    for risk_action_line in _risk_action_lines(recommendation, r, vp):
+    for risk_action_line in _risk_action_lines(recommendation, r, vp, kl=kl, gamma_wall=gamma_wall):
         lines.append(_esc(risk_action_line))
 
     lines.append(sep)

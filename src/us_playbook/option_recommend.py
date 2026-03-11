@@ -67,6 +67,8 @@ def option_quotes_to_df(options: list[OptionQuote]) -> pd.DataFrame:
             "vega": o.vega,
             "last_price": o.last or 0.0,
             "snap_volume": o.volume or 0,
+            "bid_price": o.bid or 0.0,
+            "ask_price": o.ask or 0.0,
         })
     return pd.DataFrame(rows)
 
@@ -141,7 +143,49 @@ def _decide_direction(
             return "bearish" if price > mid else "bullish"
         return "neutral"
 
-    return "neutral"  # UNCLEAR
+    # UNCLEAR: use lean hint if available (P0-3)
+    if regime.regime == USRegimeType.UNCLEAR and hasattr(regime, "lean") and regime.lean != "neutral":
+        return regime.lean
+    return "neutral"
+
+
+# ── Fade entry staleness ──
+
+
+def _check_fade_entry_staleness(
+    price: float,
+    vp: VolumeProfileResult,
+    direction: str,
+    stale_moderate: float = 0.35,
+    stale_high: float = 0.55,
+) -> tuple[str, float]:
+    """Check how far price has penetrated into the VA from the entry edge.
+
+    For FADE_CHOP mean-reversion trades:
+    - Bullish: entry edge = VAL, penetration = (price - VAL) / (VAH - VAL)
+    - Bearish: entry edge = VAH, penetration = (VAH - price) / (VAH - VAL)
+
+    Returns (level, penetration) where level is "none" / "moderate" / "high".
+    """
+    if direction not in ("bullish", "bearish"):
+        return "none", 0.0
+
+    va_range = vp.vah - vp.val
+    if va_range <= 0:
+        return "none", 0.0
+
+    if direction == "bullish":
+        penetration = (price - vp.val) / va_range
+    else:
+        penetration = (vp.vah - price) / va_range
+
+    penetration = max(0.0, min(1.0, penetration))
+
+    if penetration >= stale_high:
+        return "high", penetration
+    if penetration >= stale_moderate:
+        return "moderate", penetration
+    return "none", penetration
 
 
 # ── Wait decision ──
@@ -159,15 +203,29 @@ def should_wait(
     conditions: list[str] = []
 
     if not filters.tradeable:
-        reasons.append("过滤器标记为不宜交易")
-        for w in filters.warnings:
-            reasons.append(f"  - {w}")
+        # Soft blocks can be overridden by confident FADE_CHOP
+        soft_reasons = {"inside_day_rvol", "opex_combo"}
+        soft_only = (
+            filters.block_reasons
+            and all(r in soft_reasons for r in filters.block_reasons)
+        )
+        if soft_only and regime.regime == USRegimeType.FADE_CHOP and regime.confidence >= 0.7:
+            # FADE_CHOP 覆盖软阻断：低波动震荡正是均值回归的理想条件
+            # 修正 filters 状态，使风险区显示与推荐一致（🟡 而非 🔴）
+            filters.tradeable = True
+            filters.risk_level = "elevated"
+            filters.block_reasons = [r for r in filters.block_reasons if r not in soft_reasons]
+        else:
+            reasons.append("过滤器标记为不宜交易")
+            for w in filters.warnings:
+                reasons.append(f"  - {w}")
 
     if regime.regime == USRegimeType.UNCLEAR and regime.confidence < 0.4:
         reasons.append(f"Regime UNCLEAR, 置信度仅 {regime.confidence:.0%}")
         conditions.append("等待 Regime 明确后再入场")
 
-    if regime.rvol < 0.5:
+    # RVOL absolute floor — skip for FADE_CHOP (low vol is expected in chop)
+    if regime.rvol < 0.5 and regime.regime != USRegimeType.FADE_CHOP:
         reasons.append(f"RVOL {regime.rvol:.2f} 极低, 量能不足")
         conditions.append("RVOL 回升至 0.8 以上")
 
@@ -244,13 +302,41 @@ def recommend(
             wait_conditions=["等待价格突破关键位后再入场"],
         )
 
-    # Chase risk check (ET timezone)
+    # Fade entry staleness check — only for FADE_CHOP mean-reversion
+    fade_stale_level = "none"
+    fade_penetration = 0.0
+    if regime.regime == USRegimeType.FADE_CHOP:
+        cr_cfg = chase_risk_cfg or {}
+        fade_stale_level, fade_penetration = _check_fade_entry_staleness(
+            price, vp, direction,
+            stale_moderate=cr_cfg.get("fade_entry_stale_moderate", 0.35),
+            stale_high=cr_cfg.get("fade_entry_stale_high", 0.55),
+        )
+        if fade_stale_level == "high":
+            edge = f"VAL {vp.val:,.2f}" if direction == "bullish" else f"VAH {vp.vah:,.2f}"
+            return OptionRecommendation(
+                action="wait",
+                direction=direction,
+                rationale=f"VA 渗透 {fade_penetration:.0%}, 入场窗口已过",
+                risk_note=f"价格已深入 VA 中部, 均值回归优势消失",
+                wait_conditions=[f"等待回落至 {edge} 附近再入场"],
+            )
+
+    # Fade moderate → prefer ATM
+    if fade_stale_level == "moderate":
+        prefer_atm = True
+    else:
+        prefer_atm = False
+
+    # Chase risk check (ET timezone, P2-2: proportional time decay)
     chase_risk = ChaseRiskResult()
-    prefer_atm = False
     if direction != "neutral" and vwap > 0:
         cr_cfg = chase_risk_cfg or {}
         now_et = datetime.now(ET)
         is_afternoon = now_et.hour >= 12
+        # Calculate minutes to close (16:00 ET)
+        close_time = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        minutes_to_close = max(0, int((close_time - now_et).total_seconds() / 60))
         chase_risk = assess_chase_risk(
             price=price,
             vwap=vwap,
@@ -262,6 +348,7 @@ def recommend(
             va_moderate_pct=cr_cfg.get("va_moderate_pct", 2.0),
             va_high_pct=cr_cfg.get("va_high_pct", 3.0),
             afternoon_tighten_pct=cr_cfg.get("afternoon_tighten_pct", 0.3),
+            minutes_to_close=minutes_to_close,
         )
         if chase_risk.level == "high":
             dir_hint = "看多" if direction == "bullish" else "看空"
@@ -339,8 +426,8 @@ def recommend(
                     expiry=expiry,
                     legs=spread_legs,
                     moneyness=spread_legs[0].moneyness,
-                    rationale=_build_rationale(regime, vp, direction, spread=True, has_greeks=has_greeks),
-                    risk_note=_build_risk_note(regime, vp, direction, chase_risk=chase_risk, dte=dte),
+                    rationale=_build_rationale(regime, vp, direction, spread=True, has_greeks=has_greeks, fade_penetration=fade_penetration),
+                    risk_note=_build_risk_note(regime, vp, direction, chase_risk=chase_risk, dte=dte, fade_stale_level=fade_stale_level),
                     liquidity_warning=liq_warn,
                     spread_metrics=metrics,
                     dte=dte,
@@ -364,8 +451,8 @@ def recommend(
             expiry=expiry,
             legs=[leg],
             moneyness=leg.moneyness,
-            rationale=_build_rationale(regime, vp, direction, has_greeks=has_greeks),
-            risk_note=_build_risk_note(regime, vp, direction, chase_risk=chase_risk, dte=dte),
+            rationale=_build_rationale(regime, vp, direction, has_greeks=has_greeks, fade_penetration=fade_penetration),
+            risk_note=_build_risk_note(regime, vp, direction, chase_risk=chase_risk, dte=dte, fade_stale_level=fade_stale_level),
             liquidity_warning=liq_warn,
             dte=dte,
         )
@@ -388,6 +475,7 @@ def _build_rationale(
     direction: str,
     spread: bool = False,
     has_greeks: bool = True,
+    fade_penetration: float = 0.0,
 ) -> str:
     parts = []
     regime_names = {
@@ -405,10 +493,14 @@ def _build_rationale(
             parts.append(f"价格 {regime.price:,.2f} 跌破 VAL {vp.val:,.2f}")
         parts.append(f"RVOL {regime.rvol:.2f} 量能配合")
     elif regime.regime == USRegimeType.FADE_CHOP:
-        if direction == "bullish":
-            parts.append(f"价格 {regime.price:,.2f} 靠近 VAL {vp.val:,.2f}, 低吸机会")
+        edge_label = f"VAL {vp.val:,.2f}" if direction == "bullish" else f"VAH {vp.vah:,.2f}"
+        action_label = "低吸机会" if direction == "bullish" else "高抛机会"
+        if fade_penetration >= 0.35:
+            parts.append(f"已在 VA 中部 (渗透 {fade_penetration:.0%}), 入场优势减弱")
+        elif fade_penetration >= 0.20:
+            parts.append(f"距 {edge_label} 偏远 (VA 渗透 {fade_penetration:.0%})")
         else:
-            parts.append(f"价格 {regime.price:,.2f} 靠近 VAH {vp.vah:,.2f}, 高抛机会")
+            parts.append(f"价格 {regime.price:,.2f} 靠近 {edge_label}, {action_label}")
         if spread:
             parts.append("震荡市适合使用价差策略, 利用时间价值衰减")
 
@@ -424,6 +516,7 @@ def _build_risk_note(
     direction: str,
     chase_risk: ChaseRiskResult | None = None,
     dte: int = 0,
+    fade_stale_level: str = "none",
 ) -> str:
     parts = []
     if regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
@@ -439,8 +532,12 @@ def _build_risk_note(
     if dte > 0:
         if dte <= 3:
             parts.append(f"仅剩 {dte} DTE, Gamma 风险极高")
+            parts.append("⚠️ 期权亏损达 40% 即止损，不等标的到止损位")
         elif dte <= 5:
             parts.append(f"仅剩 {dte} DTE, Theta 衰减加速")
+
+    if fade_stale_level == "moderate":
+        parts.append("⚠️ 入场区已消耗: 仓位减半, 仅用 ATM")
 
     if chase_risk and chase_risk.level == "moderate":
         chase_parts = []
