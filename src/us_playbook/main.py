@@ -44,7 +44,7 @@ from src.us_playbook.option_recommend import (
     select_expiry,
 )
 from src.us_playbook.playbook import format_us_playbook_message, get_regime_strategy
-from src.us_playbook.regime import classify_us_regime, regime_to_signal_type
+from src.us_playbook.regime import classify_us_regime, detect_regime_transition, regime_to_signal_type
 from src.us_playbook.watchlist import USWatchlist
 from src.utils.logger import setup_logger
 
@@ -106,6 +106,8 @@ class USPredictor:
         # Auto-scan state
         self._scan_history: dict[str, list[USScanAlertRecord]] = {}
         self._scan_history_date: str = ""
+        # P1-4: regime transition tracking — {symbol: last_regime_result}
+        self._last_scan_regimes: dict[str, USRegimeResult] = {}
 
     # ── Core: analysis pipeline ──
 
@@ -132,7 +134,11 @@ class USPredictor:
 
         # 2. Volume Profile
         vp_history = get_history_bars(hist_bars, max_trading_days=vp_target) if not hist_bars.empty else hist_bars
-        vp = compute_volume_profile(vp_history, value_area_pct=vp_cfg.get("value_area_pct", 0.70))
+        vp = compute_volume_profile(
+            vp_history,
+            value_area_pct=vp_cfg.get("value_area_pct", 0.70),
+            recency_decay=vp_cfg.get("recency_decay", 0.15),
+        )
 
         # 3. PDH/PDL and PMH/PML (from cache)
         pdh = cached_entry.pdh
@@ -232,6 +238,7 @@ class USPredictor:
             current_low=snap["low_price"],
             calendar_path=filter_cfg.get("calendar_file", "config/us_calendar.yaml"),
             inside_day_rvol_threshold=filter_cfg.get("inside_day_rvol_threshold", 0.8),
+            symbol=symbol,
         )
 
         # 8. Adaptive RVOL profile
@@ -474,6 +481,13 @@ class USPredictor:
                 continue
             try:
                 l1_data = await self._l1_screen(symbol, session, scan_cfg, spy_regime_type)
+
+                # P1-4: Regime transition detection for previously scanned symbols
+                if l1_data is None and symbol in self._last_scan_regimes:
+                    l1_data = await self._check_regime_transition(
+                        symbol, session, scan_cfg, spy_regime_type,
+                    )
+
                 if l1_data is None:
                     continue
 
@@ -489,6 +503,9 @@ class USPredictor:
 
                 signal, playbook_html, option_rec, l2_filters = l2_result
 
+                # Track regime for transition detection
+                self._last_scan_regimes[symbol] = signal.regime
+
                 # Frequency control
                 allowed, override_reason = self._check_frequency(
                     symbol, signal, session, scan_cfg,
@@ -500,7 +517,7 @@ class USPredictor:
                 header = self._format_scan_header(
                     signal, l2_filters.risk_level, option_rec, override_reason, cooldown_mins,
                 )
-                await send_fn(header + "\n" + playbook_html, parse_mode="HTML")
+                await send_fn(header + "\n" + playbook_html)
 
                 self._record_alert(symbol, signal, session)
                 logger.info(
@@ -564,7 +581,11 @@ class USPredictor:
 
         # VP
         vp_history = get_history_bars(hist_bars, max_trading_days=vp_target) if not hist_bars.empty else hist_bars
-        vp = compute_volume_profile(vp_history, value_area_pct=vp_cfg.get("value_area_pct", 0.70))
+        vp = compute_volume_profile(
+            vp_history,
+            value_area_pct=vp_cfg.get("value_area_pct", 0.70),
+            recency_decay=vp_cfg.get("recency_decay", 0.15),
+        )
         if vp.vah <= 0 or vp.val <= 0:
             return None
 
@@ -635,6 +656,25 @@ class USPredictor:
                 magnitude = (vp.val - price) / price * 100
 
             if magnitude >= bo_min_mag:
+                # P1-2: Bar-close confirmation — reject wick-only breakouts
+                if not today.empty:
+                    last_close = float(today.iloc[-1]["Close"])
+                    if price > vp.vah and last_close < vp.vah:
+                        return None  # wick above VAH, not confirmed
+                    if price < vp.val and last_close > vp.val:
+                        return None  # wick below VAL, not confirmed
+
+                # P1-1: Volume surge confirmation
+                vol_surge_threshold = breakout_cfg.get("volume_surge_threshold", 2.0)
+                vol_surge_bars = breakout_cfg.get("volume_surge_bars", 5)
+                if not today.empty and len(today) >= 2:
+                    avg_bar_vol = float(today["Volume"].mean())
+                    recent = today.iloc[-vol_surge_bars:]
+                    if avg_bar_vol > 0:
+                        has_surge = (recent["Volume"] >= avg_bar_vol * vol_surge_threshold).any()
+                        if not has_surge:
+                            return None  # no volume surge to confirm breakout
+
                 direction = "bullish" if price > vp.vah else "bearish"
                 signal_type = regime_to_signal_type(regime.regime, direction) or "BREAKOUT_LONG"
                 triggers = []
@@ -652,7 +692,7 @@ class USPredictor:
 
         # RANGE_REVERSAL check (disabled by default in v1)
         range_cfg = scan_cfg.get("range_reversal", {})
-        if range_cfg.get("enabled", False) and session == "morning":
+        if range_cfg.get("enabled", False):
             rng_min_conf = range_cfg.get("min_confidence", 0.70)
             rng_rvol_min = range_cfg.get("rvol_min", 0.50)
             rng_rvol_max = range_cfg.get("rvol_max", 1.00)
@@ -681,6 +721,117 @@ class USPredictor:
                     }
 
         return None
+
+    # ── P1-4: Regime transition detection ──
+
+    async def _check_regime_transition(
+        self,
+        symbol: str,
+        session: str,
+        scan_cfg: dict,
+        spy_regime: USRegimeType | None = None,
+    ) -> dict | None:
+        """Check if a previously scanned symbol has undergone regime transition.
+
+        Only triggers for meaningful upgrades (UNCLEAR/FADE_CHOP → TREND_DAY/GAP_AND_GO).
+        Uses existing `regime_upgrade` override to bypass cooldown.
+        """
+        original = self._last_scan_regimes.get(symbol)
+        if not original:
+            return None
+
+        cfg = self._cfg
+        vp_cfg = cfg.get("volume_profile", {})
+        rvol_cfg = cfg.get("rvol", {})
+        regime_cfg = cfg.get("regime", {})
+
+        # Get current bars + VP
+        vp_target = vp_cfg.get("lookback_trading_days") or vp_cfg.get("lookback_days", 5)
+        rvol_td = rvol_cfg.get("lookback_days", 10)
+        fetch_days = calc_fetch_calendar_days(vp_target, rvol_td)
+        hist_bars, today, cached_entry = await self._get_bars_split(symbol, fetch_days, vp_target)
+
+        vp_history = get_history_bars(hist_bars, max_trading_days=vp_target) if not hist_bars.empty else hist_bars
+        vp = compute_volume_profile(
+            vp_history,
+            value_area_pct=vp_cfg.get("value_area_pct", 0.70),
+            recency_decay=vp_cfg.get("recency_decay", 0.15),
+        )
+        if vp.vah <= 0 or vp.val <= 0:
+            return None
+
+        snap = await self._collector.get_snapshot(symbol)
+        price = snap["last_price"]
+        prev_close = snap["prev_close_price"] or 0.0
+        if price <= 0:
+            return None
+
+        rvol = calculate_us_rvol(
+            today, hist_bars,
+            skip_open_minutes=rvol_cfg.get("skip_open_minutes", 3),
+            lookback_days=rvol_cfg.get("lookback_days", 10),
+        )
+
+        # Adaptive RVOL profile
+        adaptive_cfg = regime_cfg.get("adaptive", {})
+        rvol_profile = None
+        if adaptive_cfg.get("enabled", True):
+            rvol_profile = compute_rvol_profile(
+                history_bars=hist_bars,
+                today_rvol=rvol,
+                skip_open_minutes=rvol_cfg.get("skip_open_minutes", 3),
+                gap_and_go_pctl=adaptive_cfg.get("gap_and_go_percentile", 85),
+                trend_day_pctl=adaptive_cfg.get("trend_day_percentile", 60),
+                fade_chop_pctl=adaptive_cfg.get("fade_chop_percentile", 30),
+                fallback_gap_and_go=regime_cfg.get("gap_and_go_rvol", 1.5),
+                fallback_trend_day=regime_cfg.get("trend_day_rvol", 1.2),
+                fallback_fade_chop=regime_cfg.get("fade_chop_rvol", 1.0),
+                min_sample_days=adaptive_cfg.get("min_sample_days", 5),
+                min_trend_day_floor=adaptive_cfg.get("min_trend_day_floor", 1.0),
+            )
+
+        transitioned, new_regime = detect_regime_transition(
+            original=original,
+            current_rvol=rvol,
+            current_price=price,
+            vp=vp,
+            spy_regime=spy_regime,
+            prev_close=prev_close,
+            pmh=cached_entry.pmh,
+            pml=cached_entry.pml,
+            gap_and_go_rvol=regime_cfg.get("gap_and_go_rvol", 1.5),
+            trend_day_rvol=regime_cfg.get("trend_day_rvol", 1.2),
+            fade_chop_rvol=regime_cfg.get("fade_chop_rvol", 1.0),
+            rvol_profile=rvol_profile,
+            gap_significance_threshold=adaptive_cfg.get("gap_significance_threshold", 0.3),
+            pm_source=cached_entry.pm_source,
+        )
+
+        if not transitioned or new_regime is None:
+            return None
+
+        logger.info(
+            "Regime transition detected for %s: %s → %s (conf %.2f)",
+            symbol, original.regime.value, new_regime.regime.value, new_regime.confidence,
+        )
+
+        direction = "bullish" if price > vp.vah else "bearish"
+        signal_type = regime_to_signal_type(new_regime.regime, direction) or "BREAKOUT_LONG"
+        triggers = [
+            f"Regime 转换: {original.regime.value} → {new_regime.regime.value}",
+            f"RVOL {rvol:.2f} | Conf {new_regime.confidence:.0%}",
+        ]
+
+        # Update stored regime
+        self._last_scan_regimes[symbol] = new_regime
+
+        return {
+            "signal_type": signal_type,
+            "direction": direction,
+            "regime": new_regime,
+            "price": price,
+            "trigger_reasons": triggers,
+        }
 
     # ── Auto-scan: L2 verification (structure + execution decoupled) ──
 
@@ -753,6 +904,7 @@ class USPredictor:
         today = datetime.now(ET).strftime("%Y-%m-%d")
         if self._scan_history_date != today:
             self._scan_history.clear()
+            self._last_scan_regimes.clear()
             self._scan_history_date = today
 
     def _check_frequency(

@@ -52,6 +52,7 @@ def evaluate_levels(
     bounce_window_bars: int = 15,
     value_area_pct: float = 0.70,
     exclude_symbols: set[str] | None = None,
+    recency_decay: float = 0.15,
 ) -> LevelEvalResult:
     """Evaluate VAH/VAL/PDH/PDL level bounce rates across historical data.
 
@@ -84,7 +85,7 @@ def evaluate_levels(
             if lookback_bars.empty or len(lookback_bars) < 10:
                 continue
 
-            vp = compute_volume_profile(lookback_bars, value_area_pct=value_area_pct)
+            vp = compute_volume_profile(lookback_bars, value_area_pct=value_area_pct, recency_decay=recency_decay)
             if vp.poc == 0:
                 continue
 
@@ -247,6 +248,7 @@ def evaluate_regimes(
     regime_cfg: dict | None = None,
     exclude_symbols: set[str] | None = None,
     no_adaptive: bool = False,
+    recency_decay: float = 0.15,
 ) -> RegimeEvalResult:
     """Evaluate regime classification accuracy across historical data.
 
@@ -308,7 +310,7 @@ def evaluate_regimes(
             if vp_bars.empty or len(vp_bars) < 10:
                 continue
 
-            vp = compute_volume_profile(vp_bars, value_area_pct=value_area_pct)
+            vp = compute_volume_profile(vp_bars, value_area_pct=value_area_pct, recency_decay=recency_decay)
             if vp.poc == 0:
                 continue
 

@@ -56,6 +56,7 @@ class USBacktestEngine:
         self.trailing_activation_pct = trailing_activation_pct
         self.trailing_trail_pct = trailing_trail_pct
         self.no_adaptive = no_adaptive
+        self.recency_decay = 0.15  # VP recency decay (match production default)
 
     def run(self, bars_by_symbol: dict[str, pd.DataFrame]) -> USBacktestResult:
         """Run the full US backtest pipeline.
@@ -84,6 +85,7 @@ class USBacktestEngine:
             bounce_window_bars=self.bounce_window_bars,
             value_area_pct=self.value_area_pct,
             exclude_symbols=self.exclude_symbols,
+            recency_decay=self.recency_decay,
         )
         logger.info(
             "Level evaluation: %d touch events found", len(level_eval.events),
@@ -101,6 +103,7 @@ class USBacktestEngine:
             regime_cfg=self.regime_cfg,
             exclude_symbols=self.exclude_symbols,
             no_adaptive=self.no_adaptive,
+            recency_decay=self.recency_decay,
         )
         logger.info(
             "Regime evaluation: %d day-evaluations", len(regime_eval.days),
