@@ -51,6 +51,7 @@ class USRegimeResult:
     details: str = ""
     adaptive_thresholds: dict | None = None
     # e.g. {"gap_and_go": 1.73, "trend_day": 1.15, "fade_chop": 0.88, "pctl_rank": 72.3, "sample": 9}
+    lean: str = "neutral"        # "bullish" / "bearish" / "neutral" — UNCLEAR sub-type hint
 
 
 @dataclass

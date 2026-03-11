@@ -76,6 +76,7 @@ def get_history_bars(bars: pd.DataFrame, max_trading_days: int = 0) -> pd.DataFr
 def compute_volume_profile(
     history_bars: pd.DataFrame,
     value_area_pct: float = 0.70,
+    recency_decay: float = 0.0,
 ) -> VolumeProfileResult:
     """Compute VP using shared HK function with US tick_size."""
     if history_bars.empty:
@@ -83,7 +84,10 @@ def compute_volume_profile(
 
     avg_price = history_bars["Close"].mean()
     tick = us_tick_size(avg_price)
-    result = calculate_volume_profile(history_bars, value_area_pct=value_area_pct, tick_size=tick)
+    result = calculate_volume_profile(
+        history_bars, value_area_pct=value_area_pct, tick_size=tick,
+        recency_decay=recency_decay,
+    )
 
     # Populate trading_days from actual bar data
     if not history_bars.empty:

@@ -12,6 +12,7 @@ volume_profile:
   lookback_trading_days: 5
   value_area_pct: 0.70
   min_trading_days: 3
+  recency_decay: 0.15
 
 rvol:
   skip_open_minutes: 3
@@ -51,11 +52,11 @@ auto_scan:
     volume_surge_threshold: 2.0
     volume_surge_bars: 5
   range_reversal:
-    enabled: false  # v1 disabled
-    min_confidence: 0.70
+    enabled: true
+    min_confidence: 0.75
     rvol_min: 0.50
     rvol_max: 1.00
-    va_proximity_pct: 0.30
+    va_proximity_pct: 0.20
   cooldown:
     same_signal_minutes: 30
     max_per_session: 2
@@ -71,6 +72,8 @@ chase_risk:
   va_moderate_pct: 2.0
   va_high_pct: 3.0
   afternoon_tighten_pct: 0.3
+  fade_entry_stale_moderate: 0.35
+  fade_entry_stale_high: 0.55
 
 option_recommend:
   dte_min: 1
