@@ -202,6 +202,18 @@ def recommend_single_leg(
         if not good_delta.empty:
             candidates = good_delta.sort_values("dist")
 
+    # P2-3: Bid-ask spread filter — reject illiquid contracts
+    if "bid_price" in candidates.columns and "ask_price" in candidates.columns:
+        valid_spread = candidates[
+            (candidates["bid_price"] > 0) & (candidates["ask_price"] > 0)
+        ]
+        if not valid_spread.empty:
+            mid = (valid_spread["ask_price"] + valid_spread["bid_price"]) / 2
+            spread_pct = (valid_spread["ask_price"] - valid_spread["bid_price"]) / mid
+            tight = valid_spread[spread_pct <= 0.05]
+            if not tight.empty:
+                candidates = tight.sort_values("dist")
+
     best = candidates.iloc[0]
     return option_leg_from_row(best, side="buy", price=price, option_type=opt_type)
 
@@ -275,10 +287,15 @@ def assess_chase_risk(
     va_moderate_pct: float = 2.5,
     va_high_pct: float = 4.0,
     afternoon_tighten_pct: float = 0.5,
+    minutes_to_close: int | None = None,
 ) -> ChaseRiskResult:
     """Assess chase risk based on VWAP deviation and VA boundary distance.
 
     Default thresholds are HK values. US callers pass tighter values explicitly.
+
+    If ``minutes_to_close`` is provided, uses proportional tightening instead of
+    the binary ``is_afternoon`` flag. This gives a gradual increase in chase risk
+    as the trading day progresses (P2-2).
 
     Only checks directional extension (bullish above VWAP/VAH, bearish below VWAP/VAL).
     Returns ChaseRiskResult with level, reasons, and pullback target.
@@ -286,8 +303,16 @@ def assess_chase_risk(
     if direction == "neutral" or vwap <= 0 or price <= 0:
         return ChaseRiskResult()
 
-    # Tighten thresholds in the afternoon
-    if is_afternoon:
+    # Tighten thresholds based on time remaining
+    if minutes_to_close is not None and minutes_to_close < 240:
+        # Proportional tightening: 0% at 240min left → 100% at 0min left
+        tighten_factor = (240 - minutes_to_close) / 240
+        tighten_amount = afternoon_tighten_pct * tighten_factor
+        vwap_moderate_pct -= tighten_amount
+        vwap_high_pct -= tighten_amount
+        va_moderate_pct -= tighten_amount
+        va_high_pct -= tighten_amount
+    elif is_afternoon:
         vwap_moderate_pct -= afternoon_tighten_pct
         vwap_high_pct -= afternoon_tighten_pct
         va_moderate_pct -= afternoon_tighten_pct
