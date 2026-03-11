@@ -29,6 +29,7 @@ class FilterResult:
     tradeable: bool
     warnings: list[str] = field(default_factory=list)
     risk_level: str = "normal"  # normal, elevated, high, blocked
+    block_reasons: list[str] = field(default_factory=list)  # "calendar", "inside_day_rvol", "opex_combo", "earnings"
 
 
 @dataclass

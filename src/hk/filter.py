@@ -44,6 +44,7 @@ def check_filters(
     warnings: list[str] = []
     risk_level = "normal"
     tradeable = True
+    block_reasons: list[str] = []
 
     # Filter 1: Economic calendar
     calendar_warnings = _check_calendar(today, calendar_path)
@@ -53,6 +54,7 @@ def check_filters(
             if "high" in w.lower():
                 risk_level = "high"
                 tradeable = False
+                block_reasons.append("calendar")
             elif risk_level == "normal":
                 risk_level = "elevated"
 
@@ -82,6 +84,7 @@ def check_filters(
         )
         tradeable = False
         risk_level = "high"
+        block_reasons.append("iv_rvol_mismatch")
     elif iv_rank > 60:
         warnings.append(f"IV Rank \u504f\u9ad8 ({iv_rank:.0f}%)")
         if risk_level == "normal":
@@ -103,7 +106,7 @@ def check_filters(
         if risk_level != "high":
             risk_level = "high"
 
-    return FilterResult(tradeable=tradeable, warnings=warnings, risk_level=risk_level)
+    return FilterResult(tradeable=tradeable, warnings=warnings, risk_level=risk_level, block_reasons=block_reasons)
 
 
 def _check_calendar(today: date, calendar_path: str) -> list[str]:
