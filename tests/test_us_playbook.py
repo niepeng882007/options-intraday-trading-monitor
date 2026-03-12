@@ -14,6 +14,7 @@ from src.collector.base import PremarketData
 from src.us_playbook import (
     USRegimeType, USRegimeResult, USPlaybookResult, KeyLevels,
     USScanSignal, USScanAlertRecord,
+    BreadthProxy, MarketTone,
 )
 from src.us_playbook.indicators import calculate_vwap, calculate_us_rvol, compute_rvol_profile, RvolProfile
 from src.us_playbook.levels import (
@@ -27,7 +28,9 @@ from src.us_playbook.playbook import (
     format_us_playbook_message, _collect_levels,
     _nearest_levels, _risk_action_lines, _entry_zone_text,
     ActionPlan, _calculate_rr, _generate_action_plans,
-    _compact_option_line, _rvol_assessment,
+    _compact_option_line, _rvol_assessment, _find_fade_entry_zone,
+    PlanContext, _reachable_range_pct, _cap_tp2,
+    _check_entry_reachability, _apply_wait_coherence, _apply_min_rr_gate,
 )
 from src.us_playbook.watchlist import USWatchlist, normalize_us_symbol
 from src.us_playbook.option_recommend import (
@@ -939,6 +942,149 @@ class TestRegimePmSourcePenalty:
             pm_source="gap_estimate",
         )
         assert result.confidence >= 0.1
+
+
+# ── C1: gap_pct uses open_price Tests ──
+
+class TestGapPctOpenPrice:
+    """C1: classify_us_regime should use open_price for gap calculation."""
+
+    def _vp(self, poc=550, vah=555, val=545):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    def test_gap_pct_uses_open_not_current(self):
+        """gap_pct should reflect the opening gap, not intraday drift."""
+        # Scenario: opened at 560 (gap +1.8%), drifted back to 552
+        result = classify_us_regime(
+            price=552, prev_close=550, rvol=2.5,
+            pmh=555, pml=548, vp=self._vp(),
+            open_price=560.0,
+        )
+        # gap_pct should be ~1.82% (from open), not ~0.36% (from current price)
+        assert abs(result.gap_pct - 1.82) < 0.1
+
+    def test_gap_pct_fallback_when_no_open(self):
+        """When open_price=0, fall back to current price for backward compat."""
+        result = classify_us_regime(
+            price=560, prev_close=550, rvol=2.5,
+            pmh=555, pml=548, vp=self._vp(),
+            open_price=0.0,
+        )
+        # Should use current price as fallback
+        assert abs(result.gap_pct - 1.82) < 0.1
+
+    def test_gap_stability_intraday(self):
+        """gap_pct should stay the same regardless of current price when open_price is given."""
+        result_a = classify_us_regime(
+            price=560, prev_close=550, rvol=2.0,
+            pmh=555, pml=548, vp=self._vp(),
+            open_price=555.0,
+        )
+        result_b = classify_us_regime(
+            price=545, prev_close=550, rvol=2.0,
+            pmh=555, pml=548, vp=self._vp(),
+            open_price=555.0,
+        )
+        # Same open_price → same gap_pct
+        assert result_a.gap_pct == result_b.gap_pct
+
+
+# ── M5: BreadthProxy majority_direction Tests ──
+
+class TestBreadthMajorityDirection:
+    """M5: BreadthProxy should carry majority_direction field."""
+
+    def test_bearish_majority(self):
+        """When bears dominate, majority_direction should be bearish."""
+        bp = BreadthProxy(
+            aligned_count=7, total_count=10,
+            alignment_ratio=0.7, alignment_label="mixed",
+            index_aligned=False, majority_direction="bearish",
+            details="3↑ 7↓ / 10",
+        )
+        assert bp.majority_direction == "bearish"
+
+    def test_bullish_majority(self):
+        bp = BreadthProxy(
+            aligned_count=8, total_count=10,
+            alignment_ratio=0.8, alignment_label="strong_aligned",
+            index_aligned=True, majority_direction="bullish",
+            details="8↑ 2↓ / 10",
+        )
+        assert bp.majority_direction == "bullish"
+
+    def test_default_neutral(self):
+        """Default majority_direction is neutral."""
+        bp = BreadthProxy(
+            aligned_count=5, total_count=10,
+            alignment_ratio=0.5, alignment_label="mixed",
+            index_aligned=False,
+        )
+        assert bp.majority_direction == "neutral"
+
+
+# ── C3: Tone modifier helper Tests ──
+
+class TestApplyToneModifier:
+    """C3: _apply_tone_modifier should adjust confidence and add details."""
+
+    def test_negative_modifier(self):
+        regime = USRegimeResult(
+            regime=USRegimeType.GAP_AND_GO, confidence=0.80,
+            rvol=2.0, price=560, gap_pct=1.5,
+        )
+        tone = MarketTone(
+            grade="D", grade_score=0, direction="bearish",
+            day_type="chop", confidence_modifier=-0.15,
+            position_size_hint="sit_out",
+        )
+        from src.us_playbook.main import USPredictor
+        USPredictor._apply_tone_modifier(regime, tone)
+        assert abs(regime.confidence - 0.65) < 0.01
+        assert "Tone D adj -0.15" in regime.details
+
+    def test_positive_modifier(self):
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.70,
+            rvol=1.5, price=555, gap_pct=0.3,
+        )
+        tone = MarketTone(
+            grade="A+", grade_score=5, direction="bullish",
+            day_type="trend", confidence_modifier=0.10,
+            position_size_hint="full",
+        )
+        from src.us_playbook.main import USPredictor
+        USPredictor._apply_tone_modifier(regime, tone)
+        assert abs(regime.confidence - 0.80) < 0.01
+
+    def test_zero_modifier_no_change(self):
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.60,
+            rvol=0.8, price=550, gap_pct=0.1,
+        )
+        tone = MarketTone(
+            grade="B+", grade_score=3, direction="neutral",
+            day_type="chop", confidence_modifier=0.0,
+            position_size_hint="reduced",
+        )
+        from src.us_playbook.main import USPredictor
+        USPredictor._apply_tone_modifier(regime, tone)
+        assert regime.confidence == 0.60
+        assert "Tone" not in regime.details
+
+    def test_clamp_to_bounds(self):
+        regime = USRegimeResult(
+            regime=USRegimeType.GAP_AND_GO, confidence=0.95,
+            rvol=2.5, price=560, gap_pct=2.0,
+        )
+        tone = MarketTone(
+            grade="A+", grade_score=5, direction="bullish",
+            day_type="trend", confidence_modifier=0.10,
+            position_size_hint="full",
+        )
+        from src.us_playbook.main import USPredictor
+        USPredictor._apply_tone_modifier(regime, tone)
+        assert regime.confidence == 1.0
 
 
 # ── US Watchlist Tests ──
@@ -3010,28 +3156,53 @@ class TestActionPlanGeneration:
         assert plans[0].entry_action == "做空"
 
     def test_fade_chop_bearish(self):
-        """FADE_CHOP near VAH → Plan A entry=VAH, TP1=POC."""
+        """FADE_CHOP near VAH → Plan A entry=VAH with zone from PMH."""
         regime = USRegimeResult(
             regime=USRegimeType.FADE_CHOP, confidence=0.7,
             rvol=0.8, price=254.5, gap_pct=0.1,
         )
-        # Price closer to VAH → bearish direction
+        # vp: poc=252, vah=255, val=249 → VA range=6, upper third=[253, 255]
+        # kl: pmh=254 → falls in [253, 255] → zone found
         plans = _generate_action_plans(regime, "bearish", self._vp(), self._kl(), self._gw(), None)
         assert plans[0].name == "上沿做空"
-        assert plans[0].entry == self._vp().vah
+        assert plans[0].entry == self._vp().vah  # 255.0
+        assert plans[0].entry_zone_label == "PMH"
+        assert plans[0].entry_zone_price == 254.0
         assert plans[0].tp1 == self._vp().poc
         assert plans[0].tp2 == self._vp().val
 
     def test_fade_chop_bullish(self):
-        """FADE_CHOP near VAL → Plan A entry=VAL, TP1=POC."""
+        """FADE_CHOP near VAL → Plan A entry=VAL with zone from PML."""
         regime = USRegimeResult(
             regime=USRegimeType.FADE_CHOP, confidence=0.7,
             rvol=0.8, price=249.5, gap_pct=0.1,
         )
+        # vp: poc=252, vah=255, val=249 → VA range=6, lower third=[249, 251]
+        # kl: pml=250.5 → falls in [249, 251] → zone found
         plans = _generate_action_plans(regime, "bullish", self._vp(), self._kl(), self._gw(), None)
         assert plans[0].name == "下沿做多"
-        assert plans[0].entry == self._vp().val
+        assert plans[0].entry == self._vp().val  # 249.0
+        assert plans[0].entry_zone_label == "PML"
+        assert plans[0].entry_zone_price == 250.5
         assert plans[0].tp1 == self._vp().poc
+
+    def test_fade_chop_no_structural_level_in_third(self):
+        """No structural level in VA third → fallback to single-point entry."""
+        # All key levels far from VA edges
+        kl = KeyLevels(
+            poc=252.0, vah=255.0, val=249.0,
+            pdh=260.0, pdl=240.0, pmh=260.0, pml=240.0,
+            vwap=252.0,
+        )
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=254.5, gap_pct=0.1,
+        )
+        plans = _generate_action_plans(regime, "bearish", self._vp(), kl, None, None)
+        assert plans[0].entry == self._vp().vah
+        assert plans[0].entry_zone_price is None
+        assert plans[0].entry_zone_label == ""
+        assert "触及 VAH" in plans[0].trigger
 
     def test_unclear_no_entry(self):
         """UNCLEAR → Plan A has no entry price."""
@@ -3251,3 +3422,260 @@ class TestEdgeCases:
         msg = format_us_playbook_message(result)
         assert "📋 合约" not in msg
         assert "剧本推演" in msg
+
+
+class TestPlanContext:
+    """Tests for PlanContext reachability estimation."""
+
+    def test_reachable_range_high_rvol_morning(self):
+        """RVOL=1.5, 360min remaining → wide reachable range."""
+        ctx = PlanContext(minutes_to_close=360, rvol=1.5, avg_daily_range_pct=1.5)
+        result = _reachable_range_pct(ctx)
+        # total_range = 1.5 * 1.5 = 2.25, time_factor = sqrt(360/390) ≈ 0.96
+        # remaining ≈ 2.25 * 0.96 ≈ 2.16
+        assert result > 2.0
+        assert result < 2.5
+
+    def test_reachable_range_low_rvol_afternoon(self):
+        """RVOL=0.46, 90min remaining → narrow range."""
+        ctx = PlanContext(
+            minutes_to_close=90, rvol=0.46,
+            avg_daily_range_pct=1.5, intraday_range_pct=0.5,
+        )
+        result = _reachable_range_pct(ctx)
+        # total_range = 1.5 * 0.46 = 0.69, time_factor = sqrt(90/390) ≈ 0.48
+        # remaining = 0.69 * 0.48 - 0.25 ≈ 0.08, floor = 0.69 * 0.15 ≈ 0.10
+        assert result < 0.5
+        assert result > 0
+
+    def test_reachable_range_no_history(self):
+        """avg_daily_range_pct=0 → returns inf."""
+        ctx = PlanContext(minutes_to_close=90, rvol=0.5, avg_daily_range_pct=0.0)
+        assert _reachable_range_pct(ctx) == float("inf")
+
+
+class TestActionPlanReachability:
+    """Tests for post-processing pipeline: TP2 cap, entry reachability, R:R gate, wait coherence."""
+
+    def _vp(self):
+        return VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
+
+    def _kl(self):
+        return KeyLevels(
+            poc=252.0, vah=255.0, val=249.0,
+            pdh=257.0, pdl=248.0, pmh=254.0, pml=250.5,
+            vwap=251.5,
+        )
+
+    def _gw(self):
+        return GammaWallResult(call_wall_strike=260.0, put_wall_strike=245.0, max_pain=252.0)
+
+    def _regime(self, regime_type=USRegimeType.FADE_CHOP, price=254.5, rvol=0.8):
+        return USRegimeResult(
+            regime=regime_type, confidence=0.7,
+            rvol=rvol, price=price, gap_pct=0.1,
+        )
+
+    def test_tp2_capped_low_rvol(self):
+        """TP2=VAL too far in low RVOL afternoon → TP2 capped or cleared."""
+        ctx = PlanContext(
+            minutes_to_close=90, rvol=0.46,
+            avg_daily_range_pct=1.5, intraday_range_pct=0.5,
+        )
+        # FADE bearish: entry=VAH=255, tp2=VAL=249 → dist=2.35%
+        plans = _generate_action_plans(
+            self._regime(), "bearish", self._vp(), self._kl(), self._gw(), None, ctx=ctx,
+        )
+        plan_a = plans[0]
+        # With low reachable range, TP2 should be capped or cleared
+        if plan_a.tp2 is not None:
+            tp2_dist = abs(plan_a.tp2 - plan_a.entry) / plan_a.entry * 100
+            reachable = _reachable_range_pct(ctx)
+            assert tp2_dist <= reachable
+        # TP2 was either replaced or cleared
+
+    def test_tp2_kept_high_rvol(self):
+        """High RVOL morning → TP2 preserved."""
+        ctx = PlanContext(
+            minutes_to_close=360, rvol=1.5,
+            avg_daily_range_pct=2.5,  # wide enough to keep TP2
+        )
+        plans = _generate_action_plans(
+            self._regime(rvol=1.5), "bearish", self._vp(), self._kl(), self._gw(), None, ctx=ctx,
+        )
+        plan_a = plans[0]
+        assert plan_a.tp2 == self._vp().val  # VAL preserved
+
+    def test_tp2_range_filter(self):
+        """Replacement TP2 must fall between entry and original TP2."""
+        ctx = PlanContext(
+            minutes_to_close=60, rvol=0.3,
+            avg_daily_range_pct=1.0, intraday_range_pct=0.8,
+        )
+        plan = ActionPlan(
+            label="A", name="test", emoji="📉", is_primary=True,
+            logic="test", direction="bearish", trigger="test",
+            entry=255.0, entry_action="做空",
+            stop_loss=257.0, stop_loss_reason="PDH",
+            tp1=252.0, tp1_label="POC",
+            tp2=245.0, tp2_label="Put Wall",
+            rr_ratio=1.5,
+        )
+        result = _cap_tp2(plan, ctx, self._vp(), self._kl(), self._gw())
+        if result.tp2 is not None:
+            # Must be between tp2_original(245) and entry(255)
+            assert 245.0 < result.tp2 < 255.0
+            # Must be farther than TP1 from entry
+            tp1_dist = abs(252.0 - 255.0)
+            tp2_dist = abs(result.tp2 - 255.0)
+            assert tp2_dist > tp1_dist
+
+    def test_entry_demoted_unreachable(self):
+        """Entry far from current price + low reachable → demoted."""
+        ctx = PlanContext(
+            minutes_to_close=60, rvol=0.3,
+            avg_daily_range_pct=1.0, intraday_range_pct=0.8,
+        )
+        plan = ActionPlan(
+            label="A", name="test", emoji="📈", is_primary=True,
+            logic="test", direction="bullish", trigger="test",
+            entry=260.0, entry_action="做多",
+            stop_loss=258.0, stop_loss_reason="SL",
+            tp1=265.0, tp1_label="target",
+            tp2=None, tp2_label="", rr_ratio=2.5,
+        )
+        current_price = 252.0
+        result = _check_entry_reachability(plan, current_price, ctx)
+        assert result.demoted is True
+        assert "入场位距当前价" in result.demote_reason
+
+    def test_entry_ok_early_session(self):
+        """Same distance, early morning with high RVOL → not demoted."""
+        ctx = PlanContext(
+            minutes_to_close=360, rvol=1.5,
+            avg_daily_range_pct=2.0,
+        )
+        plan = ActionPlan(
+            label="A", name="test", emoji="📈", is_primary=True,
+            logic="test", direction="bullish", trigger="test",
+            entry=255.0, entry_action="做多",
+            stop_loss=253.0, stop_loss_reason="SL",
+            tp1=260.0, tp1_label="target",
+            tp2=None, tp2_label="", rr_ratio=2.5,
+        )
+        current_price = 252.0
+        result = _check_entry_reachability(plan, current_price, ctx)
+        assert result.demoted is False
+
+    def test_plan_b_dynamic_sl(self):
+        """Plan B SL uses nearest structure level, not hardcoded VAH/VAL."""
+        # FADE bearish: Plan B entry=VWAP, SL should be nearest level above VWAP
+        plans = _generate_action_plans(
+            self._regime(), "bearish", self._vp(), self._kl(), self._gw(), None,
+        )
+        plan_b = plans[1]
+        # VWAP=251.5, nearest above: POC=252, PMH=254, VAH=255...
+        # SL should NOT be hardcoded VAH=255.0 anymore
+        # It should be nearest structural level above VWAP
+        assert plan_b.stop_loss is not None
+        if plan_b.entry is not None:  # VWAP > POC condition met
+            assert plan_b.stop_loss != self._vp().vah or plan_b.stop_loss_reason != "VAH"
+
+    def test_min_rr_gate_filters(self):
+        """R:R=0.3 → demoted."""
+        ctx = PlanContext(min_rr=0.8)
+        plan = ActionPlan(
+            label="A", name="test", emoji="📉", is_primary=True,
+            logic="test", direction="bearish", trigger="test",
+            entry=255.0, entry_action="做空",
+            stop_loss=256.5, stop_loss_reason="SL",
+            tp1=254.5, tp1_label="TP",
+            tp2=None, tp2_label="", rr_ratio=0.3,
+        )
+        result = _apply_min_rr_gate([plan], ctx)
+        assert result[0].demoted is True
+        assert "R:R" in result[0].demote_reason
+
+    def test_min_rr_gate_passes(self):
+        """R:R=1.5 → not demoted."""
+        ctx = PlanContext(min_rr=0.8)
+        plan = ActionPlan(
+            label="A", name="test", emoji="📈", is_primary=True,
+            logic="test", direction="bullish", trigger="test",
+            entry=250.0, entry_action="做多",
+            stop_loss=248.0, stop_loss_reason="SL",
+            tp1=253.0, tp1_label="TP",
+            tp2=None, tp2_label="", rr_ratio=1.5,
+        )
+        result = _apply_min_rr_gate([plan], ctx)
+        assert result[0].demoted is False
+
+    def test_wait_demotes_a_suppresses_b(self):
+        """Wait signal → Plan A demoted, Plan B suppressed, Plan C unchanged."""
+        ctx = PlanContext(option_action="wait")
+        plans = [
+            ActionPlan(
+                label="A", name="做空", emoji="📉", is_primary=True,
+                logic="test", direction="bearish", trigger="test",
+                entry=255.0, entry_action="做空",
+                stop_loss=257.0, stop_loss_reason="SL",
+                tp1=252.0, tp1_label="POC",
+                tp2=None, tp2_label="", rr_ratio=1.5,
+            ),
+            ActionPlan(
+                label="B", name="VWAP回归", emoji="📉", is_primary=False,
+                logic="test", direction="bearish", trigger="test",
+                entry=251.5, entry_action="做空",
+                stop_loss=253.0, stop_loss_reason="SL",
+                tp1=249.0, tp1_label="VAL",
+                tp2=None, tp2_label="", rr_ratio=1.0,
+            ),
+            ActionPlan(
+                label="C", name="失效", emoji="⚡", is_primary=False,
+                logic="test", direction="bullish", trigger="test",
+                entry=None, entry_action="",
+                stop_loss=None, stop_loss_reason="",
+                tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+            ),
+        ]
+        result = _apply_wait_coherence(plans, ctx)
+        assert result[0].demoted is True
+        assert "观望" in result[0].demote_reason
+        assert result[1].suppressed is True
+        assert "观望" in result[1].demote_reason
+        assert result[2].demoted is False
+        assert result[2].suppressed is False
+
+    def test_no_ctx_backward_compat(self):
+        """No ctx → same behavior as before (no post-processing)."""
+        vp = self._vp()
+        kl = self._kl()
+        regime = self._regime()
+        plans_no_ctx = _generate_action_plans(regime, "bearish", vp, kl, self._gw(), None)
+        # Should still return 3 plans with no demoted/suppressed
+        assert len(plans_no_ctx) == 3
+        assert all(not p.demoted for p in plans_no_ctx)
+        assert all(not p.suppressed for p in plans_no_ctx)
+
+    def test_plan_c_safe_skip(self):
+        """Plan C (no entry/tp) → post-processing safely skips it."""
+        ctx = PlanContext(
+            minutes_to_close=60, rvol=0.3,
+            avg_daily_range_pct=1.0, option_action="wait", min_rr=0.8,
+        )
+        plan_c = ActionPlan(
+            label="C", name="失效", emoji="⚡", is_primary=False,
+            logic="test", direction="bullish", trigger="test",
+            entry=None, entry_action="",
+            stop_loss=None, stop_loss_reason="",
+            tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+        )
+        # Entry reachability should skip
+        result = _check_entry_reachability(plan_c, 252.0, ctx)
+        assert result.demoted is False
+        # TP2 cap should skip
+        result = _cap_tp2(plan_c, ctx, self._vp(), self._kl(), self._gw())
+        assert result.tp2 is None
+        # R:R gate should skip
+        results = _apply_min_rr_gate([plan_c], ctx)
+        assert results[0].demoted is False

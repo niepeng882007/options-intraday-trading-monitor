@@ -37,17 +37,20 @@ def _load_config(path: str = "config/us_playbook_settings.yaml") -> dict:
 
 
 def _build_telegram_application(bot_token: str) -> Application:
+    proxy_url = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
     request = HTTPXRequest(
         read_timeout=TELEGRAM_READ_TIMEOUT_SECONDS,
         write_timeout=TELEGRAM_WRITE_TIMEOUT_SECONDS,
         connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
         pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS,
+        proxy=proxy_url,
     )
     get_updates_request = HTTPXRequest(
         read_timeout=TELEGRAM_READ_TIMEOUT_SECONDS,
         write_timeout=TELEGRAM_WRITE_TIMEOUT_SECONDS,
         connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
         pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS,
+        proxy=proxy_url,
     )
     return (
         Application.builder()

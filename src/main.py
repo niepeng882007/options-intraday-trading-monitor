@@ -33,17 +33,20 @@ TELEGRAM_POLL_RETRY_BASE_SECONDS = 2
 
 
 def _build_telegram_application(bot_token: str) -> Application:
+    proxy_url = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
     request = HTTPXRequest(
         read_timeout=TELEGRAM_READ_TIMEOUT_SECONDS,
         write_timeout=TELEGRAM_WRITE_TIMEOUT_SECONDS,
         connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
         pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS,
+        proxy=proxy_url,
     )
     get_updates_request = HTTPXRequest(
         read_timeout=TELEGRAM_READ_TIMEOUT_SECONDS,
         write_timeout=TELEGRAM_WRITE_TIMEOUT_SECONDS,
         connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
         pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS,
+        proxy=proxy_url,
     )
     return (
         Application.builder()
@@ -62,7 +65,7 @@ async def _shutdown_telegram_application(app: Application) -> None:
     if app.running:
         with suppress(Exception):
             await app.stop()
-    if app.initialized:
+    if app._initialized:
         with suppress(Exception):
             await app.shutdown()
 
@@ -112,6 +115,53 @@ async def _cmd_keyboard_off(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "⌨️ 快捷键盘已关闭。发送 /kb 重新开启。",
         reply_markup=ReplyKeyboardRemove(),
     )
+
+
+async def _cmd_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/messages — show last trading day's message archive."""
+    import datetime
+    from zoneinfo import ZoneInfo
+    from src.store import message_archive
+
+    et = ZoneInfo("America/New_York")
+    now = datetime.datetime.now(et)
+
+    # Find the last trading day (skip weekends)
+    day = now.date() - datetime.timedelta(days=1)
+    while day.weekday() >= 5:  # Saturday=5, Sunday=6
+        day -= datetime.timedelta(days=1)
+
+    start_dt = datetime.datetime.combine(day, datetime.time(0, 0), tzinfo=et)
+    end_dt = datetime.datetime.combine(day, datetime.time(23, 59, 59), tzinfo=et)
+    rows = message_archive.query(start_dt.timestamp(), end_dt.timestamp())
+
+    if not rows:
+        await update.message.reply_text(
+            f"📭 {day.isoformat()} 没有消息记录。",
+        )
+        return
+
+    lines = [f"📬 <b>{day.isoformat()} 消息归档</b> ({len(rows)} 条)\n"]
+    for r in rows:
+        ts = datetime.datetime.fromtimestamp(r["timestamp"], tz=et)
+        time_str = ts.strftime("%H:%M")
+        market = r["market"].upper()
+        source = r["source"]
+        # Truncate long content
+        content = r["content"]
+        if len(content) > 120:
+            content = content[:120] + "…"
+        # Strip HTML tags for summary
+        import re
+        content = re.sub(r"<[^>]+>", "", content)
+        lines.append(f"<code>{time_str}</code> [{market}] {source}: {content}")
+
+    text = "\n".join(lines)
+    # Telegram message limit is 4096 chars
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n…(更多消息已截断)"
+
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def main() -> None:
@@ -176,10 +226,11 @@ async def main() -> None:
             from src.hk.telegram import register_hk_predictor_handlers
             register_hk_predictor_handlers(app, hk_predictor)
 
-        # Keyboard commands
+        # Keyboard & utility commands
         app.add_handler(CommandHandler("kb", _cmd_keyboard))
         app.add_handler(CommandHandler("start", _cmd_keyboard))
         app.add_handler(CommandHandler("kboff", _cmd_keyboard_off))
+        app.add_handler(CommandHandler("messages", _cmd_messages))
 
         await _start_telegram_polling(app)
 

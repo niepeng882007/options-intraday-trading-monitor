@@ -139,12 +139,14 @@ class MarketToneEngine:
 
         try:
             snap = await self._collector.get_snapshot("SPY")
-            price = snap.get("last_price", 0.0)
+            open_price = snap.get("open_price", 0.0)
             prev_close = snap.get("prev_close_price", 0.0)
-            if prev_close <= 0 or price <= 0:
+            # Use open_price for gap calculation (fixed at open, not drifting intraday)
+            gap_ref = open_price if open_price > 0 else snap.get("last_price", 0.0)
+            if prev_close <= 0 or gap_ref <= 0:
                 return "neutral", 0.0
 
-            gap_pct = (price - prev_close) / prev_close * 100
+            gap_pct = (gap_ref - prev_close) / prev_close * 100
 
             if abs(gap_pct) >= large:
                 return "gap_and_go", gap_pct
@@ -398,6 +400,7 @@ class MarketToneEngine:
             alignment_ratio=alignment_ratio,
             alignment_label=alignment_label,
             index_aligned=index_aligned,
+            majority_direction=majority_dir,
             details=details,
         )
 
@@ -476,18 +479,7 @@ class MarketToneEngine:
         # Signal 5: Breadth
         if breadth:
             if breadth.alignment_label == "strong_aligned":
-                majority_dir = (
-                    "bullish" if breadth.aligned_count > breadth.total_count / 2
-                    else "bearish"
-                )
-                # Infer majority direction from details
-                if "↑" in breadth.details:
-                    up_count = int(breadth.details.split("↑")[0])
-                    down_count = int(
-                        breadth.details.split("↑")[1].split("↓")[0].strip()
-                    )
-                    majority_dir = "bullish" if up_count > down_count else "bearish"
-                direction_votes.append(majority_dir)
+                direction_votes.append(breadth.majority_direction)
                 idx_note = " 指数共振" if breadth.index_aligned else ""
                 aligned.append(
                     f"广度: {breadth.aligned_count}/{breadth.total_count} 同向{idx_note}"

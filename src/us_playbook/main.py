@@ -126,13 +126,23 @@ class USPredictor:
         spy_bars = self._last_today_bars.get("SPY")
         return await self._tone_engine.get_tone(spy_today_bars=spy_bars)
 
+    @staticmethod
+    def _apply_tone_modifier(regime: USRegimeResult, tone: MarketTone) -> None:
+        """Apply market tone confidence modifier to a regime result."""
+        if tone.confidence_modifier == 0:
+            return
+        old_conf = regime.confidence
+        regime.confidence = max(0.0, min(1.0, regime.confidence + tone.confidence_modifier))
+        if abs(regime.confidence - old_conf) > 0.001:
+            tone_note = f"Tone {tone.grade} adj {tone.confidence_modifier:+.2f}"
+            regime.details = f"{regime.details}; {tone_note}" if regime.details else tone_note
+
     # ── Core: analysis pipeline ──
 
     async def _run_analysis_pipeline(
         self,
         symbol: str,
         spy_regime: USRegimeType | None = None,
-        market_tone: MarketTone | None = None,
     ) -> USPlaybookResult | None:
         """Run full pipeline for a single symbol."""
         cfg = self._cfg
@@ -295,17 +305,10 @@ class USPredictor:
             rvol_profile=rvol_profile,
             gap_significance_threshold=adaptive_cfg.get("gap_significance_threshold", 0.3),
             pm_source=pm_source,
+            open_price=quote_snapshot.open_price,
         )
 
-        # 9a. Market tone confidence adjustment
-        if market_tone and market_tone.confidence_modifier != 0:
-            old_conf = regime.confidence
-            regime.confidence = max(0.0, min(1.0, regime.confidence + market_tone.confidence_modifier))
-            if abs(regime.confidence - old_conf) > 0.001:
-                tone_note = f"Tone {market_tone.grade} adj {market_tone.confidence_modifier:+.2f}"
-                regime.details = f"{regime.details}; {tone_note}" if regime.details else tone_note
-
-        # 9b. P1-1: FADE_CHOP exec chain — independent from analysis chain
+        # 9a. P1-1: FADE_CHOP exec chain — independent from analysis chain
         exec_chain_df = chain_df  # default: same as analysis chain
         rr_option = option_cfg.get("range_reversal", {})
         if regime.regime == USRegimeType.FADE_CHOP and rr_option.get("dte_min"):
@@ -367,7 +370,8 @@ class USPredictor:
             option_rec=option_rec,
             quote=quote_snapshot,
             option_market=option_market,
-            market_tone=market_tone,
+            market_tone=None,  # set by caller after pipeline
+            avg_daily_range_pct=rvol_profile.avg_daily_range_pct if rvol_profile else 0.0,
         )
         self._last_playbooks[symbol] = result
         self._last_today_bars[symbol] = today
@@ -454,11 +458,7 @@ class USPredictor:
         tone = await self._ensure_market_tone()
         if tone and result.market_tone is None:
             result.market_tone = tone
-            # Apply confidence modifier if not already applied in pipeline
-            if tone.confidence_modifier != 0:
-                result.regime.confidence = max(
-                    0.0, min(1.0, result.regime.confidence + tone.confidence_modifier)
-                )
+            self._apply_tone_modifier(result.regime, tone)
 
         # Get SPY/QQQ results for market context display
         spy_result = self._last_playbooks.get("SPY")
@@ -756,6 +756,7 @@ class USPredictor:
             rvol_profile=rvol_profile,
             gap_significance_threshold=adaptive_cfg.get("gap_significance_threshold", 0.3),
             pm_source=cached_entry.pm_source,
+            open_price=snap.get("open_price", 0.0),
         )
 
         # BREAKOUT check
@@ -942,6 +943,7 @@ class USPredictor:
             rvol_profile=rvol_profile,
             gap_significance_threshold=adaptive_cfg.get("gap_significance_threshold", 0.3),
             pm_source=cached_entry.pm_source,
+            open_price=snap.get("open_price", 0.0),
         )
 
         if not transitioned or new_regime is None:
@@ -982,6 +984,13 @@ class USPredictor:
         result = await self._run_analysis_pipeline(symbol, spy_regime=spy_regime)
         if not result:
             return None
+
+        # Apply market tone confidence modifier (matching on-demand behavior)
+        tone = await self._ensure_market_tone()
+        if tone:
+            if result.market_tone is None:
+                result.market_tone = tone
+            self._apply_tone_modifier(result.regime, tone)
 
         # Structure verification (must all pass to push)
         if not result.filters.tradeable:

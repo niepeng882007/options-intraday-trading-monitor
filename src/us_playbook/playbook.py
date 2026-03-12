@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -107,6 +108,11 @@ class ActionPlan:
     tp2_label: str
     rr_ratio: float
     option_line: str | None = None  # 压缩合约行
+    entry_zone_price: float | None = None   # 区间另一端 (结构位价格)
+    entry_zone_label: str = ""              # 结构位名称 (如 "PMH")
+    demoted: bool = False          # 因可达性/R:R 不合格
+    demote_reason: str = ""
+    suppressed: bool = False       # 因 wait 信号被压制
 
 
 def _calculate_rr(entry: float | None, stop_loss: float | None, take_profit: float | None) -> float:
@@ -116,6 +122,33 @@ def _calculate_rr(entry: float | None, stop_loss: float | None, take_profit: flo
     risk = abs(entry - stop_loss)
     reward = abs(take_profit - entry)
     return reward / risk if risk > 0 else 0.0
+
+
+@dataclass
+class PlanContext:
+    """Runtime context for plan reachability and coherence checks."""
+    minutes_to_close: int = 390
+    rvol: float = 1.0
+    avg_daily_range_pct: float = 0.0   # 0 = 无历史数据，不限制
+    intraday_range_pct: float = 0.0
+    option_action: str = ""             # "wait" / "call" / "put" / ...
+    min_rr: float = 0.8
+
+
+def _reachable_range_pct(ctx: PlanContext) -> float:
+    """Estimate remaining reachable price range (%).
+    Uses sqrt(t/T) scaling (standard intraday volatility model).
+    Returns inf when no historical data, avoiding false restrictions.
+    """
+    if ctx.avg_daily_range_pct <= 0:
+        return float("inf")
+    total_range = ctx.avg_daily_range_pct * max(ctx.rvol, 0.1)
+    time_factor = math.sqrt(ctx.minutes_to_close / 390) if ctx.minutes_to_close > 0 else 0
+    remaining = total_range * time_factor
+    # 已消耗幅度折减 50%（范围可能扩张，不全额扣减）
+    consumed_discount = ctx.intraday_range_pct * 0.5
+    # 地板：日均波幅 15%，即使收盘前也保留最低估算
+    return max(remaining - consumed_discount, total_range * 0.15)
 
 
 def get_regime_strategy(regime: USRegimeType, direction: str) -> str:
@@ -422,6 +455,67 @@ def _nearest_levels(
 
     filtered.sort(key=lambda x: abs(x[1] - price))
     return filtered[:n]
+
+
+def _find_fade_entry_zone(
+    va_edge: float,
+    opposite_edge: float,
+    kl: KeyLevels,
+    gamma_wall: GammaWallResult | None,
+) -> tuple[str, float] | None:
+    """Find the nearest structural level within the VA upper/lower third.
+
+    For shorts (near VAH): zone = [VAH - range/3, VAH)
+    For longs  (near VAL): zone = (VAL, VAL + range/3]
+
+    Candidates: VWAP, PDH, PDL, PMH, PML, Call Wall, Put Wall (no VP POC/VAH/VAL).
+    Returns (label, price) of the nearest to *va_edge*, or None.
+    """
+    va_range = abs(va_edge - opposite_edge)
+    if va_range <= 0:
+        return None
+
+    third = va_range / 3.0
+    is_short = va_edge > opposite_edge  # near VAH → short
+    if is_short:
+        zone_lo = va_edge - third
+        zone_hi = va_edge
+    else:
+        zone_lo = va_edge
+        zone_hi = va_edge + third
+
+    candidates: list[tuple[str, float]] = []
+    if kl.vwap > 0:
+        candidates.append(("VWAP", kl.vwap))
+    if kl.pdh > 0:
+        candidates.append(("PDH", kl.pdh))
+    if kl.pdl > 0:
+        candidates.append(("PDL", kl.pdl))
+    if kl.pmh > 0:
+        candidates.append(("PMH", kl.pmh))
+    if kl.pml > 0:
+        candidates.append(("PML", kl.pml))
+    if gamma_wall:
+        if gamma_wall.call_wall_strike > 0:
+            candidates.append(("Call Wall", gamma_wall.call_wall_strike))
+        if gamma_wall.put_wall_strike > 0:
+            candidates.append(("Put Wall", gamma_wall.put_wall_strike))
+
+    min_dist_pct = 0.0005  # 0.05% noise filter
+    filtered = []
+    for name, val in candidates:
+        if val < zone_lo or val > zone_hi:
+            continue
+        if va_edge > 0 and abs(val - va_edge) / va_edge < min_dist_pct:
+            continue
+        filtered.append((name, val))
+
+    if not filtered:
+        return None
+
+    # Pick the one nearest to va_edge
+    filtered.sort(key=lambda x: abs(x[1] - va_edge))
+    return filtered[0]
 
 
 def _entry_check_text(
@@ -850,6 +944,93 @@ def _regime_reason_lines(
 # ── Action Plan generation engine ──
 
 
+def _cap_tp2(
+    plan: ActionPlan, ctx: PlanContext,
+    vp: VolumeProfileResult, kl: KeyLevels,
+    gamma_wall: GammaWallResult | None,
+) -> ActionPlan:
+    """Cap TP2 to reachable range; replace with nearer structural level or clear."""
+    if plan.tp2 is None or plan.entry is None:
+        return plan
+    reachable = _reachable_range_pct(ctx)
+    tp2_dist = abs(plan.tp2 - plan.entry) / plan.entry * 100
+    if tp2_dist <= reachable:
+        return plan
+
+    # 在 entry→tp2 方向找更近的结构位替代
+    side = "below" if plan.direction == "bearish" else "above"
+    candidates = _nearest_levels(plan.entry, side, vp, kl, gamma_wall, n=3)
+    tp1_val = plan.tp1 or 0
+    original_tp2 = plan.tp2
+    for name, val in candidates:
+        # 区间过滤：替代 TP2 必须在 entry 和原 TP2 之间
+        if plan.direction == "bearish" and not (original_tp2 < val < plan.entry):
+            continue
+        if plan.direction == "bullish" and not (plan.entry < val < original_tp2):
+            continue
+        # 跳过与 TP1 重复的
+        if abs(val - tp1_val) / max(tp1_val, 1) < 0.001:
+            continue
+        dist = abs(val - plan.entry) / plan.entry * 100
+        tp1_dist = abs(tp1_val - plan.entry) / plan.entry * 100 if tp1_val else 0
+        if dist <= reachable and dist > tp1_dist:
+            plan.tp2 = val
+            plan.tp2_label = name
+            return plan
+
+    # 无合适替代 → 清除 TP2
+    plan.tp2 = None
+    plan.tp2_label = ""
+    return plan
+
+
+def _check_entry_reachability(
+    plan: ActionPlan, current_price: float, ctx: PlanContext,
+) -> ActionPlan:
+    """Demote plan if entry is beyond reachable range."""
+    if plan.entry is None or plan.label == "C":
+        return plan
+    entry_dist = abs(plan.entry - current_price) / current_price * 100
+    reachable = _reachable_range_pct(ctx)
+    if entry_dist > reachable:
+        plan.demoted = True
+        plan.demote_reason = (
+            f"入场位距当前价 {entry_dist:.1f}%, "
+            f"剩余波动预估仅 {reachable:.1f}%"
+        )
+    return plan
+
+
+def _apply_wait_coherence(
+    plans: list[ActionPlan], ctx: PlanContext,
+) -> list[ActionPlan]:
+    """When option_rec says 'wait', demote Plan A and suppress Plan B."""
+    if ctx.option_action != "wait":
+        return plans
+    for plan in plans:
+        if plan.label == "A" and plan.entry is not None:
+            plan.demoted = True
+            plan.demote_reason = "核心结论为观望, 边缘入场需额外确认"
+        elif plan.label == "B" and plan.entry is not None:
+            plan.suppressed = True
+            plan.demote_reason = "核心结论为观望, 中间区域入场暂缓"
+    return plans
+
+
+def _apply_min_rr_gate(
+    plans: list[ActionPlan], ctx: PlanContext,
+) -> list[ActionPlan]:
+    """Demote plans with R:R below threshold."""
+    for plan in plans:
+        if plan.label == "C" or plan.entry is None:
+            continue
+        if 0 < plan.rr_ratio < ctx.min_rr:
+            plan.demoted = True
+            if not plan.demote_reason:
+                plan.demote_reason = f"R:R 仅 1:{plan.rr_ratio:.1f}, 低于阈值 1:{ctx.min_rr:.1f}"
+    return plans
+
+
 def _generate_action_plans(
     regime: USRegimeResult,
     direction: str,
@@ -857,6 +1038,7 @@ def _generate_action_plans(
     kl: KeyLevels,
     gamma_wall: GammaWallResult | None,
     option_rec: OptionRecommendation | None,
+    ctx: PlanContext | None = None,
 ) -> list[ActionPlan]:
     """Generate A/B/C action plans based on regime and direction."""
     price = regime.price
@@ -864,17 +1046,26 @@ def _generate_action_plans(
 
     if regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
         if direction == "bullish":
-            return _plans_trend_bullish(price, vp, kl, gamma_wall, option_line)
-        return _plans_trend_bearish(price, vp, kl, gamma_wall, option_line)
-
-    if regime.regime == USRegimeType.FADE_CHOP:
+            plans = _plans_trend_bullish(price, vp, kl, gamma_wall, option_line)
+        else:
+            plans = _plans_trend_bearish(price, vp, kl, gamma_wall, option_line)
+    elif regime.regime == USRegimeType.FADE_CHOP:
         edge, _ = _closest_value_area_edge(price, vp)
         if edge == "VAH":
-            return _plans_fade_bearish(price, vp, kl, gamma_wall, option_line)
-        return _plans_fade_bullish(price, vp, kl, gamma_wall, option_line)
+            plans = _plans_fade_bearish(price, vp, kl, gamma_wall, option_line)
+        else:
+            plans = _plans_fade_bullish(price, vp, kl, gamma_wall, option_line)
+    else:
+        # UNCLEAR
+        plans = _plans_unclear(price, vp, kl, gamma_wall, regime, option_line)
 
-    # UNCLEAR
-    return _plans_unclear(price, vp, kl, gamma_wall, regime, option_line)
+    # 后处理（仅当有 ctx 时执行）
+    if ctx:
+        plans = [_cap_tp2(p, ctx, vp, kl, gamma_wall) for p in plans]
+        plans = [_check_entry_reachability(p, price, ctx) for p in plans]
+        plans = _apply_wait_coherence(plans, ctx)
+        plans = _apply_min_rr_gate(plans, ctx)
+    return plans
 
 
 def _plans_trend_bullish(
@@ -1000,12 +1191,18 @@ def _plans_fade_bearish(
     above = _nearest_levels(vp.vah, "above", vp, kl, gamma_wall, n=1)
     sl_a = above[0] if above else None
 
+    zone = _find_fade_entry_zone(vp.vah, vp.val, kl, gamma_wall)
+
     plan_a = ActionPlan(
         label="A", name="上沿做空", emoji="📉", is_primary=True,
-        logic="价格靠近 VAH, 博均值回归做空",
+        logic="价格进入 VA 上沿区间, 博均值回归做空" if zone
+              else "价格靠近 VAH, 博均值回归做空",
         direction="bearish",
-        trigger=f"价格触及 VAH {vp.vah:,.2f} 附近",
+        trigger=f"价格进入 {zone[0]}→VAH 区间 ({zone[1]:,.2f}-{vp.vah:,.2f})" if zone
+                else f"价格触及 VAH {vp.vah:,.2f} 附近",
         entry=vp.vah, entry_action="做空",
+        entry_zone_price=zone[1] if zone else None,
+        entry_zone_label=zone[0] if zone else "",
         stop_loss=sl_a[1] if sl_a else None,
         stop_loss_reason=sl_a[0] if sl_a else "VAH 上方",
         tp1=vp.poc, tp1_label="POC",
@@ -1014,18 +1211,25 @@ def _plans_fade_bearish(
         option_line=option_line,
     )
 
-    # Plan B: VWAP regression
+    # Plan B: VWAP regression — dynamic SL: nearest structure above entry
     plan_b_entry = kl.vwap if kl.vwap > vp.poc else None
+    if plan_b_entry:
+        sl_b_candidates = _nearest_levels(plan_b_entry, "above", vp, kl, gamma_wall, n=1)
+        sl_b_price = sl_b_candidates[0][1] if sl_b_candidates else vp.vah
+        sl_b_label = sl_b_candidates[0][0] if sl_b_candidates else "VAH"
+    else:
+        sl_b_price = vp.vah
+        sl_b_label = "VAH"
     plan_b = ActionPlan(
         label="B", name="VWAP 回归做空", emoji="📉", is_primary=False,
         logic="VWAP 上方接空, 目标 POC",
         direction="bearish",
         trigger=f"价格反弹至 VWAP {kl.vwap:,.2f}" if plan_b_entry else "价格反弹至 VAH 附近",
         entry=plan_b_entry, entry_action="做空",
-        stop_loss=vp.vah, stop_loss_reason="VAH",
+        stop_loss=sl_b_price, stop_loss_reason=sl_b_label,
         tp1=vp.poc, tp1_label="POC",
         tp2=vp.val, tp2_label="VAL",
-        rr_ratio=_calculate_rr(plan_b_entry, vp.vah, vp.poc),
+        rr_ratio=_calculate_rr(plan_b_entry, sl_b_price, vp.poc),
     )
 
     plan_c = ActionPlan(
@@ -1048,12 +1252,18 @@ def _plans_fade_bullish(
     below = _nearest_levels(vp.val, "below", vp, kl, gamma_wall, n=1)
     sl_a = below[0] if below else None
 
+    zone = _find_fade_entry_zone(vp.val, vp.vah, kl, gamma_wall)
+
     plan_a = ActionPlan(
         label="A", name="下沿做多", emoji="📈", is_primary=True,
-        logic="价格靠近 VAL, 博均值回归做多",
+        logic="价格进入 VA 下沿区间, 博均值回归做多" if zone
+              else "价格靠近 VAL, 博均值回归做多",
         direction="bullish",
-        trigger=f"价格触及 VAL {vp.val:,.2f} 附近",
+        trigger=f"价格进入 VAL→{zone[0]} 区间 ({vp.val:,.2f}-{zone[1]:,.2f})" if zone
+                else f"价格触及 VAL {vp.val:,.2f} 附近",
         entry=vp.val, entry_action="做多",
+        entry_zone_price=zone[1] if zone else None,
+        entry_zone_label=zone[0] if zone else "",
         stop_loss=sl_a[1] if sl_a else None,
         stop_loss_reason=sl_a[0] if sl_a else "VAL 下方",
         tp1=vp.poc, tp1_label="POC",
@@ -1062,17 +1272,25 @@ def _plans_fade_bullish(
         option_line=option_line,
     )
 
+    # Plan B: VWAP regression — dynamic SL: nearest structure below entry
     plan_b_entry = kl.vwap if kl.vwap < vp.poc else None
+    if plan_b_entry:
+        sl_b_candidates = _nearest_levels(plan_b_entry, "below", vp, kl, gamma_wall, n=1)
+        sl_b_price = sl_b_candidates[0][1] if sl_b_candidates else vp.val
+        sl_b_label = sl_b_candidates[0][0] if sl_b_candidates else "VAL"
+    else:
+        sl_b_price = vp.val
+        sl_b_label = "VAL"
     plan_b = ActionPlan(
         label="B", name="VWAP 回归做多", emoji="📈", is_primary=False,
         logic="VWAP 下方接多, 目标 POC",
         direction="bullish",
         trigger=f"价格回调至 VWAP {kl.vwap:,.2f}" if plan_b_entry else "价格回调至 VAL 附近",
         entry=plan_b_entry, entry_action="做多",
-        stop_loss=vp.val, stop_loss_reason="VAL",
+        stop_loss=sl_b_price, stop_loss_reason=sl_b_label,
         tp1=vp.poc, tp1_label="POC",
         tp2=vp.vah, tp2_label="VAH",
-        rr_ratio=_calculate_rr(plan_b_entry, vp.val, vp.poc),
+        rr_ratio=_calculate_rr(plan_b_entry, sl_b_price, vp.poc),
     )
 
     plan_c = ActionPlan(
@@ -1203,7 +1421,19 @@ def _format_action_plan(plan: ActionPlan) -> list[str]:
 
     lines.append(f"  触发: {_esc(plan.trigger)}")
     if plan.entry is not None:
-        lines.append(f"  入场: {plan.entry:,.2f} ({plan.entry_action})")
+        if plan.entry_zone_price is not None:
+            if plan.direction == "bearish":
+                lines.append(
+                    f"  入场区间: {_esc(plan.entry_zone_label)}({plan.entry_zone_price:,.2f})"
+                    f" → VAH({plan.entry:,.2f}) {plan.entry_action}"
+                )
+            else:
+                lines.append(
+                    f"  入场区间: VAL({plan.entry:,.2f})"
+                    f" → {_esc(plan.entry_zone_label)}({plan.entry_zone_price:,.2f}) {plan.entry_action}"
+                )
+        else:
+            lines.append(f"  入场: {plan.entry:,.2f} ({plan.entry_action})")
     else:
         lines.append(f"  入场: 等待方向明确后入场")
     if plan.stop_loss is not None:
@@ -1216,6 +1446,10 @@ def _format_action_plan(plan: ActionPlan) -> list[str]:
         lines.append(f"  R:R ≈ 1:{plan.rr_ratio:.1f}")
     if plan.option_line:
         lines.append(plan.option_line)
+    if plan.demoted and plan.demote_reason:
+        lines.append(f"  ⚠️ {_esc(plan.demote_reason)}")
+    if plan.suppressed and plan.demote_reason:
+        lines.append(f"  ⚠️ {_esc(plan.demote_reason)}")
     return lines
 
 
@@ -1401,7 +1635,20 @@ def format_us_playbook_message(
     lines.append("⚔️ <b>剧本推演</b>")
     lines.append("")
 
-    plans = _generate_action_plans(r, _direction, vp, kl, gamma_wall, recommendation)
+    _close_et = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    _min_left = max(0, int((_close_et - now).total_seconds() / 60))
+    _intraday_range = 0.0
+    if quote and quote.high_price > 0 and quote.low_price > 0:
+        _intraday_range = (quote.high_price - quote.low_price) / quote.low_price * 100
+    _plan_ctx = PlanContext(
+        minutes_to_close=_min_left,
+        rvol=r.rvol,
+        avg_daily_range_pct=getattr(result, "avg_daily_range_pct", 0.0),
+        intraday_range_pct=_intraday_range,
+        option_action=recommendation.action if recommendation else "",
+    )
+
+    plans = _generate_action_plans(r, _direction, vp, kl, gamma_wall, recommendation, ctx=_plan_ctx)
     for plan in plans:
         for plan_line in _format_action_plan(plan):
             lines.append(plan_line)

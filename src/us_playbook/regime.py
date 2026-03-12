@@ -23,6 +23,7 @@ def detect_regime_transition(
     rvol_profile=None,
     gap_significance_threshold: float = 0.3,
     pm_source: str = "futu",
+    open_price: float = 0.0,
 ) -> tuple[bool, USRegimeResult | None]:
     """Detect if regime has transitioned from original classification.
 
@@ -46,6 +47,7 @@ def detect_regime_transition(
         rvol_profile=rvol_profile,
         gap_significance_threshold=gap_significance_threshold,
         pm_source=pm_source,
+        open_price=open_price,
     )
 
     # Only signal meaningful upgrades
@@ -90,6 +92,7 @@ def classify_us_regime(
     rvol_profile: RvolProfile | None = None,
     gap_significance_threshold: float = 0.3,
     pm_source: str = "futu",
+    open_price: float = 0.0,
 ) -> USRegimeResult:
     """Classify US intraday regime into 4 styles.
 
@@ -126,8 +129,9 @@ def classify_us_regime(
     else:
         threshold_label = "static"
 
-    # Gap calculation
-    gap_pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
+    # Gap calculation — use open_price (fixed at open) rather than current price
+    gap_ref = open_price if open_price > 0 else price  # fallback for callers that don't pass open_price
+    gap_pct = ((gap_ref - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
 
     # Normalized gap: use daily range if available from adaptive profile
     if rvol_profile and rvol_profile.avg_daily_range_pct > 0:

@@ -396,6 +396,7 @@ def evaluate_regimes(
                 rvol_profile=rvol_profile,
                 gap_significance_threshold=gap_significance_threshold,
                 pm_source="gap_estimate",
+                open_price=open_price,
             )
 
             # Cache SPY regime for other symbols (D1b)

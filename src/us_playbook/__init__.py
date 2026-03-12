@@ -81,6 +81,7 @@ class BreadthProxy:
     alignment_ratio: float
     alignment_label: str       # "strong_aligned" / "mixed" / "divergent"
     index_aligned: bool        # SPY+QQQ+IWM all same direction
+    majority_direction: str = "neutral"  # "bullish" / "bearish" / "neutral"
     details: str = ""
 
 
@@ -133,6 +134,7 @@ class USPlaybookResult:
     quote: QuoteSnapshot | None = None
     option_market: OptionMarketSnapshot | None = None
     market_tone: MarketTone | None = None
+    avg_daily_range_pct: float = 0.0  # 来自 RvolProfile，0=无历史数据
 
 
 @dataclass
