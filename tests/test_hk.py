@@ -2739,3 +2739,217 @@ class TestDirectionVwapContradiction:
         )
         direction = _decide_direction(regime, self._vp, vwap=560.0)
         assert direction == "bullish"
+
+
+# ── P0-1: VWAP Structural Veto for RANGE ──
+
+class TestRangeVwapStructuralVeto:
+    """P0-1: RANGE direction should be vetoed when VWAP contradicts structural thesis."""
+
+    _vp = VolumeProfileResult(poc=109.0, vah=109.0, val=107.0)
+
+    def test_range_bearish_vetoed_when_vwap_above_vah(self):
+        """RANGE bearish near VAH should be neutral when VWAP > VAH (uptrend, not range)."""
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=108.80, vah=109.0, val=107.0, poc=108.0,
+        )
+        direction = _decide_direction(regime, self._vp, vwap=109.54)
+        assert direction == "neutral"
+
+    def test_range_bullish_vetoed_when_vwap_below_val(self):
+        """RANGE bullish near VAL should be neutral when VWAP < VAL (downtrend, not range)."""
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=107.20, vah=109.0, val=107.0, poc=108.0,
+        )
+        direction = _decide_direction(regime, self._vp, vwap=106.50)
+        assert direction == "neutral"
+
+    def test_range_bearish_allowed_when_vwap_inside_va(self):
+        """RANGE bearish near VAH is valid when VWAP is inside VA (normal range)."""
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=108.80, vah=109.0, val=107.0, poc=108.0,
+        )
+        direction = _decide_direction(regime, self._vp, vwap=108.50)
+        assert direction == "bearish"
+
+    def test_range_direction_no_vwap_backward_compat(self):
+        """Without VWAP, RANGE direction works normally."""
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=108.80, vah=109.0, val=107.0, poc=108.0,
+        )
+        direction = _decide_direction(regime, self._vp, vwap=0.0)
+        assert direction == "bearish"  # price > mid → bearish
+
+    def test_jd_case_vwap_above_vah_blocks_bearish_put(self):
+        """JD 2026-03-12 case: price=108.80, VWAP=109.54, VAH=109.00 → no bearish Put."""
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.72,
+            rvol=0.6, price=108.80, vah=109.0, val=107.0, poc=108.0,
+        )
+        vp = VolumeProfileResult(poc=108.0, vah=109.0, val=107.0)
+        filters = FilterResult(tradeable=True)
+        chain = pd.DataFrame([
+            {"code": "P1", "option_type": "PUT", "strike_price": 108.0,
+             "strike_time": "2026-03-14", "open_interest": 200,
+             "delta": -0.45, "last_price": 1.50},
+        ])
+        dates = [{"strike_time": "2026-03-14"}]
+        rec = recommend(regime, vp, filters, chain_df=chain, expiry_dates=dates, vwap=109.54)
+        # Should be wait (neutral direction from VWAP veto)
+        assert rec.action == "wait"
+        assert rec.direction == "neutral"
+
+
+# ── P0-2: Failed Breakout Detection ──
+
+class TestFailedBreakoutDetection:
+    """P0-2: Price that breached VA boundary and retreated should discount RANGE confidence."""
+
+    _vp = VolumeProfileResult(poc=109.0, vah=110.0, val=108.0)
+
+    def test_failed_breakout_above_vah_discounts_confidence(self):
+        """Today's high breached VAH by >= 0.5% then retreated → confidence reduced."""
+        bars = _make_bars([
+            ("2026-03-12 10:00", 110.3, 110.6, 110.0, 110.2, 100),  # high=110.6, VAH=110 → 0.55%
+            ("2026-03-12 10:01", 110.2, 110.3, 109.5, 109.5, 100),
+        ])
+        result = classify_regime(
+            price=109.5, rvol=0.6, vp=self._vp,
+            today_bars=bars, failed_breakout_pct=0.5,
+        )
+        assert result.regime == RegimeType.RANGE
+        assert "failed breakout above VAH" in result.details
+
+        # Compare with no breach
+        result_no_breach = classify_regime(price=109.5, rvol=0.6, vp=self._vp)
+        assert result.confidence < result_no_breach.confidence
+
+    def test_no_breach_no_discount(self):
+        """Today's high below VAH → no failed breakout discount."""
+        bars = _make_bars([
+            ("2026-03-12 10:00", 109.0, 109.8, 108.5, 109.5, 100),
+        ])
+        result = classify_regime(
+            price=109.5, rvol=0.6, vp=self._vp,
+            today_bars=bars, failed_breakout_pct=0.5,
+        )
+        assert result.regime == RegimeType.RANGE
+        assert "failed breakout" not in result.details
+
+    def test_shallow_breach_no_discount(self):
+        """Breach < 0.5% → no discount (under threshold)."""
+        bars = _make_bars([
+            ("2026-03-12 10:00", 110.0, 110.3, 109.5, 109.5, 100),  # 110.3 vs VAH 110 → 0.27%
+        ])
+        result = classify_regime(
+            price=109.5, rvol=0.6, vp=self._vp,
+            today_bars=bars, failed_breakout_pct=0.5,
+        )
+        assert "failed breakout" not in result.details
+
+
+# ── P1-2: RANGE DTE Guard ──
+
+class TestRangeDTEGuard:
+    """P1-2: RANGE regime with DTE < range_min_dte should wait."""
+
+    def test_range_1dte_blocked(self):
+        """RANGE with DTE=1 should return wait."""
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=109.8, vah=110.0, val=108.0, poc=109.0,
+        )
+        vp = VolumeProfileResult(poc=109.0, vah=110.0, val=108.0)
+        filters = FilterResult(tradeable=True)
+        chain = pd.DataFrame([
+            {"code": "P1", "option_type": "PUT", "strike_price": 109.0,
+             "strike_time": "2026-03-13", "open_interest": 200,
+             "delta": -0.45, "last_price": 1.50},
+        ])
+        # DTE=1
+        dates = [{"strike_time": "2026-03-13"}]
+        rec = recommend(
+            regime, vp, filters, chain_df=chain, expiry_dates=dates,
+            vwap=109.5, range_min_dte=2,
+        )
+        assert rec.action == "wait"
+        assert "DTE" in rec.rationale
+
+    def test_range_3dte_allowed(self):
+        """RANGE with DTE=3 (>= range_min_dte=2) should NOT be blocked by DTE guard."""
+        regime = RegimeResult(
+            regime=RegimeType.RANGE, confidence=0.7,
+            rvol=0.6, price=109.8, vah=110.0, val=108.0, poc=109.0,
+        )
+        vp = VolumeProfileResult(poc=109.0, vah=110.0, val=108.0)
+        filters = FilterResult(tradeable=True)
+        chain = pd.DataFrame([
+            {"code": "P1", "option_type": "PUT", "strike_price": 109.0,
+             "strike_time": "2026-03-15", "open_interest": 200,
+             "delta": -0.45, "last_price": 1.50},
+        ])
+        # DTE=3
+        dates = [{"strike_time": "2026-03-15"}]
+        rec = recommend(
+            regime, vp, filters, chain_df=chain, expiry_dates=dates,
+            vwap=109.5, range_min_dte=2,
+        )
+        # Should NOT be blocked by DTE guard (may still be wait for other reasons)
+        if rec.action == "wait":
+            assert "DTE" not in rec.rationale
+
+    def test_breakout_1dte_not_blocked(self):
+        """BREAKOUT with DTE=1 should NOT be blocked by DTE guard (only affects RANGE)."""
+        regime = RegimeResult(
+            regime=RegimeType.BREAKOUT, confidence=0.8,
+            rvol=1.5, price=112.0, vah=110.0, val=108.0, poc=109.0,
+        )
+        vp = VolumeProfileResult(poc=109.0, vah=110.0, val=108.0)
+        filters = FilterResult(tradeable=True)
+        chain = pd.DataFrame([
+            {"code": "C1", "option_type": "CALL", "strike_price": 112.0,
+             "strike_time": "2026-03-13", "open_interest": 200,
+             "delta": 0.50, "last_price": 2.00},
+        ])
+        dates = [{"strike_time": "2026-03-13"}]
+        rec = recommend(
+            regime, vp, filters, chain_df=chain, expiry_dates=dates,
+            vwap=112.0, range_min_dte=2,
+        )
+        # BREAKOUT should not be affected by range_min_dte
+        assert "DTE" not in (rec.rationale or "")
+
+
+# ── P2-2: Spike-and-Fade Marker ──
+
+class TestSpikeAndFadeMarker:
+    """P2-2: Informational spike-and-fade marker in RANGE details."""
+
+    _vp = VolumeProfileResult(poc=109.0, vah=110.0, val=108.0)
+
+    def test_spike_and_fade_above_vah(self):
+        """Today touched VAH but retreated → spike-and-fade marker."""
+        bars = _make_bars([
+            ("2026-03-12 10:00", 109.5, 110.3, 109.0, 109.2, 100),
+        ])
+        result = classify_regime(
+            price=109.2, rvol=0.6, vp=self._vp,
+            today_bars=bars, failed_breakout_pct=5.0,  # High threshold to avoid fb discount
+        )
+        assert result.regime == RegimeType.RANGE
+        assert "spike-and-fade above VAH" in result.details
+
+    def test_no_spike_no_marker(self):
+        """Today didn't touch VAH → no marker."""
+        bars = _make_bars([
+            ("2026-03-12 10:00", 109.0, 109.5, 108.5, 109.2, 100),
+        ])
+        result = classify_regime(
+            price=109.2, rvol=0.6, vp=self._vp,
+            today_bars=bars,
+        )
+        assert "spike-and-fade" not in result.details

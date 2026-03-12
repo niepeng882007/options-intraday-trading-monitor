@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
@@ -134,7 +135,7 @@ class HKPredictor:
         self._cfg = _load_config(config_path)
         futu_cfg = self._cfg.get("futu", {})
         self._collector = HKCollector(
-            host=futu_cfg.get("host", "127.0.0.1"),
+            host=os.getenv("FUTU_HOST", futu_cfg.get("host", "127.0.0.1")),
             port=futu_cfg.get("port", 11111),
         )
         self._connected = False
@@ -325,10 +326,12 @@ class HKPredictor:
             today_bars=today_bars,
             gap_warning_pct=regime_cfg.get("gap_warning_pct", 3.0),
             va_penetration_min_pct=regime_cfg.get("va_penetration_min_pct", 0.3),
+            failed_breakout_pct=regime_cfg.get("failed_breakout_pct", 0.5),
         )
 
         # 9. Option recommendation
         chase_risk_cfg = cfg.get("chase_risk", {})
+        opt_rec_cfg = cfg.get("option_recommend", {})
         option_rec = recommend(
             regime=regime,
             vp=vp,
@@ -338,6 +341,7 @@ class HKPredictor:
             gamma_wall=gamma_wall,
             vwap=vwap,
             chase_risk_cfg=chase_risk_cfg,
+            range_min_dte=opt_rec_cfg.get("range_min_dte", 2),
         )
 
         option_market = OptionMarketSnapshot(
@@ -491,6 +495,7 @@ class HKPredictor:
             today_bars=today_bars,
             gap_warning_pct=regime_cfg.get("gap_warning_pct", 3.0),
             va_penetration_min_pct=regime_cfg.get("va_penetration_min_pct", 0.3),
+            failed_breakout_pct=regime_cfg.get("failed_breakout_pct", 0.5),
         )
 
         # ── BREAKOUT L1 check (both sessions) ──
@@ -567,6 +572,19 @@ class HKPredictor:
             and regime.confidence >= rng_min_conf
             and rng_rvol_min <= rvol <= rng_rvol_max
         ):
+            # L1 breach rejection: if today already breached VA boundary significantly,
+            # the level has been tested — RANGE mean-reversion thesis is weakened
+            fb_pct = regime_cfg.get("failed_breakout_pct", 0.5)
+            if not today_bars.empty and vp.vah > 0 and vp.val > 0:
+                t_high = float(today_bars["High"].max())
+                t_low = float(today_bars["Low"].min())
+                if t_high > vp.vah and (t_high - vp.vah) / vp.vah * 100 >= fb_pct:
+                    logger.info("L1 reject %s: RANGE but today breached VAH (%.2f > %.2f)", symbol, t_high, vp.vah)
+                    return None
+                if t_low < vp.val and (vp.val - t_low) / vp.val * 100 >= fb_pct:
+                    logger.info("L1 reject %s: RANGE but today breached VAL (%.2f < %.2f)", symbol, t_low, vp.val)
+                    return None
+
             # Price within proximity of VAH or VAL
             dist_vah = abs(price - vp.vah) / price * 100 if price > 0 else 999
             dist_val = abs(price - vp.val) / price * 100 if price > 0 else 999
@@ -575,6 +593,16 @@ class HKPredictor:
             if near_boundary <= rng_prox:
                 direction = "bearish" if dist_vah < dist_val else "bullish"
                 boundary = "VAH" if dist_vah < dist_val else "VAL"
+
+                # VWAP structural veto: skip RANGE signal if VWAP contradicts direction
+                if l1_vwap > 0:
+                    if direction == "bearish" and l1_vwap > vp.vah:
+                        logger.info("L1 reject %s: RANGE bearish but VWAP %.2f > VAH %.2f", symbol, l1_vwap, vp.vah)
+                        return None
+                    if direction == "bullish" and l1_vwap < vp.val:
+                        logger.info("L1 reject %s: RANGE bullish but VWAP %.2f < VAL %.2f", symbol, l1_vwap, vp.val)
+                        return None
+
                 triggers = [f"接近 {boundary} (距离 {near_boundary:.2f}%)"]
 
                 return {

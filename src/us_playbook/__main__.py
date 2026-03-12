@@ -107,7 +107,7 @@ async def main() -> None:
     futu_cfg = cfg.get("futu", {})
 
     collector = FutuCollector(
-        host=futu_cfg.get("host", "127.0.0.1"),
+        host=os.getenv("FUTU_HOST", futu_cfg.get("host", "127.0.0.1")),
         port=futu_cfg.get("port", 11111),
     )
     await collector.connect()

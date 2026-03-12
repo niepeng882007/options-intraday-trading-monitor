@@ -58,6 +58,7 @@ regime:
   momentum_min_dist_pct: 1.0  # VA 边界距离 >= 1% 触发动量突破
   gap_warning_pct: 3.0        # 跳空 >= 3% 触发特殊处理
   va_penetration_min_pct: 0.3  # VA 边界最小渗透 % 才给满置信度
+  failed_breakout_pct: 0.5    # 日内 breach VA 边界 >= 0.5% 视为 failed breakout
 
 simulation:
   tp_pct: 0.8
@@ -124,6 +125,9 @@ telegram:
   bot_token: "${TELEGRAM_BOT_TOKEN}"
   chat_id: "${TELEGRAM_CHAT_ID}"
   max_notifications_per_minute: 10
+
+option_recommend:
+  range_min_dte: 2                   # RANGE 策略最小 DTE, < 此值拦截
 
 filters:
   min_turnover_hkd: 100000000       # 1亿 HKD

@@ -101,7 +101,15 @@ def _decide_direction(
         # Mean reversion: near VAH → bearish, near VAL → bullish
         if vp.vah > vp.val:
             mid = (vp.vah + vp.val) / 2
-            return "bearish" if price > mid else "bullish"
+            direction = "bearish" if price > mid else "bullish"
+            # VWAP structural veto: if VWAP contradicts the mean-reversion direction,
+            # the range thesis is unreliable (e.g. VWAP above VAH → uptrend, not range)
+            if vwap > 0:
+                if direction == "bearish" and vwap > vp.vah:
+                    return "neutral"  # VWAP above VAH contradicts bearish range
+                if direction == "bullish" and vwap < vp.val:
+                    return "neutral"  # VWAP below VAL contradicts bullish range
+            return direction
         return "neutral"
 
     return "neutral"  # WHIPSAW / UNCLEAR
@@ -198,6 +206,7 @@ def recommend(
     gamma_wall: GammaWallResult | None = None,
     vwap: float = 0.0,
     chase_risk_cfg: dict | None = None,
+    range_min_dte: int = 2,
 ) -> OptionRecommendation:
     """Generate option recommendation based on regime, levels, and chain data."""
     price = regime.price
@@ -277,6 +286,18 @@ def recommend(
             dte = (exp_date - date.today()).days
         except (ValueError, TypeError):
             pass
+
+    # RANGE + short DTE guard: RANGE mean-reversion needs time to play out,
+    # 1 DTE options have too much gamma risk for this strategy
+    if regime.regime == RegimeType.RANGE and 0 < dte < range_min_dte:
+        dir_hint = "看多" if direction == "bullish" else "看空"
+        return OptionRecommendation(
+            action="wait",
+            direction=direction,
+            rationale=f"方向偏{dir_hint}, 但 DTE={dte} 过短不适合 RANGE 策略",
+            risk_note=f"RANGE 需要时间回归均值, {dte} DTE Gamma 风险过高",
+            wait_conditions=[f"等待 DTE >= {range_min_dte} 的合约"],
+        )
 
     # No expiry or no chain → wait (recommendations require specific strike + expiry)
     if not expiry or not has_chain:

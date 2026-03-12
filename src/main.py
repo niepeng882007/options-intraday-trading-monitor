@@ -182,7 +182,7 @@ async def main() -> None:
     # ── Shared FutuCollector (for US Predictor) ──
     futu_cfg = (us_cfg or {}).get("futu", {})
     collector = FutuCollector(
-        host=futu_cfg.get("host", "127.0.0.1"),
+        host=os.getenv("FUTU_HOST", futu_cfg.get("host", "127.0.0.1")),
         port=futu_cfg.get("port", 11111),
     )
     await collector.connect()

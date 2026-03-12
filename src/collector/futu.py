@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -103,7 +104,7 @@ class FutuCollector(BaseCollector):
 
     def __init__(
         self,
-        host: str = "127.0.0.1",
+        host: str = os.getenv("FUTU_HOST", "127.0.0.1"),
         port: int = 11111,
         subscription_quota: int = 300,
     ) -> None:

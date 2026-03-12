@@ -108,6 +108,9 @@ def classify_regime(
     today_bars: pd.DataFrame | None = None,
     gap_warning_pct: float = 3.0,
     va_penetration_min_pct: float = 0.3,
+    failed_breakout_pct: float = 0.5,
+    range_discount_threshold: float = 0.3,
+    range_discount_slope: float = 0.5,
 ) -> RegimeResult:
     """Classify current market regime.
 
@@ -231,11 +234,39 @@ def classify_regime(
 
         # Discount confidence when intraday range is wide relative to VA
         details = f"RVOL {rvol:.2f} < {range_rvol}, price in value area"
+
+        # Failed breakout detection: today's price breached VA boundary
+        # then retreated — the level has been tested and may not hold
+        _fb_pct = failed_breakout_pct
+        today_high = 0.0
+        today_low = float("inf")
+        if today_bars is not None and not today_bars.empty:
+            today_high = float(today_bars["High"].max())
+            today_low = float(today_bars["Low"].min())
+        if vp.vah > 0 and today_high > vp.vah:
+            breach_pct = (today_high - vp.vah) / vp.vah * 100
+            if breach_pct >= _fb_pct:
+                confidence -= 0.20
+                details += f", failed breakout above VAH ({breach_pct:.1f}%)"
+        if vp.val > 0 and today_low < float("inf") and today_low < vp.val:
+            breach_pct = (vp.val - today_low) / vp.val * 100
+            if breach_pct >= _fb_pct:
+                confidence -= 0.20
+                details += f", failed breakout below VAL ({breach_pct:.1f}%)"
+        confidence = max(0.0, confidence)
+
+        # Spike-and-fade marker (informational): today touched VAH/VAL but retreated
+        # Price is back inside VA → level was tested, adds context to playbook
+        if today_high > vp.vah and price < vp.vah:
+            details += ", spike-and-fade above VAH"
+        if today_low < float("inf") and today_low < vp.val and price > vp.val:
+            details += ", spike-and-fade below VAL"
+
         va_range = vp.vah - vp.val
         if intraday_range > 0 and va_range > 0:
             range_ratio = intraday_range / va_range
-            if range_ratio > 0.3:
-                discount = min(0.3, (range_ratio - 0.3) * 0.5)
+            if range_ratio > range_discount_threshold:
+                discount = min(0.3, (range_ratio - range_discount_threshold) * range_discount_slope)
                 confidence = max(0.0, confidence - discount)
                 details += f" (振幅占VA {range_ratio:.0%}, 置信度折扣)"
 

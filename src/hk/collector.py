@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -21,7 +22,7 @@ HKT = timezone(timedelta(hours=8))
 class HKCollector:
     """Synchronous HK market data collector via Futu OpenAPI."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 11111):
+    def __init__(self, host: str = os.getenv("FUTU_HOST", "127.0.0.1"), port: int = 11111):
         self._host = host
         self._port = port
         self._ctx: OpenQuoteContext | None = None

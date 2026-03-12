@@ -7,6 +7,7 @@ services:
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - FUTU_HOST=host.docker.internal
       - TZ=America/New_York
     volumes:
       - ./config:/app/config
