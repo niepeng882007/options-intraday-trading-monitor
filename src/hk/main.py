@@ -20,8 +20,8 @@ import yaml
 from src.common.chart import ChartData, generate_chart_async
 from src.common.types import PlaybookResponse
 from src.hk import (
-    FilterResult, GammaWallResult, OptionMarketSnapshot, OptionRecommendation, Playbook,
-    QuoteSnapshot,
+    FilterResult, GammaWallResult, HKKeyLevels, OptionMarketSnapshot, OptionRecommendation,
+    Playbook, QuoteSnapshot,
     RegimeResult, RegimeType, ScanAlertRecord, ScanSignal,
     VolumeProfileResult,
 )
@@ -29,10 +29,14 @@ from src.hk.collector import HKCollector
 from src.hk.filter import check_filters
 from src.hk.gamma_wall import calculate_gamma_wall
 from src.hk.indicators import (
+    build_hk_key_levels,
+    calculate_avg_daily_range,
+    calculate_initial_balance,
     calculate_rvol,
     calculate_vwap,
     get_history_bars,
     get_today_bars,
+    minutes_to_close_hk,
 )
 from src.hk.option_recommend import recommend, select_expiry
 from src.hk.playbook import format_playbook_message, generate_playbook
@@ -153,6 +157,9 @@ class HKPredictor:
         self._scan_history: dict[str, list[ScanAlertRecord]] = {}
         self._scan_history_date: str = ""  # YYYY-MM-DD, reset daily
 
+        # Market context cache: symbol → (RegimeResult, timestamp)
+        self._market_context_cache: dict[str, tuple[RegimeResult, float]] = {}
+
     # ── Lifecycle ──
 
     async def connect(self) -> None:
@@ -265,14 +272,25 @@ class HKPredictor:
         except Exception:
             logger.warning("Option chain fetch failed for %s", symbol, exc_info=True)
 
+        # 6b. IBH/IBL
+        ib_window = regime_cfg.get("ib_window_minutes", 30)
+        ibh, ibl = calculate_initial_balance(today_bars, window_minutes=ib_window)
+
+        # 6c. PDC / Day Open / avg_daily_range
+        pdc = quote_snapshot.prev_close
+        day_open_price = quote_snapshot.open_price
+        avg_daily_range_pct = calculate_avg_daily_range(hist_bars, lookback_days=10)
+
         # 7. Filters
         prev_high, prev_low = 0.0, 0.0
+        prev_close = 0.0
         if not hist_bars.empty:
             last_day = hist_bars.index[-1].date()
             last_day_bars = hist_bars[hist_bars.index.date == last_day]
             if not last_day_bars.empty:
                 prev_high = float(last_day_bars["High"].max())
                 prev_low = float(last_day_bars["Low"].min())
+                prev_close = float(last_day_bars["Close"].iloc[-1])
 
         iv_rank = 0.0
         if avg_iv > 0 and atm_iv > 0:
@@ -327,6 +345,22 @@ class HKPredictor:
             gap_warning_pct=regime_cfg.get("gap_warning_pct", 3.0),
             va_penetration_min_pct=regime_cfg.get("va_penetration_min_pct", 0.3),
             failed_breakout_pct=regime_cfg.get("failed_breakout_pct", 0.5),
+            # New 5-class params
+            ibh=ibh,
+            ibl=ibl,
+            pdc=pdc,
+            day_open=day_open_price,
+            gap_and_go_gap_pct=regime_cfg.get("gap_and_go_gap_pct", 1.0),
+            gap_and_go_rvol=regime_cfg.get("gap_and_go_rvol", 1.2),
+            trend_day_rvol=regime_cfg.get("trend_day_rvol", 0.0),
+            fade_chop_rvol=regime_cfg.get("fade_chop_rvol", 0.0),
+            unclear_atr_pct=regime_cfg.get("unclear_atr_pct", 0.5),
+            unclear_vwap_proximity_pct=regime_cfg.get("unclear_vwap_proximity_pct", 0.5),
+        )
+
+        # 8c. Build HKKeyLevels
+        hk_kl = build_hk_key_levels(
+            vp, vwap, prev_high, prev_low, pdc, day_open_price, ibh, ibl, gamma_wall,
         )
 
         # 9. Option recommendation
@@ -369,9 +403,91 @@ class HKPredictor:
             option_rec=option_rec,
             quote=quote_snapshot,
             option_market=option_market,
+            key_levels_obj=hk_kl,
         )
 
         return regime, vp, vwap, filters, option_rec, gamma_wall, playbook, today_bars
+
+    # ── Market context: HSI/HSTECH regime (simplified pipeline) ──
+
+    async def _get_market_context_regime(self, symbol: str) -> RegimeResult | None:
+        """Simplified pipeline for HSI/HSTECH — bars, VP, VWAP, RVOL, IBH/IBL, regime.
+
+        No option chain, gamma wall, or filters.  Cached with configurable TTL.
+        """
+        ctx_cfg = self._cfg.get("market_context", {})
+        ttl = ctx_cfg.get("context_ttl_seconds", 300)
+
+        cached = self._market_context_cache.get(symbol)
+        if cached:
+            result, ts = cached
+            if time.time() - ts < ttl:
+                return result
+
+        try:
+            vp_cfg = self._cfg.get("volume_profile", {})
+            regime_cfg = self._cfg.get("regime", {})
+
+            hist_bars, today_bars = await self._get_bars_cached(symbol, vp_cfg)
+            if hist_bars.empty:
+                return None
+
+            vp = calculate_volume_profile(
+                hist_bars,
+                value_area_pct=vp_cfg.get("value_area_pct", 0.70),
+                recency_decay=vp_cfg.get("recency_decay", 0.15),
+            )
+            vwap = calculate_vwap(today_bars) if not today_bars.empty else 0.0
+            rvol = calculate_rvol(
+                today_bars, hist_bars,
+                lookback_days=self._cfg.get("rvol", {}).get("lookback_days", 10),
+            )
+
+            quote = await self._run_sync(self._collector.get_quote, symbol)
+            price = quote.get("last_price", 0.0)
+            open_price = quote.get("open_price", 0.0)
+            prev_close = quote.get("prev_close", 0.0)
+
+            ib_window = regime_cfg.get("ib_window_minutes", 30)
+            ibh, ibl = calculate_initial_balance(today_bars, window_minutes=ib_window)
+
+            has_surge = _has_volume_surge(today_bars)
+            intraday_range = float(today_bars["High"].max() - today_bars["Low"].min()) if not today_bars.empty else 0.0
+
+            result = classify_regime(
+                price=price,
+                rvol=rvol,
+                vp=vp,
+                breakout_rvol=regime_cfg.get("breakout_rvol", 1.2),
+                range_rvol=regime_cfg.get("range_rvol", 0.8),
+                has_volume_surge=has_surge,
+                momentum_min_dist_pct=regime_cfg.get("momentum_min_dist_pct", 1.0),
+                vwap=vwap,
+                open_price=open_price,
+                prev_close=prev_close,
+                today_bars=today_bars,
+                gap_warning_pct=regime_cfg.get("gap_warning_pct", 3.0),
+                va_penetration_min_pct=regime_cfg.get("va_penetration_min_pct", 0.3),
+                failed_breakout_pct=regime_cfg.get("failed_breakout_pct", 0.5),
+                intraday_range=intraday_range,
+                ibh=ibh,
+                ibl=ibl,
+                pdc=prev_close,
+                day_open=open_price,
+                gap_and_go_gap_pct=regime_cfg.get("gap_and_go_gap_pct", 1.0),
+                gap_and_go_rvol=regime_cfg.get("gap_and_go_rvol", 1.2),
+                trend_day_rvol=regime_cfg.get("trend_day_rvol", 0.0),
+                fade_chop_rvol=regime_cfg.get("fade_chop_rvol", 0.0),
+                unclear_atr_pct=regime_cfg.get("unclear_atr_pct", 0.5),
+                unclear_vwap_proximity_pct=regime_cfg.get("unclear_vwap_proximity_pct", 0.5),
+            )
+
+            self._market_context_cache[symbol] = (result, time.time())
+            return result
+
+        except Exception:
+            logger.warning("Market context fetch failed for %s", symbol, exc_info=True)
+            return None
 
     # ── Core: on-demand playbook for a single symbol ──
 
@@ -383,7 +499,16 @@ class HKPredictor:
         )
         name = self.watchlist.get_name(symbol)
         display = f"{name} ({symbol})" if name != symbol else symbol
-        html_text = format_playbook_message(playbook, symbol=display)
+
+        # Fetch market context (HSI / HSTECH)
+        ctx_cfg = self._cfg.get("market_context", {})
+        hsi_regime = await self._get_market_context_regime(ctx_cfg.get("hsi_symbol", "HK.800000"))
+        hstech_regime = await self._get_market_context_regime(ctx_cfg.get("hstech_symbol", "HK.800700"))
+
+        html_text = format_playbook_message(
+            playbook, symbol=display,
+            hsi_regime=hsi_regime, hstech_regime=hstech_regime,
+        )
 
         # Generate chart (best-effort — failure degrades to text-only)
         chart_bytes: bytes | None = None
@@ -481,6 +606,10 @@ class HKPredictor:
 
         # Preliminary regime (no option chain / gamma wall — lightweight)
         regime_cfg = self._cfg.get("regime", {})
+        ib_window = regime_cfg.get("ib_window_minutes", 30)
+        l1_ibh, l1_ibl = calculate_initial_balance(today_bars, window_minutes=ib_window)
+        l1_open = quote.get("open_price", 0.0)
+        l1_prev_close = quote.get("prev_close", 0.0)
         regime = classify_regime(
             price=price,
             rvol=rvol,
@@ -490,23 +619,34 @@ class HKPredictor:
             has_volume_surge=has_surge,
             momentum_min_dist_pct=regime_cfg.get("momentum_min_dist_pct", 1.0),
             vwap=l1_vwap,
-            open_price=quote.get("open_price", 0.0),
-            prev_close=quote.get("prev_close", 0.0),
+            open_price=l1_open,
+            prev_close=l1_prev_close,
             today_bars=today_bars,
             gap_warning_pct=regime_cfg.get("gap_warning_pct", 3.0),
             va_penetration_min_pct=regime_cfg.get("va_penetration_min_pct", 0.3),
             failed_breakout_pct=regime_cfg.get("failed_breakout_pct", 0.5),
+            ibh=l1_ibh,
+            ibl=l1_ibl,
+            pdc=l1_prev_close,
+            day_open=l1_open,
+            gap_and_go_gap_pct=regime_cfg.get("gap_and_go_gap_pct", 1.0),
+            gap_and_go_rvol=regime_cfg.get("gap_and_go_rvol", 1.2),
+            trend_day_rvol=regime_cfg.get("trend_day_rvol", 0.0),
+            fade_chop_rvol=regime_cfg.get("fade_chop_rvol", 0.0),
+            unclear_atr_pct=regime_cfg.get("unclear_atr_pct", 0.5),
+            unclear_vwap_proximity_pct=regime_cfg.get("unclear_vwap_proximity_pct", 0.5),
         )
 
-        # ── BREAKOUT L1 check (both sessions) ──
+        # ── TREND / GAP_AND_GO L1 check (both sessions) ──
         bo_min_conf = breakout_cfg.get("min_confidence", 0.72)
         bo_min_rvol = breakout_cfg.get("min_rvol", 1.35)
         bo_min_mag = breakout_cfg.get("min_magnitude_pct", 0.15)
         bo_surge_threshold = breakout_cfg.get("volume_surge_threshold", 2.0)
         bo_surge_bars = breakout_cfg.get("volume_surge_bars", 5)
 
+        trend_regimes = {RegimeType.GAP_AND_GO, RegimeType.TREND_DAY, RegimeType.BREAKOUT}
         if (
-            regime.regime == RegimeType.BREAKOUT
+            regime.regime in trend_regimes
             and regime.confidence >= bo_min_conf
             and rvol >= bo_min_rvol
         ):
@@ -526,18 +666,18 @@ class HKPredictor:
                 trend_dir, trend_strength = _intraday_trend(today_bars)
                 if trend_strength >= 0.5:
                     if direction == "bullish" and trend_dir == "falling":
-                        logger.info("L1 reject %s: BREAKOUT bullish but intraday falling", symbol)
+                        logger.info("L1 reject %s: %s bullish but intraday falling", symbol, regime.regime.value)
                         return None
                     if direction == "bearish" and trend_dir == "rising":
-                        logger.info("L1 reject %s: BREAKOUT bearish but intraday rising", symbol)
+                        logger.info("L1 reject %s: %s bearish but intraday rising", symbol, regime.regime.value)
                         return None
 
                 if l1_vwap > 0:
                     if direction == "bullish" and price < l1_vwap:
-                        logger.info("L1 reject %s: BREAKOUT bullish but below VWAP", symbol)
+                        logger.info("L1 reject %s: %s bullish but below VWAP", symbol, regime.regime.value)
                         return None
                     if direction == "bearish" and price > l1_vwap:
-                        logger.info("L1 reject %s: BREAKOUT bearish but above VWAP", symbol)
+                        logger.info("L1 reject %s: %s bearish but above VWAP", symbol, regime.regime.value)
                         return None
 
                 triggers = []
@@ -547,8 +687,9 @@ class HKPredictor:
                 if has_surge:
                     triggers.append("最近 5 根 bar 量能突变")
 
+                signal_type = regime.regime.value.upper()
                 return {
-                    "signal_type": "BREAKOUT",
+                    "signal_type": signal_type,
                     "direction": direction,
                     "regime": regime,
                     "vp": vp,
@@ -558,7 +699,7 @@ class HKPredictor:
                     "trigger_reasons": triggers,
                 }
 
-        # ── RANGE L1 check (morning only) ──
+        # ── FADE_CHOP L1 check (morning only) ──
         if session != "morning":
             return None
 
@@ -567,22 +708,23 @@ class HKPredictor:
         rng_rvol_max = range_cfg.get("rvol_max", 0.90)
         rng_prox = range_cfg.get("va_proximity_pct", 0.30)
 
+        fade_regimes = {RegimeType.FADE_CHOP, RegimeType.RANGE}
         if (
-            regime.regime == RegimeType.RANGE
+            regime.regime in fade_regimes
             and regime.confidence >= rng_min_conf
             and rng_rvol_min <= rvol <= rng_rvol_max
         ):
             # L1 breach rejection: if today already breached VA boundary significantly,
-            # the level has been tested — RANGE mean-reversion thesis is weakened
+            # the level has been tested — FADE_CHOP mean-reversion thesis is weakened
             fb_pct = regime_cfg.get("failed_breakout_pct", 0.5)
             if not today_bars.empty and vp.vah > 0 and vp.val > 0:
                 t_high = float(today_bars["High"].max())
                 t_low = float(today_bars["Low"].min())
                 if t_high > vp.vah and (t_high - vp.vah) / vp.vah * 100 >= fb_pct:
-                    logger.info("L1 reject %s: RANGE but today breached VAH (%.2f > %.2f)", symbol, t_high, vp.vah)
+                    logger.info("L1 reject %s: FADE_CHOP but today breached VAH (%.2f > %.2f)", symbol, t_high, vp.vah)
                     return None
                 if t_low < vp.val and (vp.val - t_low) / vp.val * 100 >= fb_pct:
-                    logger.info("L1 reject %s: RANGE but today breached VAL (%.2f < %.2f)", symbol, t_low, vp.val)
+                    logger.info("L1 reject %s: FADE_CHOP but today breached VAL (%.2f < %.2f)", symbol, t_low, vp.val)
                     return None
 
             # Price within proximity of VAH or VAL
@@ -594,19 +736,20 @@ class HKPredictor:
                 direction = "bearish" if dist_vah < dist_val else "bullish"
                 boundary = "VAH" if dist_vah < dist_val else "VAL"
 
-                # VWAP structural veto: skip RANGE signal if VWAP contradicts direction
+                # VWAP structural veto: skip FADE_CHOP signal if VWAP contradicts direction
                 if l1_vwap > 0:
                     if direction == "bearish" and l1_vwap > vp.vah:
-                        logger.info("L1 reject %s: RANGE bearish but VWAP %.2f > VAH %.2f", symbol, l1_vwap, vp.vah)
+                        logger.info("L1 reject %s: FADE_CHOP bearish but VWAP %.2f > VAH %.2f", symbol, l1_vwap, vp.vah)
                         return None
                     if direction == "bullish" and l1_vwap < vp.val:
-                        logger.info("L1 reject %s: RANGE bullish but VWAP %.2f < VAL %.2f", symbol, l1_vwap, vp.val)
+                        logger.info("L1 reject %s: FADE_CHOP bullish but VWAP %.2f < VAL %.2f", symbol, l1_vwap, vp.val)
                         return None
 
                 triggers = [f"接近 {boundary} (距离 {near_boundary:.2f}%)"]
 
+                signal_type = regime.regime.value.upper()
                 return {
-                    "signal_type": "RANGE",
+                    "signal_type": signal_type,
                     "direction": direction,
                     "regime": regime,
                     "vp": vp,
@@ -644,20 +787,22 @@ class HKPredictor:
         signal_type = l1_data["signal_type"]
         direction = l1_data["direction"]
 
-        # BREAKOUT: re-verify with full regime (now includes option chain / gamma wall)
-        if signal_type == "BREAKOUT":
-            if regime.regime != RegimeType.BREAKOUT:
-                logger.debug("L2 reject %s: full regime not BREAKOUT (%s)", symbol, regime.regime)
+        # Trend regimes: re-verify with full regime (now includes option chain / gamma wall)
+        trend_types = {"GAP_AND_GO", "TREND_DAY", "BREAKOUT"}
+        fade_types = {"FADE_CHOP", "RANGE"}
+        if signal_type in trend_types:
+            if regime.regime.value.upper() not in trend_types:
+                logger.debug("L2 reject %s: full regime not trend (%s)", symbol, regime.regime)
                 return None
 
-        # RANGE: verify action is actionable
-        if signal_type == "RANGE":
-            if regime.regime != RegimeType.RANGE:
-                logger.debug("L2 reject %s: full regime not RANGE (%s)", symbol, regime.regime)
+        # Fade regimes: verify action is actionable
+        if signal_type in fade_types:
+            if regime.regime.value.upper() not in fade_types:
+                logger.debug("L2 reject %s: full regime not fade (%s)", symbol, regime.regime)
                 return None
             allowed_actions = {"bull_put_spread", "bear_call_spread", "call", "put"}
             if option_rec.action not in allowed_actions:
-                logger.debug("L2 reject %s: RANGE action=%s not actionable", symbol, option_rec.action)
+                logger.debug("L2 reject %s: FADE_CHOP action=%s not actionable", symbol, option_rec.action)
                 return None
 
         # Build signal
@@ -707,24 +852,27 @@ class HKPredictor:
         records = self._scan_history.get(symbol, [])
         now = time.time()
 
+        weak_regimes = {"FADE_CHOP", "RANGE", "UNCLEAR"}
+        strong_regimes = {"GAP_AND_GO", "TREND_DAY", "BREAKOUT"}
+
         # Layer 3: max per day
         if len(records) >= max_per_day:
-            # Check override: regime upgrade
+            # Check override: regime upgrade (weak → strong)
             if override_cfg.get("regime_upgrade", True):
                 last = records[-1]
-                if last.signal_type == "RANGE" and signal.signal_type == "BREAKOUT":
-                    return True, "Regime 从 RANGE 升级为 BREAKOUT"
+                if last.signal_type in weak_regimes and signal.signal_type in strong_regimes:
+                    return True, f"Regime 从 {last.signal_type} 升级为 {signal.signal_type}"
             logger.debug("Frequency block %s: daily max %d reached", symbol, max_per_day)
             return False, None
 
         # Layer 2: max per session
         session_records = [r for r in records if r.session == session]
         if len(session_records) >= max_per_session:
-            # Check override: regime upgrade
+            # Check override: regime upgrade (weak → strong)
             if override_cfg.get("regime_upgrade", True):
                 last = session_records[-1]
-                if last.signal_type == "RANGE" and signal.signal_type == "BREAKOUT":
-                    return True, "Regime 从 RANGE 升级为 BREAKOUT"
+                if last.signal_type in weak_regimes and signal.signal_type in strong_regimes:
+                    return True, f"Regime 从 {last.signal_type} 升级为 {signal.signal_type}"
             logger.debug("Frequency block %s: session max %d reached", symbol, max_per_session)
             return False, None
 
@@ -753,10 +901,10 @@ class HKPredictor:
                 if price_ext >= ext_threshold:
                     return True, f"价格继续扩展 {price_ext:.2f}%"
 
-            # Override 3: regime upgrade
+            # Override 3: regime upgrade (weak → strong)
             if override_cfg.get("regime_upgrade", True):
-                if last.signal_type == "RANGE" and signal.signal_type == "BREAKOUT":
-                    return True, "Regime 从 RANGE 升级为 BREAKOUT"
+                if last.signal_type in weak_regimes and signal.signal_type in strong_regimes:
+                    return True, f"Regime 从 {last.signal_type} 升级为 {signal.signal_type}"
 
             logger.debug(
                 "Frequency block %s: same signal within %dmin cooldown",
@@ -789,15 +937,20 @@ class HKPredictor:
         cooldown_mins: int = 30,
     ) -> str:
         """Format the alert header prepended to the playbook."""
-        emoji = "\U0001f680" if signal.signal_type == "BREAKOUT" else "\U0001f4e6"
+        trend_types = {"GAP_AND_GO", "TREND_DAY", "BREAKOUT"}
+        if signal.signal_type in trend_types:
+            emoji = "\U0001f680" if signal.direction == "bullish" else "\U0001f4a5"
+        else:
+            emoji = "\U0001f4e6"
         dir_cn = "看多" if signal.direction == "bullish" else "看空"
         dir_arrow = "\u2191" if signal.direction == "bullish" else "\u2193"
 
+        display_type = signal.signal_type.replace("_", " ")
         lines = [
-            f"\U0001f514 <b>{signal.signal_type} 强信号</b> {emoji} {dir_arrow} {dir_cn}",
+            f"\U0001f514 <b>{display_type} 强信号</b> {emoji} {dir_arrow} {dir_cn}",
         ]
-        if signal.signal_type == "BREAKOUT":
-            lines.append("  当前状态: 高置信度突破")
+        if signal.signal_type in trend_types:
+            lines.append("  当前状态: 高置信度趋势突破")
         else:
             lines.append("  当前状态: 高置信度区间边界信号")
 
@@ -810,7 +963,7 @@ class HKPredictor:
         )
 
         lines.append("  是否还能追:")
-        if signal.signal_type == "BREAKOUT":
+        if signal.signal_type in trend_types:
             lines.append("  • 更适合等回踩确认，不适合已经大幅延伸后的追价。")
         else:
             lines.append("  • 只适合靠近边界时轻仓试单，不适合在区间中间位置追单。")

@@ -36,6 +36,12 @@ class HKBacktestEngine:
         exit_mode: str = "trailing",
         trailing_activation_pct: float = 0.005,
         trailing_trail_pct: float = 0.003,
+        gap_and_go_gap_pct: float = 1.0,
+        gap_and_go_rvol: float = 1.2,
+        trend_day_rvol: float = 0.0,
+        fade_chop_rvol: float = 0.0,
+        unclear_atr_pct: float = 0.5,
+        unclear_vwap_proximity_pct: float = 0.5,
     ) -> None:
         self.vp_lookback_days = vp_lookback_days
         self.rvol_lookback_days = rvol_lookback_days
@@ -56,6 +62,12 @@ class HKBacktestEngine:
         self.exit_mode = exit_mode
         self.trailing_activation_pct = trailing_activation_pct
         self.trailing_trail_pct = trailing_trail_pct
+        self.gap_and_go_gap_pct = gap_and_go_gap_pct
+        self.gap_and_go_rvol = gap_and_go_rvol
+        self.trend_day_rvol = trend_day_rvol
+        self.fade_chop_rvol = fade_chop_rvol
+        self.unclear_atr_pct = unclear_atr_pct
+        self.unclear_vwap_proximity_pct = unclear_vwap_proximity_pct
 
     def run(self, bars_by_symbol: dict[str, pd.DataFrame]) -> HKBacktestResult:
         """Run the full HK backtest pipeline.
@@ -105,6 +117,12 @@ class HKBacktestEngine:
             breakout_rvol=self.breakout_rvol,
             range_rvol=self.range_rvol,
             exclude_symbols=self.exclude_symbols,
+            gap_and_go_gap_pct=self.gap_and_go_gap_pct,
+            gap_and_go_rvol=self.gap_and_go_rvol,
+            trend_day_rvol=self.trend_day_rvol,
+            fade_chop_rvol=self.fade_chop_rvol,
+            unclear_atr_pct=self.unclear_atr_pct,
+            unclear_vwap_proximity_pct=self.unclear_vwap_proximity_pct,
         )
         logger.info(
             "Regime evaluation: %d day-evaluations", len(regime_eval.days),

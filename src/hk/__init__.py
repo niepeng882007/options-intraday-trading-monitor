@@ -19,10 +19,31 @@ from src.common.types import (  # noqa: F401
 
 
 class RegimeType(Enum):
-    BREAKOUT = "breakout"      # Style A: 单边突破日
-    RANGE = "range"            # Style B: 区间震荡日
-    WHIPSAW = "whipsaw"        # Style C: 高波洗盘日
-    UNCLEAR = "unclear"        # Style D: 不明确日
+    GAP_AND_GO = "gap_and_go"  # 缺口追击日
+    TREND_DAY = "trend_day"    # 趋势日
+    FADE_CHOP = "fade_chop"    # 震荡日
+    WHIPSAW = "whipsaw"        # 高波洗盘日
+    UNCLEAR = "unclear"        # 不明确日
+    # DEPRECATED — 保留兼容过渡期
+    BREAKOUT = "breakout"
+    RANGE = "range"
+
+
+@dataclass
+class HKKeyLevels:
+    poc: float
+    vah: float
+    val: float
+    pdh: float           # Previous Day High
+    pdl: float           # Previous Day Low
+    pdc: float           # Previous Day Close
+    ibh: float           # Initial Balance High (first 30min)
+    ibl: float           # Initial Balance Low (first 30min)
+    day_open: float      # Current Day Open
+    vwap: float
+    gamma_call_wall: float = 0.0
+    gamma_put_wall: float = 0.0
+    gamma_max_pain: float = 0.0
 
 
 @dataclass
@@ -35,6 +56,9 @@ class RegimeResult:
     val: float
     poc: float
     details: str = ""
+    gap_pct: float = 0.0      # 缺口百分比
+    direction: str = ""        # "bullish"/"bearish"
+    lean: str = "neutral"      # UNCLEAR 子类型倾向
 
 
 @dataclass
@@ -61,12 +85,13 @@ class Playbook:
     strategy_text: str = ""
     generated_at: datetime | None = None
     option_rec: OptionRecommendation | None = None
+    key_levels_obj: HKKeyLevels | None = None
 
 
 @dataclass
 class ScanSignal:
     """Result of a successful L1+L2 scan for a single symbol."""
-    signal_type: str        # "BREAKOUT" | "RANGE"
+    signal_type: str        # "GAP_AND_GO" | "TREND_DAY" | "FADE_CHOP"
     direction: str          # "bullish" | "bearish"
     symbol: str
     regime: RegimeResult
@@ -79,7 +104,7 @@ class ScanSignal:
 class ScanAlertRecord:
     """Tracks a sent scan alert for frequency control."""
     symbol: str
-    signal_type: str        # "BREAKOUT" | "RANGE"
+    signal_type: str        # "GAP_AND_GO" | "TREND_DAY" | "FADE_CHOP"
     direction: str          # "bullish" | "bearish"
     confidence: float
     price: float

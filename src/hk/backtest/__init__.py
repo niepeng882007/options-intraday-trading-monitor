@@ -71,7 +71,7 @@ class RegimeEvalResult:
 class SimTrade:
     """A simulated trade from level or regime signals."""
     symbol: str
-    signal_type: str  # "VAH_short", "VAL_long", "BREAKOUT_long", etc.
+    signal_type: str  # "VAH_short", "VAL_long", "GAP_AND_GO_long", "TREND_DAY_short", "FADE_CHOP_long", etc.
     entry_price: float
     entry_time: datetime
     exit_price: float = 0.0

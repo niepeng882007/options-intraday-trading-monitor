@@ -24,8 +24,10 @@ US Playbook + HK Playbook 的 Telegram 期权交易辅助系统。
 ### HK Playbook (`src/hk/`)
 
 - 港股期权日内分析模块，支持文本触发剧本查询
-- 使用多日 `1m` K 线计算 `Volume Profile / VWAP / RVOL`
-- Regime 分类为 `BREAKOUT / RANGE / WHIPSAW / UNCLEAR`
+- 使用多日 `1m` K 线计算 `Volume Profile / VWAP / RVOL / IBH / IBL`
+- Regime 分类为 `GAP_AND_GO / TREND_DAY / FADE_CHOP / WHIPSAW / UNCLEAR`
+- ActionPlan A/B/C 引擎 + 5 段式剧本格式（对齐 US Playbook）
+- 大盘情绪：HSI / HSTECH regime 显示在剧本头部
 - 指数支持 `Gamma Wall / Max Pain`
 - 集成到 `src/main.py` 时可启用自动扫描；独立运行模式以按需查询为主
 
@@ -157,8 +159,8 @@ US 与 HK 的 watchlist 都不是只读 YAML 配置。
 ### HK Playbook
 
 - 过滤当日到期合约
-- `BREAKOUT` 场景偏向方向性单腿
-- `RANGE` 场景优先尝试 `Bull Put Spread / Bear Call Spread`
+- `GAP_AND_GO / TREND_DAY` 场景偏向方向性单腿
+- `FADE_CHOP` 场景优先尝试 `Bull Put Spread / Bear Call Spread`
 - 结合 `VWAP`、`Value Area` 和时段做 chase risk 判断
 - 若过滤器、流动性、到期日或期权链条件不足，会返回 `wait`
 

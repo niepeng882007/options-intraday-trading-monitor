@@ -118,14 +118,17 @@ class TradeSimulator:
     ) -> SimResult:
         """Simulate trades from regime classifications.
 
-        BREAKOUT → trend following (long if above POC, short if below)
-        RANGE → mean reversion toward POC (long if near VAL, short if near VAH)
-        WHIPSAW/UNCLEAR → no trade
+        GAP_AND_GO / TREND_DAY → trend following (long if above POC, short if below)
+        FADE_CHOP → mean reversion toward POC (long if near VAL, short if near VAH)
+        WHIPSAW/UNCLEAR/RANGE/BREAKOUT → no trade
         """
         trades: list[SimTrade] = []
 
         for day_eval in regime_days:
-            if day_eval.predicted in (RegimeType.WHIPSAW, RegimeType.UNCLEAR):
+            if day_eval.predicted in (
+                RegimeType.WHIPSAW, RegimeType.UNCLEAR,
+                RegimeType.BREAKOUT, RegimeType.RANGE,
+            ):
                 continue
 
             symbol = day_eval.symbol
@@ -150,16 +153,18 @@ class TradeSimulator:
             if isinstance(start_idx_in_day, slice):
                 start_idx_in_day = start_idx_in_day.start
 
-            if day_eval.predicted == RegimeType.BREAKOUT:
+            if day_eval.predicted in (RegimeType.GAP_AND_GO, RegimeType.TREND_DAY):
                 # Trend following: direction based on price vs POC
                 is_short = entry_price < day_eval.poc
-                signal_type = "BREAKOUT_short" if is_short else "BREAKOUT_long"
-            else:
-                # RANGE: mean reversion toward POC
+                signal_type = f"{day_eval.predicted.value.upper()}_{'short' if is_short else 'long'}"
+            elif day_eval.predicted == RegimeType.FADE_CHOP:
+                # Mean reversion toward POC
                 dist_to_vah = abs(entry_price - day_eval.vah)
                 dist_to_val = abs(entry_price - day_eval.val)
                 is_short = dist_to_vah < dist_to_val  # nearer VAH → short
-                signal_type = "RANGE_short" if is_short else "RANGE_long"
+                signal_type = f"FADE_CHOP_{'short' if is_short else 'long'}"
+            else:
+                continue
 
             if signal_type in self.skip_signal_types:
                 continue

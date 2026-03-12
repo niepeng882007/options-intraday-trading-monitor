@@ -8,7 +8,7 @@ import pandas as pd
 
 from src.hk import RegimeType, VolumeProfileResult
 from src.hk.volume_profile import calculate_volume_profile
-from src.hk.indicators import calculate_rvol
+from src.hk.indicators import calculate_rvol, calculate_initial_balance
 from src.hk.regime import classify_regime
 from src.hk.backtest import (
     LevelEvent, LevelEvalResult,
@@ -244,18 +244,25 @@ def evaluate_regimes(
     breakout_rvol: float = 1.2,
     range_rvol: float = 0.8,
     exclude_symbols: set[str] | None = None,
+    gap_and_go_gap_pct: float = 1.0,
+    gap_and_go_rvol: float = 1.2,
+    trend_day_rvol: float = 0.0,
+    fade_chop_rvol: float = 0.0,
+    unclear_atr_pct: float = 0.5,
+    unclear_vwap_proximity_pct: float = 0.5,
 ) -> RegimeEvalResult:
     """Evaluate regime classification accuracy across historical data.
 
     For each trading day D:
     1. Calculate VP from D-vp_lookback ~ D-1
     2. Calculate early-morning RVOL from 09:30-09:35 (or configurable)
-    3. Classify regime
-    4. Check actual day's price action against prediction
+    3. Calculate IBH/IBL from first 30 minutes
+    4. Classify regime (5-class: GAP_AND_GO, TREND_DAY, FADE_CHOP, WHIPSAW, UNCLEAR)
+    5. Check actual day's price action against prediction
 
     Accuracy criteria:
-    - BREAKOUT: close > VAH or close < VAL
-    - RANGE: high < VAH and low > VAL
+    - GAP_AND_GO / TREND_DAY: close > VAH or close < VAL
+    - FADE_CHOP: high < VAH and low > VAL
     - WHIPSAW/UNCLEAR: always marked as N/A (no clear accuracy metric)
 
     Args:
@@ -263,8 +270,14 @@ def evaluate_regimes(
         vp_lookback_days: Days of history for VP calculation
         rvol_lookback_days: Days of history for RVOL calculation
         morning_rvol_minutes: Minutes from open to calculate RVOL (default 5)
-        breakout_rvol: RVOL threshold for breakout classification
-        range_rvol: RVOL threshold for range classification
+        breakout_rvol: RVOL threshold for breakout classification (legacy)
+        range_rvol: RVOL threshold for range classification (legacy)
+        gap_and_go_gap_pct: Gap % threshold for GAP_AND_GO classification
+        gap_and_go_rvol: RVOL threshold for GAP_AND_GO classification
+        trend_day_rvol: RVOL threshold for TREND_DAY (0 = fallback to breakout_rvol)
+        fade_chop_rvol: RVOL threshold for FADE_CHOP (0 = fallback to range_rvol)
+        unclear_atr_pct: ATR % threshold for UNCLEAR early-exit
+        unclear_vwap_proximity_pct: VWAP proximity % for UNCLEAR early-exit
 
     Returns:
         RegimeEvalResult with per-regime accuracy
@@ -318,6 +331,16 @@ def evaluate_regimes(
             # Opening price for regime classification
             opening_price = float(day_bars.iloc[0]["Open"])
 
+            # IBH/IBL from first 30 minutes
+            ibh, ibl = calculate_initial_balance(day_bars, window_minutes=30)
+
+            # Previous day close
+            prev_day = dates[i - 1]
+            prev_day_bars = daily[prev_day]
+            pdc = float(prev_day_bars.iloc[-1]["Close"]) if not prev_day_bars.empty else 0.0
+
+            day_open_price = float(day_bars.iloc[0]["Open"])
+
             # Classify regime
             regime_result = classify_regime(
                 price=opening_price,
@@ -325,6 +348,16 @@ def evaluate_regimes(
                 vp=vp,
                 breakout_rvol=breakout_rvol,
                 range_rvol=range_rvol,
+                ibh=ibh,
+                ibl=ibl,
+                pdc=pdc,
+                day_open=day_open_price,
+                gap_and_go_gap_pct=gap_and_go_gap_pct,
+                gap_and_go_rvol=gap_and_go_rvol,
+                trend_day_rvol=trend_day_rvol,
+                fade_chop_rvol=fade_chop_rvol,
+                unclear_atr_pct=unclear_atr_pct,
+                unclear_vwap_proximity_pct=unclear_vwap_proximity_pct,
             )
 
             # Actual day statistics
@@ -367,7 +400,7 @@ def _check_regime_accuracy(
     vp: VolumeProfileResult,
 ) -> tuple[bool, str]:
     """Check if regime prediction matches actual price action."""
-    if regime == RegimeType.BREAKOUT:
+    if regime in (RegimeType.GAP_AND_GO, RegimeType.TREND_DAY):
         # Accurate if close finished outside value area
         if day_close > vp.vah:
             return True, f"Close {day_close:.0f} above VAH {vp.vah:.0f}"
@@ -375,7 +408,7 @@ def _check_regime_accuracy(
             return True, f"Close {day_close:.0f} below VAL {vp.val:.0f}"
         return False, f"Close {day_close:.0f} stayed in value area"
 
-    if regime == RegimeType.RANGE:
+    if regime == RegimeType.FADE_CHOP:
         # Accurate if high stayed below VAH and low stayed above VAL
         if day_high < vp.vah and day_low > vp.val:
             return True, f"Range [{day_low:.0f}-{day_high:.0f}] within VA"

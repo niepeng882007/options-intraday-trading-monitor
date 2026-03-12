@@ -40,12 +40,13 @@ docker compose up --build       # Docker
 
 Shared utilities extracted from HK and US modules to eliminate cross-module dependencies. Both market modules import from `src/common/` instead of from each other.
 
-- **`types.py`** — 9 shared dataclasses: `VolumeProfileResult`, `GammaWallResult`, `FilterResult`, `OptionLeg`, `ChaseRiskResult`, `SpreadMetrics`, `OptionRecommendation`, `QuoteSnapshot`, `OptionMarketSnapshot`. HK-specific types (`RegimeType`, `RegimeResult`, `Playbook`, `ScanSignal`, `ScanAlertRecord`, `OrderBookAlert`) remain in `src/hk/__init__.py`.
+- **`types.py`** — 9 shared dataclasses: `VolumeProfileResult`, `GammaWallResult`, `FilterResult`, `OptionLeg`, `ChaseRiskResult`, `SpreadMetrics`, `OptionRecommendation`, `QuoteSnapshot`, `OptionMarketSnapshot`. HK-specific types (`RegimeType`, `RegimeResult`, `HKKeyLevels`, `Playbook`, `ScanSignal`, `ScanAlertRecord`, `OrderBookAlert`) remain in `src/hk/__init__.py`.
 - **`volume_profile.py`** — `calculate_volume_profile()` (POC/VAH/VAL). Re-export shim at `src/hk/volume_profile.py`.
 - **`gamma_wall.py`** — `calculate_gamma_wall()`, `format_gamma_wall_message()`. Re-export shim at `src/hk/gamma_wall.py`.
 - **`formatting.py`** — 12 playbook formatting utilities: `confidence_bar()`, `pct_change()`, `format_percent()`, `split_reason_lines()`, `closest_value_area_edge()`, `action_label()`, `action_plain_language()`, `format_strike()`, `format_leg_line()`, `position_size_text()`, `spread_execution_text()`, `risk_status_text()`. Market-specific formatters (`_format_turnover`, `_price_position`, `_regime_reason_lines`) remain in each module's `playbook.py`.
 - **`option_utils.py`** — `classify_moneyness()`, `option_leg_from_row()`, `calculate_spread_metrics()`, `is_positive_ev()`, `recommend_single_leg()`, `recommend_spread()`, `assess_chase_risk()`. Defaults match HK values (min_oi=50, chase 2.0/3.5%); US callers pass tighter overrides (min_oi=100, chase 1.5/2.5%).
 - **`indicators.py`** — `calculate_vwap()`. RVOL stays in each module (different algorithms).
+- **`action_plan.py`** — `ActionPlan`, `PlanContext` dataclasses + 12 shared plan utilities (`calculate_rr`, `reachable_range_pct`, `compact_option_line`, `format_action_plan`, `nearest_levels`, `find_fade_entry_zone`, `cap_tp2`, `check_entry_reachability`, `apply_wait_coherence`, `apply_min_rr_gate`). US and HK playbooks both import from here.
 - **`watchlist.py`** — `Watchlist` base class with `config_parser` callback. `HKWatchlist` and `USWatchlist` are thin wrappers.
 - **`telegram_handlers.py`** — `handle_query_base()`, `handle_add_base()`, `handle_remove_base()`, `handle_watchlist_base()`, `build_combined_keyboard()`. Market modules keep regex patterns, help text, and `register_*_handlers()`.
 - **`chart.py`** — `generate_chart()` / `generate_chart_async()` produce dark-themed candlestick PNG (BytesIO) with key levels + VP sidebar. `ChartData` input dataclass. Both `HKPredictor` and `USPredictor` return `PlaybookResponse(html, chart)` from `generate_playbook_for_symbol()`. `handle_query_base()` sends chart photo before HTML text; chart failure degrades gracefully to text-only.
@@ -56,10 +57,12 @@ Shared utilities extracted from HK and US modules to eliminate cross-module depe
 
 On-demand HK market playbook system, integrated via shared Telegram Application. No scheduled pushes — pure text-triggered playbook generation.
 
-- **Core:** `HKPredictor` orchestrator (on-demand, no APScheduler). `HKCollector` sync Futu wrapper, `indicators` (RVOL, trading time checks), `regime` (BREAKOUT/RANGE/WHIPSAW/UNCLEAR with IV spike detection).
+- **Core:** `HKPredictor` orchestrator (on-demand, no APScheduler). `HKCollector` sync Futu wrapper, `indicators` (RVOL, trading time checks, `calculate_initial_balance()` for IBH/IBL, `minutes_to_close_hk()` for 330min session, `calculate_avg_daily_range()`, `build_hk_key_levels()`/`hk_key_levels_to_dict()`), `regime` (GAP_AND_GO/TREND_DAY/FADE_CHOP/WHIPSAW/UNCLEAR; deprecated BREAKOUT/RANGE kept for backward compat).
+- **Key Levels:** `HKKeyLevels` dataclass (POC/VAH/VAL/PDH/PDL/PDC/IBH/IBL/day_open/VWAP/Gamma). IBH/IBL = Initial Balance (first 30min high/low, replacing PMH/PML).
+- **Playbook:** ActionPlan engine from `src.common.action_plan`. 5-section format: header + 核心结论 + 剧本推演(A/B/C ActionPlans) + 盘面逻辑 + 数据雷达. Market context: HSI/HSTECH regime in header (`_get_market_context_regime`, 300s TTL cache).
 - **Option Recommendation:** `option_recommend.py` — direction from regime + price position, expiry selection (filters DTE=0), delegates to `src.common.option_utils` for single-leg/spread/chase-risk, strict wait policy (must have concrete strike + expiry, otherwise observe).
 - **Watchlist:** `watchlist.py` — `HKWatchlist(Watchlist)` thin wrapper + `normalize_symbol()`. JSON persistence (`data/hk_watchlist.json`), `+09988` add / `-09988` remove / `wl` view. Falls back to `hk_settings.yaml` on first run.
-- **Signals:** `playbook` (5-section Telegram HTML: regime, data, option rec, risk; uses `src.common.formatting` utilities), `filter` (5 filters: calendar, Inside Day, IV+RVOL, min turnover, expiry risk).
+- **Filters:** `filter` (5 filters: calendar, Inside Day, IV+RVOL, min turnover, expiry risk).
 - **`src/hk/telegram.py`** — Text-triggered handlers delegating to `src.common.telegram_handlers` base functions. Regex patterns: `09988`/`HK09988` query, `+code` add, `-code` remove, `wl` list. `/hk_help` command.
 - **`src/hk/backtest/`** — Validates VP levels (bounce rates) and regime accuracy on historical data. Trade simulator with fixed/trailing/both exit modes. Run via `python -m src.hk.backtest`.
 
@@ -93,7 +96,7 @@ Validates VP levels (VAH/VAL/PDH/PDL bounce rates) and regime classification acc
 
 ## HK Configuration
 
-- `config/hk_settings.yaml` — HK initial watchlist (indices + stocks, runtime managed via `data/hk_watchlist.json`), regime thresholds (`breakout_rvol`, `range_rvol`, `iv_spike_ratio`), filter params (min turnover), gamma wall settings, `simulation` block (tp/sl/slippage, exit_mode, trailing params, exclude_symbols, skip_signal_types).
+- `config/hk_settings.yaml` — HK initial watchlist (indices + stocks, runtime managed via `data/hk_watchlist.json`), regime thresholds (`gap_and_go_gap_pct`, `trend_day_rvol`, `fade_chop_rvol`, `ib_window_minutes` + legacy `breakout_rvol`/`range_rvol`), `market_context` (hsi_symbol, hstech_symbol, context_ttl_seconds), filter params (min turnover), gamma wall settings, `simulation` block (tp/sl/slippage, exit_mode, trailing params, exclude_symbols, skip_signal_types).
 - `config/hk_calendar.yaml` — Economic calendar (FOMC, HKMA, China PMI/GDP, HK holidays, HSI option expiry dates). Manually maintained.
 
 ## US Predictor Configuration

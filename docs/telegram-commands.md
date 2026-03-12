@@ -52,7 +52,7 @@ HK 市场预测命令，由 `register_hk_predictor_handlers()` 注册（`src/hk/
 |------|--------|------|------|
 | `/hk_playbook` | `/hkpb` | `[symbol]` | 重新生成 Playbook（Regime + 关键点位 + 策略建议） |
 | `/hk_levels` | `/hkl` | `[symbol]` | 关键点位：POC / VAH / VAL / VWAP + 价格位置 |
-| `/hk_regime` | `/hkr` | `[symbol]` | 当前 Regime 分类（BREAKOUT / RANGE / WHIPSAW / UNCLEAR） |
+| `/hk_regime` | `/hkr` | `[symbol]` | 当前 Regime 分类（GAP_AND_GO / TREND_DAY / FADE_CHOP / WHIPSAW / UNCLEAR） |
 | `/hk_filters` | `/hkf` | `[symbol]` | 交易过滤状态（成交额、RVOL、Inside Day、日历事件等） |
 | `/hk_gamma` | `/hkg` | `[symbol]` | Gamma Wall：Call Wall / Put Wall / Max Pain（仅指数） |
 | `/hk_orderbook` | `/hkob` | `[symbol]` | LV2 盘口快照 + 大单检测 |

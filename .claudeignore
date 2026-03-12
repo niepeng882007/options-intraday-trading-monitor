@@ -1,0 +1,30 @@
+# 虚拟环境
+venv/
+.venv/
+
+# Python 编译文件
+__pycache__/
+*.py[cod]
+
+# 测试缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 数据目录（运行时生成的缓存、日志、数据库）
+data/
+
+# 日志
+*.log
+logs/
+
+# 文档归档（历史文档，不影响代码理解）
+docs/archive/
+docs/changelogs/
+docs/plans/
+
+# Git
+.git/
+
+# 系统文件
+.DS_Store

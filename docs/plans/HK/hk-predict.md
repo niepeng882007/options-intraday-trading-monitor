@@ -9,6 +9,10 @@
 > - Telegram Bot 扩展至 10 个命令: /hk, /hk_playbook, /hk_orderbook, /hk_gamma, /hk_levels, /hk_regime, /hk_quote, /hk_filters, /hk_watchlist, /hk_help
 > - 回测优化: 滑点 0.2%→0.05%/leg, TP 0.5%→0.8%, trailing stop, 信号过滤 (exclude_symbols, morning_only, skip_signal_types)
 > - 回测结果: 365T/PF=0.15/-104% → 286T/PF=1.37/+19.72%
+>
+> **⚠️ 架构升级 (2026-03-12):** Regime 分类已升级为 5 类 (GAP_AND_GO/TREND_DAY/FADE_CHOP/WHIPSAW/UNCLEAR)，
+> 新增 IBH/IBL key levels、ActionPlan A/B/C 引擎、大盘情绪 (HSI/HSTECH)。
+> 详见 `docs/prd/2026-03-12-港股Playbook改造需求文档.md`。以下为原始需求文档，仅作历史参考。
 
 针对港股市场开发日内行情预测与交易指导功能。该功能不直接进行自动化下单，也不需要实时预测价格涨跌，而是基于富途 API 的港股 LV2 深度行情和期权数据，进行微观市场状态分类（Regime Classification）、精准支撑/阻力计算、交易风格生成，并过滤劣质交易日。最终通过 Telegram Bot 在每日早盘（如 09:35）向我推送量化交易剧本（Playbook）。
 目标交易标的：一周左右到期的港股期权（末日/短期期权）。

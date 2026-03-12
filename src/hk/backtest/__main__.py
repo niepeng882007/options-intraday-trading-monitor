@@ -98,15 +98,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--skip-signals", type=str, default=None,
-        help="Comma-separated signal types to skip (e.g. BREAKOUT_long)",
+        help="Comma-separated signal types to skip (e.g. GAP_AND_GO_long,TREND_DAY_short)",
     )
     parser.add_argument(
         "--breakout-rvol", type=float, default=None,
-        help="RVOL threshold for BREAKOUT regime (default: from config)",
+        help="Legacy RVOL threshold (maps to trend_day_rvol fallback; default: from config)",
     )
     parser.add_argument(
         "--range-rvol", type=float, default=None,
-        help="RVOL threshold for RANGE regime (default: from config)",
+        help="Legacy RVOL threshold (maps to fade_chop_rvol fallback; default: from config)",
     )
     parser.add_argument(
         "--exit-mode", choices=["fixed", "trailing", "both"], default=None,
@@ -157,6 +157,12 @@ def main() -> None:
     # Resolve regime thresholds
     breakout_rvol = args.breakout_rvol or regime_cfg.get("breakout_rvol", 1.05)
     range_rvol = args.range_rvol or regime_cfg.get("range_rvol", 0.95)
+    gap_and_go_gap_pct = regime_cfg.get("gap_and_go_gap_pct", 1.0)
+    gap_and_go_rvol = regime_cfg.get("gap_and_go_rvol", 1.2)
+    trend_day_rvol = regime_cfg.get("trend_day_rvol", 0.0)
+    fade_chop_rvol = regime_cfg.get("fade_chop_rvol", 0.0)
+    unclear_atr_pct = regime_cfg.get("unclear_atr_pct", 0.5)
+    unclear_vwap_proximity_pct = regime_cfg.get("unclear_vwap_proximity_pct", 0.5)
 
     # Resolve exclude symbols
     if args.exclude:
@@ -184,7 +190,8 @@ def main() -> None:
     print(f"Symbols: {', '.join(symbols)}")
     print(f"Backtest days: {args.days} (loading {load_days} to cover lookback)")
     print(f"VP lookback: {vp_lookback}d, RVOL lookback: {rvol_lookback}d")
-    print(f"Regime thresholds: breakout_rvol={breakout_rvol}, range_rvol={range_rvol}")
+    print(f"Regime thresholds: breakout_rvol={breakout_rvol}, range_rvol={range_rvol}, "
+          f"gap_and_go_gap={gap_and_go_gap_pct}%, gap_and_go_rvol={gap_and_go_rvol}")
     if not args.no_sim:
         print(f"Simulation: TP={tp*100:.1f}%, SL={sl*100:.1f}%, Slippage={slippage*100:.2f}%/leg")
         print(f"Exit mode: {exit_mode}", end="")
@@ -229,6 +236,12 @@ def main() -> None:
         exit_mode=exit_mode,
         trailing_activation_pct=trail_act,
         trailing_trail_pct=trail_pct,
+        gap_and_go_gap_pct=gap_and_go_gap_pct,
+        gap_and_go_rvol=gap_and_go_rvol,
+        trend_day_rvol=trend_day_rvol,
+        fade_chop_rvol=fade_chop_rvol,
+        unclear_atr_pct=unclear_atr_pct,
+        unclear_vwap_proximity_pct=unclear_vwap_proximity_pct,
     )
     result = engine.run(bars)
 

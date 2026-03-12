@@ -52,6 +52,15 @@ rvol:
       end: "16:00"
 
 regime:
+  # New 5-class regime thresholds
+  gap_and_go_gap_pct: 1.0       # 缺口 >= 1% 触发 GAP_AND_GO 候选
+  gap_and_go_rvol: 1.2
+  trend_day_rvol: 1.05          # 趋势日 RVOL 阈值
+  fade_chop_rvol: 0.85          # 震荡日 RVOL 阈值
+  unclear_atr_pct: 0.5          # 日内 ATR < 0.5% → 窄幅缩量日
+  unclear_vwap_proximity_pct: 0.5  # 价格距 VWAP < 0.5% → 无方向
+  ib_window_minutes: 30         # Initial Balance 窗口 (前 30 分钟)
+  # Legacy params (backward compat)
   breakout_rvol: 1.05
   range_rvol: 0.85
   iv_spike_ratio: 1.3
@@ -59,6 +68,11 @@ regime:
   gap_warning_pct: 3.0        # 跳空 >= 3% 触发特殊处理
   va_penetration_min_pct: 0.3  # VA 边界最小渗透 % 才给满置信度
   failed_breakout_pct: 0.5    # 日内 breach VA 边界 >= 0.5% 视为 failed breakout
+
+market_context:
+  hsi_symbol: "HK.800000"
+  hstech_symbol: "HK.800700"
+  context_ttl_seconds: 300
 
 simulation:
   tp_pct: 0.8
@@ -73,9 +87,10 @@ simulation:
     - "HK.800700"
     - "HK.09988"
   skip_signal_types:
-    - "BREAKOUT_long"
-    - "BREAKOUT_short"
-    - "RANGE_long"
+    - "TREND_DAY_long"
+    - "GAP_AND_GO_long"
+    - "GAP_AND_GO_short"
+    - "FADE_CHOP_long"
 
 chase_risk:
   vwap_moderate_pct: 2.0       # VWAP deviation >= 2% → moderate

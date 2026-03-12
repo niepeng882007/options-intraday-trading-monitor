@@ -86,7 +86,9 @@ def _decide_direction(
     """Decide bullish / bearish / neutral based on regime + price position."""
     price = regime.price
 
-    if regime.regime == RegimeType.BREAKOUT:
+    if regime.regime in (
+        RegimeType.GAP_AND_GO, RegimeType.TREND_DAY, RegimeType.BREAKOUT,
+    ):
         if price > vp.vah:
             if vwap > 0 and price < vwap:
                 return "neutral"  # VWAP contradiction
@@ -97,7 +99,7 @@ def _decide_direction(
             return "bearish"
         return "bullish" if price > vp.poc else "bearish"
 
-    if regime.regime == RegimeType.RANGE:
+    if regime.regime in (RegimeType.FADE_CHOP, RegimeType.RANGE):
         # Mean reversion: near VAH → bearish, near VAL → bullish
         if vp.vah > vp.val:
             mid = (vp.vah + vp.val) / 2
@@ -139,7 +141,7 @@ def should_wait(
 
     if regime.regime == RegimeType.UNCLEAR and regime.confidence < 0.4:
         reasons.append(f"Regime UNCLEAR, 置信度仅 {regime.confidence:.0%}")
-        conditions.append("等待 Regime 更新为 BREAKOUT 或 RANGE")
+        conditions.append("等待 Regime 明确为 GAP_AND_GO / TREND_DAY 或 FADE_CHOP")
 
     if regime.regime == RegimeType.WHIPSAW:
         reasons.append("高波洗盘日, 方向不明确")
@@ -156,7 +158,9 @@ def should_wait(
     # Price too close to POC — no edge
     if vp.poc > 0 and regime.price > 0:
         dist_to_poc = abs(regime.price - vp.poc) / vp.poc
-        if dist_to_poc < 0.003 and regime.regime != RegimeType.BREAKOUT:
+        if dist_to_poc < 0.003 and regime.regime not in (
+            RegimeType.GAP_AND_GO, RegimeType.TREND_DAY, RegimeType.BREAKOUT,
+        ):
             reasons.append(f"价格距 POC 仅 {dist_to_poc:.1%}, 无方向性优势")
             conditions.append(f"价格突破 VAH {vp.vah:,.2f} 或跌破 VAL {vp.val:,.2f}")
 
@@ -287,15 +291,15 @@ def recommend(
         except (ValueError, TypeError):
             pass
 
-    # RANGE + short DTE guard: RANGE mean-reversion needs time to play out,
+    # FADE_CHOP/RANGE + short DTE guard: mean-reversion needs time to play out,
     # 1 DTE options have too much gamma risk for this strategy
-    if regime.regime == RegimeType.RANGE and 0 < dte < range_min_dte:
+    if regime.regime in (RegimeType.FADE_CHOP, RegimeType.RANGE) and 0 < dte < range_min_dte:
         dir_hint = "看多" if direction == "bullish" else "看空"
         return OptionRecommendation(
             action="wait",
             direction=direction,
-            rationale=f"方向偏{dir_hint}, 但 DTE={dte} 过短不适合 RANGE 策略",
-            risk_note=f"RANGE 需要时间回归均值, {dte} DTE Gamma 风险过高",
+            rationale=f"方向偏{dir_hint}, 但 DTE={dte} 过短不适合 FADE_CHOP 策略",
+            risk_note=f"FADE_CHOP 需要时间回归均值, {dte} DTE Gamma 风险过高",
             wait_conditions=[f"等待 DTE >= {range_min_dte} 的合约"],
         )
 
@@ -322,8 +326,8 @@ def recommend(
     # Liquidity check
     liq_warn = _check_liquidity(chain_df, price)
 
-    # Try spread for RANGE regime (skip if DTE <= 3 — gamma risk too high for spreads)
-    if regime.regime == RegimeType.RANGE and dte > 3:
+    # Try spread for FADE_CHOP/RANGE regime (skip if DTE <= 3 — gamma risk too high for spreads)
+    if regime.regime in (RegimeType.FADE_CHOP, RegimeType.RANGE) and dte > 3:
         spread_legs = recommend_spread(direction, chain_df, price, expiry)
         if spread_legs:
             spread_action = "bull_put_spread" if direction == "bullish" else "bear_call_spread"
@@ -387,14 +391,20 @@ def _build_rationale(
     parts = []
 
     regime_names = {
-        RegimeType.BREAKOUT: "单边突破",
-        RegimeType.RANGE: "区间震荡",
+        RegimeType.GAP_AND_GO: "缺口追击",
+        RegimeType.TREND_DAY: "趋势日",
+        RegimeType.FADE_CHOP: "震荡回归",
         RegimeType.WHIPSAW: "高波洗盘",
         RegimeType.UNCLEAR: "不明确",
+        # Deprecated — backward compat
+        RegimeType.BREAKOUT: "突破",
+        RegimeType.RANGE: "震荡",
     }
     parts.append(f"Regime: {regime_names.get(regime.regime, '未知')}")
 
-    if regime.regime == RegimeType.BREAKOUT:
+    if regime.regime in (
+        RegimeType.GAP_AND_GO, RegimeType.TREND_DAY, RegimeType.BREAKOUT,
+    ):
         if direction == "bullish":
             parts.append(f"价格 {regime.price:,.2f} 突破 VAH {vp.vah:,.2f}")
         else:
@@ -404,7 +414,7 @@ def _build_rationale(
         else:
             parts.append(f"RVOL {regime.rvol:.2f} 量能配合")
 
-    elif regime.regime == RegimeType.RANGE:
+    elif regime.regime in (RegimeType.FADE_CHOP, RegimeType.RANGE):
         if direction == "bullish":
             parts.append(f"价格 {regime.price:,.2f} 靠近 VAL {vp.val:,.2f}, 低吸机会")
         else:
@@ -424,18 +434,20 @@ def _build_risk_note(
 ) -> str:
     """Build risk note / defense line."""
     parts = []
-    if regime.regime == RegimeType.BREAKOUT:
+    if regime.regime in (
+        RegimeType.GAP_AND_GO, RegimeType.TREND_DAY, RegimeType.BREAKOUT,
+    ):
         parts.append("防守线: VWAP, 跌破建议止损")
         if "Momentum" in (regime.details or ""):
             parts.append("失效条件: 量能持续萎缩且价格回落至 VA 内")
         else:
             parts.append("失效条件: RVOL 回落至 1.0 以下")
-    elif regime.regime == RegimeType.RANGE:
+    elif regime.regime in (RegimeType.FADE_CHOP, RegimeType.RANGE):
         if direction == "bullish":
             parts.append(f"止损: 跌破 VAL {vp.val:,.2f}")
         else:
             parts.append(f"止损: 突破 VAH {vp.vah:,.2f}")
-        parts.append("失效条件: 带量突破 VA 边界转为 BREAKOUT")
+        parts.append("失效条件: 带量突破 VA 边界转为 TREND_DAY")
 
     # DTE risk warnings
     if dte > 0:

@@ -412,7 +412,7 @@ class TestTradeSimulator:
         assert result.total_trades == 0
 
     def test_regime_simulation(self):
-        """Regime simulation should produce trades for BREAKOUT/RANGE days."""
+        """Regime simulation should produce trades for GAP_AND_GO/TREND_DAY/FADE_CHOP days."""
         sim = TradeSimulator(
             tp_pct=0.005, sl_pct=0.003, slippage_per_leg=0.0,
             exit_mode="fixed",
@@ -430,7 +430,7 @@ class TestTradeSimulator:
         regime_day = RegimeEvalDay(
             date=bars.index[0].date(),
             symbol="HK.TEST",
-            predicted=RegimeType.BREAKOUT,
+            predicted=RegimeType.TREND_DAY,
             confidence=0.8,
             rvol=1.5,
             vah=510, val=490, poc=500,
@@ -439,7 +439,7 @@ class TestTradeSimulator:
 
         result = sim.simulate_from_regimes({"HK.TEST": bars}, [regime_day])
         assert result.total_trades == 1
-        assert "BREAKOUT" in result.trades[0].signal_type
+        assert "TREND_DAY" in result.trades[0].signal_type
 
     def test_no_trade_for_unclear(self):
         """UNCLEAR regime should not generate trades."""
@@ -454,6 +454,21 @@ class TestTradeSimulator:
         )
         result = sim.simulate_from_regimes({"HK.TEST": pd.DataFrame()}, [regime_day])
         assert result.total_trades == 0
+
+    def test_no_trade_for_deprecated_regimes(self):
+        """Deprecated BREAKOUT/RANGE regimes should not generate trades."""
+        sim = TradeSimulator()
+        for regime in (RegimeType.BREAKOUT, RegimeType.RANGE):
+            regime_day = RegimeEvalDay(
+                date=datetime(2026, 3, 9).date(),
+                symbol="HK.TEST",
+                predicted=regime,
+                confidence=0.8,
+                rvol=1.5,
+                vah=510, val=490, poc=500,
+            )
+            result = sim.simulate_from_regimes({"HK.TEST": pd.DataFrame()}, [regime_day])
+            assert result.total_trades == 0, f"{regime} should not generate trades"
 
     def test_exclude_symbols(self):
         """Excluded symbols should produce 0 trades."""
@@ -511,7 +526,7 @@ class TestTradeSimulator:
         """Skipped signal types should produce 0 trades."""
         sim = TradeSimulator(
             tp_pct=0.005, sl_pct=0.003, slippage_per_leg=0.0,
-            skip_signal_types={"BREAKOUT_long"}, exit_mode="fixed",
+            skip_signal_types={"TREND_DAY_long"}, exit_mode="fixed",
         )
 
         bar_data = [("2026-03-09 09:30:00", 500, 501, 499, 500, 10000)]
@@ -521,26 +536,26 @@ class TestTradeSimulator:
         bar_data.append(("2026-03-09 15:50:00", 503, 504, 502, 503, 10000))
         bars = _make_bars(bar_data)
 
-        # BREAKOUT_long: entry above POC → should be skipped
+        # TREND_DAY_long: entry above POC → should be skipped
         regime_day = RegimeEvalDay(
             date=bars.index[0].date(), symbol="HK.TEST",
-            predicted=RegimeType.BREAKOUT, confidence=0.8, rvol=1.5,
-            vah=510, val=490, poc=499,  # POC < entry_price → BREAKOUT_long
+            predicted=RegimeType.TREND_DAY, confidence=0.8, rvol=1.5,
+            vah=510, val=490, poc=499,  # POC < entry_price → TREND_DAY_long
             day_open=500, day_high=504, day_low=499, day_close=503,
         )
         result = sim.simulate_from_regimes({"HK.TEST": bars}, [regime_day])
         assert result.total_trades == 0
 
-        # BREAKOUT_short should still work
+        # TREND_DAY_short should still work
         regime_day2 = RegimeEvalDay(
             date=bars.index[0].date(), symbol="HK.TEST",
-            predicted=RegimeType.BREAKOUT, confidence=0.8, rvol=1.5,
-            vah=510, val=490, poc=501,  # POC > entry_price → BREAKOUT_short
+            predicted=RegimeType.TREND_DAY, confidence=0.8, rvol=1.5,
+            vah=510, val=490, poc=501,  # POC > entry_price → TREND_DAY_short
             day_open=500, day_high=504, day_low=499, day_close=503,
         )
         result2 = sim.simulate_from_regimes({"HK.TEST": bars}, [regime_day2])
         assert result2.total_trades == 1
-        assert result2.trades[0].signal_type == "BREAKOUT_short"
+        assert result2.trades[0].signal_type == "TREND_DAY_short"
 
     def test_trailing_stop(self):
         """Trailing stop should activate at threshold and exit on drawdown."""
@@ -753,8 +768,9 @@ class TestReport:
         regime_eval = RegimeEvalResult(
             days=[],
             by_regime={
-                "breakout": {"total": 5, "accurate": 3},
-                "range": {"total": 8, "accurate": 6},
+                "gap_and_go": {"total": 3, "accurate": 2},
+                "trend_day": {"total": 5, "accurate": 3},
+                "fade_chop": {"total": 8, "accurate": 6},
             },
         )
         sim_result = SimResult(
@@ -786,7 +802,7 @@ class TestReport:
         assert "Section 2" in text
         assert "Section 3" in text
         assert "VAH" in text
-        assert "breakout" in text
+        assert "trend_day" in text
 
     def test_format_report_no_sim(self):
         result = self._make_result()

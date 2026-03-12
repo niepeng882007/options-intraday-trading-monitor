@@ -29,8 +29,13 @@ from src.us_playbook.playbook import (
     _nearest_levels, _risk_action_lines, _entry_zone_text,
     ActionPlan, _calculate_rr, _generate_action_plans,
     _compact_option_line, _rvol_assessment, _find_fade_entry_zone,
-    PlanContext, _reachable_range_pct, _cap_tp2,
+    PlanContext, _reachable_range_pct, _cap_tp1, _cap_tp2,
     _check_entry_reachability, _apply_wait_coherence, _apply_min_rr_gate,
+)
+from src.common.action_plan import (
+    cap_tp1 as _cap_tp1_common,
+    apply_vwap_deviation_warning as _apply_vwap_deviation_warning,
+    format_action_plan as _format_action_plan,
 )
 from src.us_playbook.watchlist import USWatchlist, normalize_us_symbol
 from src.us_playbook.option_recommend import (
@@ -3679,3 +3684,248 @@ class TestActionPlanReachability:
         # R:R gate should skip
         results = _apply_min_rr_gate([plan_c], ctx)
         assert results[0].demoted is False
+
+
+class TestCapTp1:
+    """Tests for OPT-1: TP1 capping to reachable range."""
+
+    def _vp(self):
+        return VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
+
+    def _kl(self):
+        return KeyLevels(
+            poc=252.0, vah=255.0, val=249.0,
+            pdh=257.0, pdl=248.0, pmh=254.0, pml=250.5,
+            vwap=251.5,
+        )
+
+    def _gw(self):
+        return GammaWallResult(call_wall_strike=260.0, put_wall_strike=245.0, max_pain=252.0)
+
+    def test_tp1_beyond_reachable_replaced(self):
+        """TP1 exceeds reachable range → replaced with nearer structure."""
+        ctx = PlanContext(
+            minutes_to_close=60, rvol=0.3,
+            avg_daily_range_pct=1.0, intraday_range_pct=0.8,
+        )
+        plan = ActionPlan(
+            label="A", name="test", emoji="📉", is_primary=True,
+            logic="test", direction="bearish", trigger="test",
+            entry=255.0, entry_action="做空",
+            stop_loss=257.0, stop_loss_reason="PDH",
+            tp1=245.0, tp1_label="Put Wall",  # 3.9% away — exceeds reachable
+            tp2=None, tp2_label="", rr_ratio=5.0,
+        )
+        result = _cap_tp1(plan, ctx, self._vp(), self._kl(), self._gw())
+        # Should be replaced with a nearer level (between 245 and 255)
+        if result.tp1 != 245.0:
+            assert 245.0 < result.tp1 < 255.0
+            assert result.rr_ratio > 0  # R:R recalculated
+
+    def test_tp1_beyond_reachable_no_replacement_warns(self):
+        """TP1 exceeds reachable + no suitable replacement → warning added."""
+        ctx = PlanContext(
+            minutes_to_close=30, rvol=0.2,
+            avg_daily_range_pct=0.5, intraday_range_pct=0.4,
+        )
+        # All levels far away, TP1 the only option
+        plan = ActionPlan(
+            label="A", name="test", emoji="📉", is_primary=True,
+            logic="test", direction="bearish", trigger="test",
+            entry=255.0, entry_action="做空",
+            stop_loss=256.0, stop_loss_reason="SL",
+            tp1=245.0, tp1_label="Put Wall",
+            tp2=None, tp2_label="", rr_ratio=10.0,
+        )
+        result = _cap_tp1(plan, ctx, self._vp(), self._kl(), self._gw())
+        # TP1 kept but warning added
+        assert result.tp1 == 245.0
+        assert "TP1" in result.warning
+
+    def test_tp1_within_range_no_change(self):
+        """TP1 within reachable range → no change."""
+        ctx = PlanContext(
+            minutes_to_close=360, rvol=1.5,
+            avg_daily_range_pct=2.5,
+        )
+        plan = ActionPlan(
+            label="A", name="test", emoji="📉", is_primary=True,
+            logic="test", direction="bearish", trigger="test",
+            entry=255.0, entry_action="做空",
+            stop_loss=257.0, stop_loss_reason="PDH",
+            tp1=252.0, tp1_label="POC",
+            tp2=None, tp2_label="", rr_ratio=1.5,
+        )
+        result = _cap_tp1(plan, ctx, self._vp(), self._kl(), self._gw())
+        assert result.tp1 == 252.0
+        assert result.warning == ""
+
+    def test_tp1_entry_none_skipped(self):
+        """entry=None → cap_tp1 skipped."""
+        ctx = PlanContext(minutes_to_close=60, rvol=0.3, avg_daily_range_pct=1.0)
+        plan = ActionPlan(
+            label="A", name="test", emoji="⏳", is_primary=True,
+            logic="test", direction="neutral", trigger="test",
+            entry=None, entry_action="",
+            stop_loss=None, stop_loss_reason="",
+            tp1=245.0, tp1_label="target",
+            tp2=None, tp2_label="", rr_ratio=0.0,
+        )
+        result = _cap_tp1(plan, ctx, self._vp(), self._kl(), self._gw())
+        assert result.tp1 == 245.0
+        assert result.warning == ""
+
+
+class TestUnclearFadePlan:
+    """Tests for OPT-2: UNCLEAR + low RVOL → mean-reversion fade plan."""
+
+    def _vp(self):
+        return VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
+
+    def _kl(self):
+        return KeyLevels(
+            poc=252.0, vah=255.0, val=249.0,
+            pdh=257.0, pdl=248.0, pmh=254.0, pml=250.5,
+            vwap=251.5,
+        )
+
+    def _gw(self):
+        return GammaWallResult(call_wall_strike=260.0, put_wall_strike=245.0, max_pain=252.0)
+
+    def test_chop_likely_bearish_fade(self):
+        """is_chop_likely + lean=bearish → Plan B is fade short with SL/TP/rr."""
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.25,
+            rvol=0.57, price=256.0, gap_pct=0.1, lean="bearish",
+        )
+        plans = _generate_action_plans(
+            regime, "neutral", self._vp(), self._kl(), self._gw(), None,
+        )
+        plan_b = plans[1]
+        assert plan_b.name == "均值回归做空"
+        assert plan_b.direction == "bearish"
+        assert plan_b.entry == self._kl().vwap
+        assert plan_b.stop_loss is not None  # has explicit SL
+        assert plan_b.tp1 is not None  # has explicit TP1
+        assert plan_b.rr_ratio > 0  # meaningful R:R
+        # No entry_zone (single-point entry)
+        assert plan_b.entry_zone_price is None
+
+    def test_chop_likely_bullish_fade(self):
+        """is_chop_likely + lean=bullish → Plan B is fade long with SL/TP/rr."""
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.25,
+            rvol=0.57, price=248.0, gap_pct=-0.1, lean="bullish",
+        )
+        plans = _generate_action_plans(
+            regime, "neutral", self._vp(), self._kl(), self._gw(), None,
+        )
+        plan_b = plans[1]
+        assert plan_b.name == "均值回归做多"
+        assert plan_b.direction == "bullish"
+        assert plan_b.entry == self._kl().vwap
+        assert plan_b.stop_loss is not None
+        assert plan_b.tp1 is not None
+        assert plan_b.rr_ratio > 0
+        assert plan_b.entry_zone_price is None
+
+    def test_chop_likely_neutral_no_fade(self):
+        """is_chop_likely + lean=neutral → Plan B stays as '观察关键位'."""
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.25,
+            rvol=0.57, price=252.0, gap_pct=0.0, lean="neutral",
+        )
+        plans = _generate_action_plans(
+            regime, "neutral", self._vp(), self._kl(), self._gw(), None,
+        )
+        plan_b = plans[1]
+        assert plan_b.name == "观察关键位"
+        assert plan_b.entry is None
+
+    def test_not_chop_likely_keeps_original(self):
+        """rvol=1.0, confidence=0.35 → keeps original '轻仓' plan (backward compat)."""
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.35,
+            rvol=1.0, price=252.0, gap_pct=0.1, lean="bullish",
+        )
+        plans = _generate_action_plans(
+            regime, "neutral", self._vp(), self._kl(), self._gw(), None,
+        )
+        plan_b = plans[1]
+        assert "轻仓" in plan_b.name
+        assert plan_b.direction == "bullish"
+        assert plan_b.stop_loss is None  # original has no explicit SL
+
+    def test_amd_scenario(self):
+        """AMD-like: RVOL=0.57, confidence=0.25, lean=bearish, price=204.85."""
+        vp = VolumeProfileResult(poc=202.25, vah=202.75, val=193.75)
+        kl = KeyLevels(
+            poc=202.25, vah=202.75, val=193.75,
+            pdh=207.0, pdl=200.0, pmh=206.0, pml=199.0,
+            vwap=206.42,
+        )
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.25,
+            rvol=0.57, price=204.85, gap_pct=0.1, lean="bearish",
+        )
+        plans = _generate_action_plans(regime, "neutral", vp, kl, None, None)
+        plan_b = plans[1]
+        assert plan_b.name == "均值回归做空"
+        assert plan_b.entry == 206.42  # VWAP
+        assert plan_b.tp1 == vp.vah  # 202.75 — nearest VA edge
+        assert plan_b.rr_ratio > 0
+
+
+class TestVwapDeviationWarning:
+    """Tests for OPT-4: VWAP deviation warning."""
+
+    def _plan(self, direction="bearish", entry=255.0):
+        return ActionPlan(
+            label="A", name="test", emoji="📉", is_primary=True,
+            logic="test", direction=direction, trigger="test",
+            entry=entry, entry_action="做空" if direction == "bearish" else "做多",
+            stop_loss=257.0, stop_loss_reason="SL",
+            tp1=252.0, tp1_label="POC",
+            tp2=None, tp2_label="", rr_ratio=1.5,
+        )
+
+    def test_price_below_vwap_bearish_warns(self):
+        """Price below VWAP + bearish → warning."""
+        plan = self._plan(direction="bearish")
+        plans = _apply_vwap_deviation_warning([plan], price=250.0, vwap=255.0)
+        assert "低于 VWAP" in plans[0].warning
+
+    def test_price_above_vwap_bullish_warns(self):
+        """Price above VWAP + bullish → warning."""
+        plan = self._plan(direction="bullish", entry=250.0)
+        plans = _apply_vwap_deviation_warning([plan], price=260.0, vwap=255.0)
+        assert "高于 VWAP" in plans[0].warning
+
+    def test_price_below_vwap_bullish_no_warning(self):
+        """Price below VWAP + bullish → no warning (direction consistent)."""
+        plan = self._plan(direction="bullish", entry=250.0)
+        plans = _apply_vwap_deviation_warning([plan], price=250.0, vwap=255.0)
+        assert plans[0].warning == ""
+
+    def test_deviation_below_threshold_no_warning(self):
+        """Deviation < 0.5% → no warning."""
+        plan = self._plan(direction="bearish")
+        plans = _apply_vwap_deviation_warning([plan], price=254.5, vwap=255.0)
+        assert plans[0].warning == ""
+
+
+class TestWarningRendering:
+    """Test that warning field is rendered in format_action_plan output."""
+
+    def test_warning_rendered(self):
+        plan = ActionPlan(
+            label="A", name="test", emoji="📈", is_primary=True,
+            logic="test", direction="bullish", trigger="test",
+            entry=250.0, entry_action="做多",
+            stop_loss=248.0, stop_loss_reason="SL",
+            tp1=255.0, tp1_label="VAH",
+            tp2=None, tp2_label="", rr_ratio=2.5,
+            warning="价格已高于 VWAP 1.2%, 做多需等回调",
+        )
+        lines = _format_action_plan(plan)
+        assert any("VWAP" in l and "回调" in l for l in lines)

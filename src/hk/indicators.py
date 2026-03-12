@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import time as dt_time
+from datetime import datetime, time as dt_time, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -176,3 +176,153 @@ def get_history_bars(bars: pd.DataFrame, max_trading_days: int = 0) -> pd.DataFr
                 history = history[pd.to_datetime(history.index).date >= cutoff]
 
     return history
+
+
+# ── HK session constants ──
+
+HKT = timezone(timedelta(hours=8))
+_TOTAL_SESSION_MINUTES = 330  # 09:30-12:00 (150) + 13:00-16:00 (180)
+
+
+def calculate_initial_balance(
+    today_bars: pd.DataFrame,
+    window_minutes: int = 30,
+) -> tuple[float, float]:
+    """Calculate Initial Balance (IBH/IBL) from first N minutes of trading.
+
+    Returns (ibh, ibl). Returns (0.0, 0.0) if insufficient data.
+    """
+    if today_bars.empty:
+        return 0.0, 0.0
+
+    open_time = dt_time(9, 30)
+    end_minute = 30 + window_minutes  # minutes past 9:00
+    end_time = dt_time(9 + end_minute // 60, end_minute % 60)
+
+    times = (
+        today_bars.index.time
+        if hasattr(today_bars.index, "time")
+        else pd.to_datetime(today_bars.index).time
+    )
+    mask = [(open_time <= t <= end_time) for t in times]
+    ib_bars = today_bars[mask]
+
+    if ib_bars.empty:
+        return 0.0, 0.0
+
+    ibh = float(ib_bars["High"].max())
+    ibl = float(ib_bars["Low"].min())
+    return ibh, ibl
+
+
+def minutes_to_close_hk(now: datetime | None = None) -> int:
+    """Calculate remaining trading minutes in HK session, excluding lunch break.
+
+    09:30-12:00 (150 min) + 13:00-16:00 (180 min) = 330 total.
+    """
+    if now is None:
+        now = datetime.now(HKT)
+
+    h, m = now.hour, now.minute
+    current = h * 60 + m
+
+    morning_open = 9 * 60 + 30   # 09:30
+    morning_close = 12 * 60       # 12:00
+    afternoon_open = 13 * 60      # 13:00
+    afternoon_close = 16 * 60     # 16:00
+
+    if current < morning_open:
+        # Before market open — full day remaining
+        return _TOTAL_SESSION_MINUTES
+    elif current <= morning_close:
+        # During morning session
+        morning_left = morning_close - current
+        return morning_left + 180  # + full afternoon
+    elif current < afternoon_open:
+        # Lunch break — only afternoon remaining
+        return 180
+    elif current <= afternoon_close:
+        # During afternoon session
+        return afternoon_close - current
+    else:
+        # After market close
+        return 0
+
+
+def calculate_avg_daily_range(
+    hist_bars: pd.DataFrame,
+    lookback_days: int = 10,
+) -> float:
+    """Calculate average daily range percentage over past N trading days.
+
+    Per day: (High.max() - Low.min()) / Close.last(), then take mean.
+    Used for PlanContext.avg_daily_range_pct to estimate reachable range.
+    """
+    if hist_bars.empty:
+        return 0.0
+
+    dates = (
+        hist_bars.index.date
+        if hasattr(hist_bars.index, "date")
+        else pd.to_datetime(hist_bars.index).date
+    )
+    unique_dates = sorted(set(dates))[-lookback_days:]
+
+    ranges: list[float] = []
+    for d in unique_dates:
+        if hasattr(hist_bars.index, "date"):
+            day_data = hist_bars[hist_bars.index.date == d]
+        else:
+            day_data = hist_bars[pd.to_datetime(hist_bars.index).date == d]
+        if day_data.empty:
+            continue
+        day_high = float(day_data["High"].max())
+        day_low = float(day_data["Low"].min())
+        day_close = float(day_data["Close"].iloc[-1])
+        if day_close > 0:
+            ranges.append((day_high - day_low) / day_close * 100)
+
+    return float(np.mean(ranges)) if ranges else 0.0
+
+
+def build_hk_key_levels(
+    vp, vwap: float, pdh: float, pdl: float, pdc: float,
+    day_open: float, ibh: float, ibl: float, gamma_wall=None,
+):
+    """Assemble HKKeyLevels from individual components."""
+    from src.hk import HKKeyLevels
+    return HKKeyLevels(
+        poc=vp.poc,
+        vah=vp.vah,
+        val=vp.val,
+        pdh=pdh,
+        pdl=pdl,
+        pdc=pdc,
+        ibh=ibh,
+        ibl=ibl,
+        day_open=day_open,
+        vwap=vwap,
+        gamma_call_wall=gamma_wall.call_wall_strike if gamma_wall else 0.0,
+        gamma_put_wall=gamma_wall.put_wall_strike if gamma_wall else 0.0,
+        gamma_max_pain=gamma_wall.max_pain if gamma_wall else 0.0,
+    )
+
+
+def hk_key_levels_to_dict(kl) -> dict[str, float]:
+    """Convert HKKeyLevels to dict[str, float], filtering zero values."""
+    mapping = {
+        "POC": kl.poc,
+        "VAH": kl.vah,
+        "VAL": kl.val,
+        "PDH": kl.pdh,
+        "PDL": kl.pdl,
+        "PDC": kl.pdc,
+        "IBH": kl.ibh,
+        "IBL": kl.ibl,
+        "Open": kl.day_open,
+        "VWAP": kl.vwap,
+        "Call Wall": kl.gamma_call_wall,
+        "Put Wall": kl.gamma_put_wall,
+        "Max Pain": kl.gamma_max_pain,
+    }
+    return {k: v for k, v in mapping.items() if v > 0}

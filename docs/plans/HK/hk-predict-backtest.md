@@ -10,6 +10,9 @@
 > - P5: Regime 阈值收窄 (breakout_rvol 1.2→1.05, range_rvol 0.8→0.95), UNCLEAR 58%→43%
 > - P6: Trailing stop (activation 0.5%, trail 0.3%)
 > - 综合: 365T/50.1%WR/PF=0.15/-104.51% → 286T/53.5%WR/PF=1.37/+19.72%
+>
+> **⚠️ 架构升级 (2026-03-12):** 回测框架已适配新 5 类 Regime (GAP_AND_GO/TREND_DAY/FADE_CHOP/WHIPSAW/UNCLEAR)，
+> 含 IBH/IBL 计算。旧 BREAKOUT/RANGE 信号已标记 deprecated。以下为原始设计文档，仅作历史参考。
 
 # Role & Context
 延续我们之前开发的“高胜率期权日内交易辅助系统”。现在我需要你设计并实现专门针对该系统的**历史回测框架 (Backtesting Framework)**。
