@@ -133,6 +133,12 @@ class USPredictor:
         # Fade direction cooldown — {symbol: (direction, unix_ts)}
         self._last_fade_directions: dict[str, tuple[str, float]] = {}
 
+    def close(self) -> None:
+        """Release caches for graceful shutdown."""
+        self._last_playbooks.clear()
+        self._last_today_bars.clear()
+        logger.info("USPredictor closed")
+
     # ── Market Tone ──
 
     async def _ensure_market_tone(self) -> MarketTone | None:
@@ -458,6 +464,7 @@ class USPredictor:
 
     async def generate_playbook_for_symbol(self, symbol: str) -> PlaybookResponse:
         """Generate playbook for a symbol. Returns PlaybookResponse with HTML + chart."""
+        self._reset_scan_history_if_new_day()
         # Get SPY context first (unless querying SPY itself)
         if symbol == "SPY":
             result = await self._run_analysis_pipeline(symbol, spy_regime=None)
@@ -1425,7 +1432,10 @@ class USPredictor:
             self._scan_history.clear()
             self._last_scan_regimes.clear()
             self._last_fade_directions.clear()
+            self._last_playbooks.clear()
+            self._last_today_bars.clear()
             self._scan_history_date = today
+            logger.info("Daily reset: cleared scan history and playbook caches")
 
     def _check_frequency(
         self,

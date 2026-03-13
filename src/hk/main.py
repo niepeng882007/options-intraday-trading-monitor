@@ -529,6 +529,7 @@ class HKPredictor:
 
     async def generate_playbook_for_symbol(self, symbol: str) -> PlaybookResponse:
         """Generate aggregated playbook for a single symbol. Returns PlaybookResponse with HTML + chart."""
+        self._reset_scan_history_if_new_day()
         await self._ensure_connected()
         regime, vp, vwap, _filters, _opt_rec, gw, playbook, today_bars = (
             await self._run_analysis_pipeline(symbol)

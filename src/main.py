@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import yaml
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import BotCommand, Update
 from telegram.error import NetworkError
@@ -181,12 +182,30 @@ async def main() -> None:
             us_cfg = yaml.safe_load(f)
     except FileNotFoundError:
         logger.warning("US config not found: %s", us_cfg_path)
+    except yaml.YAMLError as exc:
+        logger.error("Invalid YAML in %s: %s", us_cfg_path, exc)
+        raise SystemExit(1)
 
     # ── Shared FutuCollector (for US Predictor) ──
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+    # System alert callback — defined early, wired to Telegram after app is built
+    _tg_app_ref: list[Application | None] = [None]
+
+    async def _system_alert(msg: str) -> None:
+        tg_app = _tg_app_ref[0]
+        if tg_app and chat_id:
+            try:
+                await tg_app.bot.send_message(chat_id=chat_id, text=f"⚠️ [SYSTEM] {msg}", parse_mode="HTML")
+            except Exception:
+                logger.warning("Failed to send system alert: %s", msg)
+
     futu_cfg = (us_cfg or {}).get("futu", {})
     collector = FutuCollector(
         host=os.getenv("FUTU_HOST", futu_cfg.get("host", "127.0.0.1")),
         port=futu_cfg.get("port", 11111),
+        alert_callback=_system_alert,
     )
     await collector.connect()
     await collector.start_watchdog()
@@ -213,12 +232,11 @@ async def main() -> None:
     message_archive.init("data/monitor.db")
 
     # ── Telegram ──
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     app = None
 
     if bot_token and chat_id:
         app = _build_telegram_application(bot_token)
+        _tg_app_ref[0] = app
 
         # Register US handlers
         if us_predictor:
@@ -300,6 +318,26 @@ async def main() -> None:
             )
             logger.info("HK auto-scan scheduled: every %ds", interval)
 
+    # APScheduler error/miss listener → log + Telegram alert
+    def _scheduler_listener(event):
+        if event.exception:
+            logger.error(
+                "APScheduler job %s failed: %s",
+                event.job_id, event.exception, exc_info=event.exception,
+            )
+            msg = f"⚠️ [SYSTEM] Scheduler job <b>{event.job_id}</b> failed: {event.exception}"
+        else:
+            logger.warning("APScheduler job %s missed at %s", event.job_id, getattr(event, "scheduled_run_time", "?"))
+            msg = f"⚠️ [SYSTEM] Scheduler job <b>{event.job_id}</b> missed"
+        if app and chat_id:
+            async def _send_alert():
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+                except Exception:
+                    logger.warning("Failed to send scheduler alert to Telegram")
+            asyncio.create_task(_send_alert())
+
+    scheduler.add_listener(_scheduler_listener, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
     scheduler.start()
     logger.info("Playbook system started — US=%s, HK=%s",
                 "ON" if us_predictor else "OFF",
@@ -312,14 +350,23 @@ async def main() -> None:
         loop.add_signal_handler(sig, shutdown.set)
     await shutdown.wait()
 
-    scheduler.shutdown(wait=False)
-    if app:
-        await _shutdown_telegram_application(app)
-    if hk_predictor:
-        with suppress(Exception):
-            await hk_predictor.close()
-    await collector.close()
-    message_archive.close()
+    async def _shutdown_all():
+        scheduler.shutdown(wait=False)
+        if us_predictor:
+            with suppress(Exception):
+                us_predictor.close()
+        if app:
+            await _shutdown_telegram_application(app)
+        if hk_predictor:
+            with suppress(Exception):
+                await hk_predictor.close()
+        await collector.close()
+        message_archive.close()
+
+    try:
+        await asyncio.wait_for(_shutdown_all(), timeout=15)
+    except asyncio.TimeoutError:
+        logger.warning("Shutdown timed out after 15s, forcing exit")
     logger.info("Playbook system stopped")
 
 

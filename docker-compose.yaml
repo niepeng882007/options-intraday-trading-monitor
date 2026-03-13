@@ -4,6 +4,7 @@ services:
   playbook:
     build: .
     restart: always
+    stop_grace_period: 20s
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
@@ -12,3 +13,14 @@ services:
     volumes:
       - ./config:/app/config
       - ./data:/app/data
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

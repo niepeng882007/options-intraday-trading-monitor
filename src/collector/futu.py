@@ -5,6 +5,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Callable
 
 import pandas as pd
@@ -110,6 +111,7 @@ class FutuCollector(BaseCollector):
         host: str = os.getenv("FUTU_HOST", "127.0.0.1"),
         port: int = 11111,
         subscription_quota: int = 300,
+        alert_callback: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -121,6 +123,7 @@ class FutuCollector(BaseCollector):
         self._watchdog_task: asyncio.Task | None = None
         self._healthy = True
         self._last_ok_ts: float = 0.0
+        self._alert_callback = alert_callback
 
     # ── Lifecycle ──
 
@@ -135,6 +138,8 @@ class FutuCollector(BaseCollector):
             await self._run_sync(self._ctx.close)
             self._ctx = None
             logger.info("Disconnected from FutuOpenD")
+        _thread_pool.shutdown(wait=False)
+        _watchdog_pool.shutdown(wait=False)
 
     async def health_check(self) -> None:
         """Check if the Futu connection is alive."""
@@ -190,12 +195,23 @@ class FutuCollector(BaseCollector):
                 if not was_healthy:
                     logger.info("Reconnected to FutuOpenD")
                     was_healthy = True
+                    await self._send_alert("FutuOpenD 连接已恢复")
             except Exception as exc:
                 self._healthy = False
+                if was_healthy:
+                    await self._send_alert("FutuOpenD 连接断开, watchdog 正在尝试重连")
                 was_healthy = False
                 logger.warning("Watchdog probe failed: %s — recycling context", exc)
                 self._safe_close_ctx()
                 self._reset_thread_pool()
+
+    async def _send_alert(self, msg: str) -> None:
+        """Send alert via callback if configured."""
+        if self._alert_callback:
+            try:
+                await self._alert_callback(msg)
+            except Exception:
+                logger.warning("Alert callback failed for: %s", msg)
 
     async def get_connection_info(self) -> dict:
         """Return detailed Futu connection status."""
