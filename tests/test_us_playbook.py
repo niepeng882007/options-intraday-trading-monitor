@@ -3814,39 +3814,57 @@ class TestUnclearFadePlan:
         return GammaWallResult(call_wall_strike=260.0, put_wall_strike=245.0, max_pain=252.0)
 
     def test_chop_likely_bearish_fade(self):
-        """is_chop_likely + lean=bearish → Plan B is fade short with SL/TP/rr."""
+        """is_chop_likely + lean=bearish → Plan B is fade short with SL/TP/rr.
+
+        VWAP must be above VAH so TP1 (VAH) is below entry → valid short direction.
+        """
         regime = USRegimeResult(
             regime=USRegimeType.UNCLEAR, confidence=0.25,
-            rvol=0.57, price=256.0, gap_pct=0.1, lean="bearish",
+            rvol=0.57, price=258.0, gap_pct=0.1, lean="bearish",
+        )
+        kl = KeyLevels(
+            poc=252.0, vah=255.0, val=249.0,
+            pdh=260.0, pdl=248.0, pmh=258.0, pml=250.5,
+            vwap=256.5,  # above VAH → bearish fade targets VAH below
         )
         plans = _generate_action_plans(
-            regime, "neutral", self._vp(), self._kl(), self._gw(), None,
+            regime, "neutral", self._vp(), kl, self._gw(), None,
         )
         plan_b = plans[1]
         assert plan_b.name == "均值回归做空"
         assert plan_b.direction == "bearish"
-        assert plan_b.entry == self._kl().vwap
+        assert plan_b.entry == kl.vwap
         assert plan_b.stop_loss is not None  # has explicit SL
         assert plan_b.tp1 is not None  # has explicit TP1
+        assert plan_b.tp1 < plan_b.entry  # TP below entry for short
         assert plan_b.rr_ratio > 0  # meaningful R:R
         # No entry_zone (single-point entry)
         assert plan_b.entry_zone_price is None
 
     def test_chop_likely_bullish_fade(self):
-        """is_chop_likely + lean=bullish → Plan B is fade long with SL/TP/rr."""
+        """is_chop_likely + lean=bullish → Plan B is fade long with SL/TP/rr.
+
+        VWAP must be below VAL so TP1 (VAL) is above entry → valid long direction.
+        """
         regime = USRegimeResult(
             regime=USRegimeType.UNCLEAR, confidence=0.25,
-            rvol=0.57, price=248.0, gap_pct=-0.1, lean="bullish",
+            rvol=0.57, price=247.0, gap_pct=-0.1, lean="bullish",
+        )
+        kl = KeyLevels(
+            poc=252.0, vah=255.0, val=249.0,
+            pdh=257.0, pdl=245.0, pmh=254.0, pml=246.0,
+            vwap=247.5,  # below VAL → bullish fade targets VAL above
         )
         plans = _generate_action_plans(
-            regime, "neutral", self._vp(), self._kl(), self._gw(), None,
+            regime, "neutral", self._vp(), kl, self._gw(), None,
         )
         plan_b = plans[1]
         assert plan_b.name == "均值回归做多"
         assert plan_b.direction == "bullish"
-        assert plan_b.entry == self._kl().vwap
+        assert plan_b.entry == kl.vwap
         assert plan_b.stop_loss is not None
         assert plan_b.tp1 is not None
+        assert plan_b.tp1 > plan_b.entry  # TP above entry for long
         assert plan_b.rr_ratio > 0
         assert plan_b.entry_zone_price is None
 
@@ -3964,18 +3982,24 @@ class TestUnclearFadePlan:
         assert plan_b.stop_loss_reason == "VAL"
 
     def test_well_spaced_levels_unchanged(self):
-        """Normal spacing: VWAP=251.5, VAL=249 → fade plan generated as before."""
+        """Normal spacing: VWAP=247.5 below VAL=249 → bullish fade plan generated."""
+        kl = KeyLevels(
+            poc=252.0, vah=255.0, val=249.0,
+            pdh=257.0, pdl=245.0, pmh=254.0, pml=246.0,
+            vwap=247.5,  # below VAL → valid bullish fade
+        )
         plans = _generate_action_plans(
             USRegimeResult(
                 regime=USRegimeType.UNCLEAR, confidence=0.25,
-                rvol=0.57, price=248.0, gap_pct=-0.1, lean="bullish",
+                rvol=0.57, price=247.0, gap_pct=-0.1, lean="bullish",
             ),
-            "neutral", self._vp(), self._kl(), self._gw(), None,
+            "neutral", self._vp(), kl, self._gw(), None,
         )
         plan_b = plans[1]
         assert plan_b.name == "均值回归做多"
-        assert plan_b.entry == self._kl().vwap
+        assert plan_b.entry == kl.vwap
         assert plan_b.tp1 == self._vp().val
+        assert plan_b.tp1 > plan_b.entry  # TP above entry for long
         assert plan_b.rr_ratio > 0
         assert plan_b.stop_loss is not None
 

@@ -1215,6 +1215,9 @@ def _make_unclear_fade_plan(
         # Price above VA → fade short back to VA edge
         tp1_price = vp.vah if vp.vah > 0 else vp.poc
         tp1_label = "VAH" if vp.vah > 0 else "POC"
+        # Direction guard: bearish fade TP must be below entry
+        if kl.vwap > 0 and tp1_price >= kl.vwap:
+            return None
         # Guard: VWAP too close to target → fade unprofitable
         if kl.vwap > 0 and abs(tp1_price - kl.vwap) / kl.vwap < _MIN_FADE_REWARD_PCT:
             return None
@@ -1245,6 +1248,9 @@ def _make_unclear_fade_plan(
         # lean == "bullish", price below VA → fade long back to VA edge
         tp1_price = vp.val if vp.val > 0 else vp.poc
         tp1_label = "VAL" if vp.val > 0 else "POC"
+        # Direction guard: bullish fade TP must be above entry
+        if kl.vwap > 0 and tp1_price <= kl.vwap:
+            return None
         # Guard: VWAP too close to target → fade unprofitable
         if kl.vwap > 0 and abs(tp1_price - kl.vwap) / kl.vwap < _MIN_FADE_REWARD_PCT:
             return None
@@ -1605,13 +1611,17 @@ def format_us_playbook_message(
     vwap_pct = _pct_change(r.price, vwap)
     vwap_str = f"VWAP {vwap:,.2f} ({_format_percent(vwap_pct)})" if vwap > 0 else ""
     amp_str = ""
-    if quote and quote.amplitude > 0:
+    if quote and quote.high_price > 0 and quote.low_price > 0:
+        amp = (quote.high_price - quote.low_price) / quote.low_price * 100
+        amp_str = f"振幅 {_format_percent(amp, signed=False)}"
+    elif quote and quote.amplitude > 0:
         amp_str = f"振幅 {_format_percent(quote.amplitude, signed=False)}"
     compact_items = [x for x in [vwap_str, f"RVOL {r.rvol:.2f}", amp_str] if x]
     lines.append(" | ".join(compact_items))
 
     # VP levels
-    lines.append(f"VAH {vp.vah:,.2f} | POC {vp.poc:,.2f} | VAL {vp.val:,.2f}")
+    vp_suffix = f" ({vp.trading_days}d)" if vp.trading_days > 0 else ""
+    lines.append(f"VAH {vp.vah:,.2f} | POC {vp.poc:,.2f} | VAL {vp.val:,.2f}{vp_suffix}")
 
     # PDH/PDL
     pd_parts = []
