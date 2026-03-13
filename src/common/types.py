@@ -95,6 +95,7 @@ class QuoteSnapshot:
     ask_price: float = 0.0
     amplitude: float = 0.0
     turnover_rate: float = 0.0
+    volume_ratio: float = 0.0
     timestamp: float = 0.0
 
 

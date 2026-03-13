@@ -3095,3 +3095,137 @@ class TestHKActionPlanGeneration:
         pb = generate_playbook(regime, self._vp(), vwap=500)
         msg = format_playbook_message(pb, symbol="Test")
         assert "观望" in msg or "等待" in msg
+
+
+# ── RVOL source selection (Futu volume_ratio vs K-line calc) ──
+
+class TestRvolSourceSelection:
+    """Tests for RVOL source selection: prefer Futu volume_ratio over K-line calculated RVOL."""
+
+    def test_rvol_prefers_futu_volume_ratio(self):
+        """When Futu volume_ratio > 0, it should be used instead of calculated RVOL."""
+        futu_rvol = 1.85
+        calc_rvol = 1.20
+        rvol = futu_rvol if futu_rvol > 0 else calc_rvol
+        assert rvol == futu_rvol
+
+    def test_rvol_fallback_when_no_volume_ratio(self):
+        """When Futu volume_ratio is 0 (unavailable), fall back to calculated RVOL."""
+        futu_rvol = 0.0
+        calc_rvol = 1.35
+        rvol = futu_rvol if futu_rvol > 0 else calc_rvol
+        assert rvol == calc_rvol
+
+    def test_quote_snapshot_has_volume_ratio_field(self):
+        """QuoteSnapshot should accept and store volume_ratio."""
+        snap = QuoteSnapshot(symbol="HK.09988", last_price=100.0, volume_ratio=2.5)
+        assert snap.volume_ratio == 2.5
+
+    def test_quote_snapshot_volume_ratio_defaults_zero(self):
+        """QuoteSnapshot volume_ratio defaults to 0.0 when not provided."""
+        snap = QuoteSnapshot(symbol="HK.09988", last_price=100.0)
+        assert snap.volume_ratio == 0.0
+
+
+# ── P0: avg_daily_range_pct flows into PlanContext ──
+
+
+class TestPlanContextAvgDailyRange:
+    def test_plan_context_receives_avg_daily_range(self):
+        """generate_playbook(avg_daily_range_pct=X) stores value on Playbook,
+        and format_playbook_message creates PlanContext with that value."""
+        regime = RegimeResult(
+            regime=RegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.9, price=100, vah=105, val=95, poc=100,
+        )
+        vp = VolumeProfileResult(poc=100, vah=105, val=95)
+        pb = generate_playbook(regime=regime, vp=vp, vwap=100.0, avg_daily_range_pct=2.5)
+        assert pb.avg_daily_range_pct == 2.5
+
+    def test_plan_context_default_zero(self):
+        """Without explicit avg_daily_range_pct, defaults to 0.0."""
+        regime = RegimeResult(
+            regime=RegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.9, price=100, vah=105, val=95, poc=100,
+        )
+        vp = VolumeProfileResult(poc=100, vah=105, val=95)
+        pb = generate_playbook(regime=regime, vp=vp, vwap=100.0)
+        assert pb.avg_daily_range_pct == 0.0
+
+
+# ── P1: FADE_CHOP core conclusion VA distance check ──
+
+
+class TestCoreConclusion_FadeChop_VA:
+    def test_core_conclusion_fade_chop_far_from_edge(self):
+        """Price far outside VA → dist/va_width > 0.5 → 观望."""
+        from src.hk.playbook import _core_conclusion_text
+        # price=50, VAH=110, VAL=90 → closest=VAL(dist=40), va_width=20, ratio=2.0 > 0.5
+        regime = RegimeResult(
+            regime=RegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.9, price=50, vah=110, val=90, poc=100,
+        )
+        vp = VolumeProfileResult(poc=100, vah=110, val=90)
+        result = _core_conclusion_text(regime, "neutral", vp, 100.0, None)
+        assert "观望" in result
+
+    def test_core_conclusion_fade_chop_near_vah(self):
+        """Price near VAH → dist/va_width ≤ 0.5 → VAH...做空."""
+        from src.hk.playbook import _core_conclusion_text
+        regime = RegimeResult(
+            regime=RegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.9, price=108, vah=110, val=90, poc=100,
+        )
+        vp = VolumeProfileResult(poc=100, vah=110, val=90)
+        result = _core_conclusion_text(regime, "neutral", vp, 100.0, None)
+        assert "VAH" in result
+        assert "做空" in result
+
+    def test_core_conclusion_fade_chop_near_val(self):
+        """Price near VAL → dist/va_width ≤ 0.5 → VAL...做多."""
+        from src.hk.playbook import _core_conclusion_text
+        regime = RegimeResult(
+            regime=RegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.9, price=92, vah=110, val=90, poc=100,
+        )
+        vp = VolumeProfileResult(poc=100, vah=110, val=90)
+        result = _core_conclusion_text(regime, "neutral", vp, 100.0, None)
+        assert "VAL" in result
+        assert "做多" in result
+
+
+# ── P2: Fade Plan B entry=None → stop_loss=None ──
+
+
+class TestFadePlanB_NoEntry_NoSL:
+    def test_fade_bearish_plan_b_no_entry_no_sl(self):
+        """FADE_CHOP bearish Plan B: when VWAP <= POC, entry=None → stop_loss=None."""
+        from src.hk.playbook import _plans_fade_bearish
+        vp = VolumeProfileResult(poc=100, vah=105, val=95)
+        levels = {"POC": 100, "VAH": 105, "VAL": 95}
+        # vwap <= poc → plan_b_entry = None
+        plans = _plans_fade_bearish(price=104, vp=vp, levels=levels, vwap=99.0, option_line=None)
+        plan_b = plans[1]
+        assert plan_b.entry is None
+        assert plan_b.stop_loss is None
+
+    def test_fade_bullish_plan_b_no_entry_no_sl(self):
+        """FADE_CHOP bullish Plan B: when VWAP >= POC, entry=None → stop_loss=None."""
+        from src.hk.playbook import _plans_fade_bullish
+        vp = VolumeProfileResult(poc=100, vah=105, val=95)
+        levels = {"POC": 100, "VAH": 105, "VAL": 95}
+        # vwap >= poc → plan_b_entry = None
+        plans = _plans_fade_bullish(price=96, vp=vp, levels=levels, vwap=101.0, option_line=None)
+        plan_b = plans[1]
+        assert plan_b.entry is None
+        assert plan_b.stop_loss is None
+
+    def test_fade_bearish_plan_b_has_entry_has_sl(self):
+        """FADE_CHOP bearish Plan B: when VWAP > POC, entry and stop_loss are set."""
+        from src.hk.playbook import _plans_fade_bearish
+        vp = VolumeProfileResult(poc=100, vah=105, val=95)
+        levels = {"POC": 100, "VAH": 105, "VAL": 95}
+        plans = _plans_fade_bearish(price=104, vp=vp, levels=levels, vwap=102.0, option_line=None)
+        plan_b = plans[1]
+        assert plan_b.entry == 102.0
+        assert plan_b.stop_loss is not None

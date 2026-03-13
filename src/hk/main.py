@@ -225,8 +225,8 @@ class HKPredictor:
                 float(today_bars["Close"].min()), float(today_bars["Close"].max()),
             )
 
-        # 4. RVOL
-        rvol = calculate_rvol(
+        # 4. RVOL (prefer Futu volume_ratio when available)
+        calc_rvol = calculate_rvol(
             today_bars, hist_bars,
             lookback_days=cfg.get("rvol", {}).get("lookback_days", 10),
         )
@@ -236,6 +236,15 @@ class HKPredictor:
         quote_snapshot = QuoteSnapshot(**quote)
         price = quote_snapshot.last_price
         turnover = quote_snapshot.turnover
+
+        # 5b. RVOL source selection: Futu volume_ratio > K-line calculated
+        futu_rvol = quote_snapshot.volume_ratio
+        rvol = futu_rvol if futu_rvol > 0 else calc_rvol
+        logger.debug(
+            "RVOL %s: futu=%.2f, calc=%.2f, used=%.2f (source=%s)",
+            symbol, futu_rvol, calc_rvol, rvol,
+            "futu" if futu_rvol > 0 else "calc",
+        )
 
         # 6. Gamma Wall + Option chain
         gamma_wall: GammaWallResult | None = None
@@ -404,6 +413,7 @@ class HKPredictor:
             quote=quote_snapshot,
             option_market=option_market,
             key_levels_obj=hk_kl,
+            avg_daily_range_pct=avg_daily_range_pct,
         )
 
         return regime, vp, vwap, filters, option_rec, gamma_wall, playbook, today_bars
@@ -592,10 +602,17 @@ class HKPredictor:
         if vp.vah <= 0 or vp.val <= 0:
             return None
 
-        # RVOL
-        rvol = calculate_rvol(
+        # RVOL (prefer Futu volume_ratio when available)
+        calc_rvol = calculate_rvol(
             today_bars, hist_bars,
             lookback_days=self._cfg.get("rvol", {}).get("lookback_days", 10),
+        )
+        futu_rvol = float(quote.get("volume_ratio", 0) or 0)
+        rvol = futu_rvol if futu_rvol > 0 else calc_rvol
+        logger.debug(
+            "L1 RVOL %s: futu=%.2f, calc=%.2f, used=%.2f (source=%s)",
+            symbol, futu_rvol, calc_rvol, rvol,
+            "futu" if futu_rvol > 0 else "calc",
         )
 
         # Volume surge (before regime, feeds into classify_regime)

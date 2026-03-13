@@ -297,8 +297,8 @@ def _plans_fade_bearish(
         sl_b_price = sl_b_candidates[0][1] if sl_b_candidates else vp.vah
         sl_b_label = sl_b_candidates[0][0] if sl_b_candidates else "VAH"
     else:
-        sl_b_price = vp.vah
-        sl_b_label = "VAH"
+        sl_b_price = None
+        sl_b_label = ""
     plan_b = ActionPlan(
         label="B", name="VWAP 回归做空", emoji="📉", is_primary=False,
         logic="VWAP 上方接空, 目标 POC",
@@ -358,8 +358,8 @@ def _plans_fade_bullish(
         sl_b_price = sl_b_candidates[0][1] if sl_b_candidates else vp.val
         sl_b_label = sl_b_candidates[0][0] if sl_b_candidates else "VAL"
     else:
-        sl_b_price = vp.val
-        sl_b_label = "VAL"
+        sl_b_price = None
+        sl_b_label = ""
     plan_b = ActionPlan(
         label="B", name="VWAP 回归做多", emoji="📈", is_primary=False,
         logic="VWAP 下方接多, 目标 POC",
@@ -548,6 +548,7 @@ def generate_playbook(
     quote: QuoteSnapshot | None = None,
     option_market: OptionMarketSnapshot | None = None,
     key_levels_obj: HKKeyLevels | None = None,
+    avg_daily_range_pct: float = 0.0,
 ) -> Playbook:
     """Generate a complete Playbook object."""
     if filters is None:
@@ -586,6 +587,7 @@ def generate_playbook(
         generated_at=datetime.now(HKT),
         option_rec=option_rec,
         key_levels_obj=key_levels_obj,
+        avg_daily_range_pct=avg_daily_range_pct,
     )
 
 
@@ -651,7 +653,10 @@ def _core_conclusion_text(
         return f"反弹至 VWAP {vwap:,.2f} 附近做空" if vwap > 0 else "反弹至阻力位做空"
 
     if regime.regime == RegimeType.FADE_CHOP:
-        edge, _ = _closest_value_area_edge(price, vp)
+        edge, dist = _closest_value_area_edge(price, vp)
+        va_width = vp.vah - vp.val
+        if va_width > 0 and dist / va_width > 0.5:
+            return "观望, 等待价格靠近 VA 边沿再入场"
         if edge == "VAH":
             return f"VAH {vp.vah:,.2f} 附近做空, 目标 POC {vp.poc:,.2f}"
         return f"VAL {vp.val:,.2f} 附近做多, 目标 POC {vp.poc:,.2f}"
@@ -791,7 +796,7 @@ def format_playbook_message(
         minutes_to_close=_min_left,
         total_session_minutes=330,
         rvol=regime.rvol,
-        avg_daily_range_pct=0.0,  # filled by main.py if available
+        avg_daily_range_pct=playbook.avg_daily_range_pct,
         intraday_range_pct=_intraday_range,
         option_action=recommendation.action if recommendation else "",
     )

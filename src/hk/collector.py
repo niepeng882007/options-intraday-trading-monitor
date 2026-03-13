@@ -74,6 +74,7 @@ class HKCollector:
             "ask_price": float(row.get("ask_price", 0) or 0),
             "amplitude": float(row.get("amplitude", 0) or 0),
             "turnover_rate": float(row.get("turnover_rate", 0) or 0),
+            "volume_ratio": float(row.get("volume_ratio", 0) or 0),
             "timestamp": time.time(),
         }
 
