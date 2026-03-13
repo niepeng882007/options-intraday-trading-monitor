@@ -138,6 +138,15 @@ def format_action_plan(plan: ActionPlan) -> list[str]:
         return lines
 
     lines.append(f"  触发: {_esc(plan.trigger)}")
+
+    # P2: Suppressed plans only show trigger + warning, hide entry/SL/TP details
+    if plan.suppressed:
+        if plan.demote_reason:
+            lines.append(f"  ⚠️ {_esc(plan.demote_reason)}")
+        if plan.warning:
+            lines.append(f"  ⚠️ {_esc(plan.warning)}")
+        return lines
+
     if plan.entry is not None:
         if plan.entry_zone_price is not None:
             if plan.direction == "bearish":
@@ -165,8 +174,6 @@ def format_action_plan(plan: ActionPlan) -> list[str]:
     if plan.option_line:
         lines.append(plan.option_line)
     if plan.demoted and plan.demote_reason:
-        lines.append(f"  ⚠️ {_esc(plan.demote_reason)}")
-    if plan.suppressed and plan.demote_reason:
         lines.append(f"  ⚠️ {_esc(plan.demote_reason)}")
     if plan.warning:
         lines.append(f"  ⚠️ {_esc(plan.warning)}")

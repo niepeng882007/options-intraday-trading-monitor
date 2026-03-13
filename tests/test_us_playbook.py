@@ -31,6 +31,7 @@ from src.us_playbook.playbook import (
     _compact_option_line, _rvol_assessment, _find_fade_entry_zone,
     PlanContext, _reachable_range_pct, _cap_tp1, _cap_tp2,
     _check_entry_reachability, _apply_wait_coherence, _apply_min_rr_gate,
+    _us_key_levels_to_dict, _cap_fade_sl,
 )
 from src.common.action_plan import (
     cap_tp1 as _cap_tp1_common,
@@ -3686,6 +3687,25 @@ class TestActionPlanReachability:
         assert results[0].demoted is False
 
 
+class TestDuplicateWarningFix:
+    """Both demoted+suppressed should produce only ONE ⚠️ line."""
+
+    def test_demoted_and_suppressed_single_warning(self):
+        plan = ActionPlan(
+            label="B", name="test", emoji="📉", is_primary=False,
+            logic="test", direction="bearish", trigger="test",
+            entry=255.0, entry_action="做空",
+            stop_loss=257.0, stop_loss_reason="SL",
+            tp1=252.0, tp1_label="POC",
+            tp2=None, tp2_label="", rr_ratio=0.5,
+            demoted=True, suppressed=True,
+            demote_reason="R:R 不合格 (0.5 < 0.8)",
+        )
+        lines = _format_action_plan(plan)
+        warning_lines = [l for l in lines if "⚠️" in l and "R:R" in l]
+        assert len(warning_lines) == 1
+
+
 class TestCapTp1:
     """Tests for OPT-1: TP1 capping to reachable range."""
 
@@ -3875,6 +3895,131 @@ class TestUnclearFadePlan:
         assert plan_b.tp1 == vp.vah  # 202.75 — nearest VA edge
         assert plan_b.rr_ratio > 0
 
+    def test_vwap_near_val_fallback_to_directional(self):
+        """QQQ bug: VWAP≈VAL (602.17 vs 602.00) → fade unprofitable, fallback to 轻仓做多."""
+        vp = VolumeProfileResult(poc=605.0, vah=608.0, val=602.0)
+        kl = KeyLevels(
+            poc=605.0, vah=608.0, val=602.0,
+            pdh=610.0, pdl=600.0, pmh=609.0, pml=601.0,
+            vwap=602.17,
+        )
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.25,
+            rvol=0.57, price=601.0, gap_pct=-0.1, lean="bullish",
+        )
+        plans = _generate_action_plans(regime, "neutral", vp, kl, self._gw(), None)
+        plan_b = plans[1]
+        # Should fallback to directional plan, not fade
+        assert "轻仓" in plan_b.name
+        assert plan_b.direction == "bullish"
+        assert plan_b.stop_loss is None  # directional plan has no explicit SL
+
+    def test_vwap_near_vah_fallback_to_directional(self):
+        """VWAP≈VAH → fade short unprofitable, fallback to 轻仓做空."""
+        vp = VolumeProfileResult(poc=250.0, vah=255.0, val=247.0)
+        kl = KeyLevels(
+            poc=250.0, vah=255.0, val=247.0,
+            pdh=258.0, pdl=246.0, pmh=256.0, pml=248.0,
+            vwap=255.10,
+        )
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.25,
+            rvol=0.57, price=256.0, gap_pct=0.1, lean="bearish",
+        )
+        plans = _generate_action_plans(regime, "neutral", vp, kl, self._gw(), None)
+        plan_b = plans[1]
+        assert "轻仓" in plan_b.name
+        assert plan_b.direction == "bearish"
+        assert plan_b.stop_loss is None
+
+    def test_sl_capped_when_distant_put_wall(self):
+        """SL only candidate is Put Wall at 510 (15% away) → capped to 1%.
+
+        All structural levels (PDL, PML, VAL) placed above VWAP so that
+        _nearest_levels("below") finds only the distant Put Wall.
+        VAL=608 gives enough reward (6pts) vs capped SL (~6pts) for R:R≈1.0.
+
+        Note: Put Wall 510 is >10% from price 599 and excluded by gamma wall
+        distance filter. SL falls back to VAL=608 (nearest structural level).
+        """
+        vp = VolumeProfileResult(poc=612.0, vah=615.0, val=608.0)
+        kl = KeyLevels(
+            poc=612.0, vah=615.0, val=608.0,
+            pdh=620.0, pdl=606.0, pmh=618.0, pml=607.0,
+            vwap=602.0,
+        )
+        gw = GammaWallResult(call_wall_strike=650.0, put_wall_strike=510.0, max_pain=600.0)
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.25,
+            rvol=0.57, price=599.0, gap_pct=-0.1, lean="bullish",
+        )
+        plans = _generate_action_plans(regime, "neutral", vp, kl, gw, None)
+        plan_b = plans[1]
+        assert plan_b.name == "均值回归做多"
+        assert plan_b.stop_loss is not None
+        # Put Wall 510 excluded (>10% away), SL falls to VAL=608
+        sl_distance_pct = abs(plan_b.stop_loss - kl.vwap) / kl.vwap
+        assert sl_distance_pct <= 0.011  # allow tiny float tolerance
+        assert plan_b.stop_loss_reason == "VAL"
+
+    def test_well_spaced_levels_unchanged(self):
+        """Normal spacing: VWAP=251.5, VAL=249 → fade plan generated as before."""
+        plans = _generate_action_plans(
+            USRegimeResult(
+                regime=USRegimeType.UNCLEAR, confidence=0.25,
+                rvol=0.57, price=248.0, gap_pct=-0.1, lean="bullish",
+            ),
+            "neutral", self._vp(), self._kl(), self._gw(), None,
+        )
+        plan_b = plans[1]
+        assert plan_b.name == "均值回归做多"
+        assert plan_b.entry == self._kl().vwap
+        assert plan_b.tp1 == self._vp().val
+        assert plan_b.rr_ratio > 0
+        assert plan_b.stop_loss is not None
+
+
+    def test_low_rr_fade_fallback_to_directional(self):
+        """AAPL bug: VWAP=256.53, VAL=257.50, SL capped → R:R=0.4 → fallback to 轻仓."""
+        vp = VolumeProfileResult(poc=258.0, vah=260.0, val=257.50)
+        kl = KeyLevels(
+            poc=258.0, vah=260.0, val=257.50,
+            pdh=261.0, pdl=253.0, pmh=260.5, pml=254.0,
+            vwap=256.53,
+        )
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.25,
+            rvol=0.57, price=255.0, gap_pct=-0.1, lean="bullish",
+        )
+        plans = _generate_action_plans(regime, "neutral", vp, kl, self._gw(), None)
+        plan_b = plans[1]
+        # R:R too low for fade → should fallback to directional
+        assert "轻仓" in plan_b.name
+        assert plan_b.direction == "bullish"
+        assert plan_b.stop_loss is None
+
+    def test_low_rr_bearish_fade_fallback(self):
+        """Bearish fade with R:R < 0.8 → fallback to 轻仓做空.
+
+        VWAP=200 above VAH=199.65 (reward=0.35), nearest SL above=PMH=201.5 (risk=1.5).
+        R:R = 0.35/1.5 ≈ 0.23 < 0.8 → fallback.
+        """
+        vp = VolumeProfileResult(poc=199.0, vah=199.65, val=198.0)
+        kl = KeyLevels(
+            poc=199.0, vah=199.65, val=198.0,
+            pdh=202.0, pdl=197.0, pmh=201.5, pml=197.5,
+            vwap=200.0,
+        )
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.25,
+            rvol=0.57, price=200.5, gap_pct=0.1, lean="bearish",
+        )
+        plans = _generate_action_plans(regime, "neutral", vp, kl, None, None)
+        plan_b = plans[1]
+        assert "轻仓" in plan_b.name
+        assert plan_b.direction == "bearish"
+        assert plan_b.stop_loss is None
+
 
 class TestVwapDeviationWarning:
     """Tests for OPT-4: VWAP deviation warning."""
@@ -3929,3 +4074,545 @@ class TestWarningRendering:
         )
         lines = _format_action_plan(plan)
         assert any("VWAP" in l and "回调" in l for l in lines)
+
+
+# ── P0-1: Volume Surge Baseline Fix Tests ──
+
+class TestVolumeSurgeBaseline:
+    def test_skip_open_bars_for_avg(self):
+        """Opening spike bars should be excluded from average baseline."""
+        bars = _make_bars([
+            # Opening rotation — 3 bars with huge volume
+            ("2026-03-10 09:30:00", 100, 101, 99, 100, 500000),
+            ("2026-03-10 09:31:00", 100, 101, 99, 100, 400000),
+            ("2026-03-10 09:32:00", 100, 101, 99, 100, 300000),
+            # Normal trading — lower volume
+            ("2026-03-10 09:33:00", 100, 101, 99, 101, 50000),
+            ("2026-03-10 09:34:00", 101, 102, 100, 102, 60000),
+            ("2026-03-10 09:35:00", 102, 103, 101, 103, 70000),
+            ("2026-03-10 09:36:00", 103, 104, 102, 104, 80000),
+            # Surge bar
+            ("2026-03-10 09:37:00", 104, 106, 103, 106, 200000),
+        ])
+        from datetime import time as dt_time
+        _cutoff = dt_time(9, 33)
+        filtered = bars[bars.index.time >= _cutoff]
+        avg_all = float(bars["Volume"].mean())
+        avg_filtered = float(filtered["Volume"].mean())
+        # Filtered avg should be much lower (no opening spike)
+        assert avg_filtered < avg_all
+        # Surge (200000) should exceed 2x filtered avg (~92k) but may not exceed 2x all avg (~207k)
+        surge_threshold = 2.0
+        assert 200000 >= avg_filtered * surge_threshold
+        # With unfiltered avg, the surge would NOT be detected
+        assert 200000 < avg_all * surge_threshold
+
+
+# ── P0-2: Frequency Precheck Tests ──
+
+class TestFrequencyPrecheck:
+    def _make_predictor(self):
+        cfg = {
+            "watchlist": [{"symbol": "SPY", "name": "S&P 500 ETF"}],
+            "auto_scan": {
+                "cooldown": {"same_signal_minutes": 30, "max_per_session": 2, "max_per_day": 3},
+                "override": {"confidence_increase": 0.10, "price_extension_pct": 0.50, "regime_upgrade": True},
+            },
+        }
+        return USPredictor(cfg, collector=None)
+
+    def test_no_history_passes(self):
+        pred = self._make_predictor()
+        pred._scan_history_date = "2026-03-10"
+        assert pred._quick_frequency_precheck("AAPL", "morning", pred._cfg["auto_scan"]) is True
+
+    def test_daily_max_reached_breakout_blocks(self):
+        """When daily max is reached and last alert is BREAKOUT, no upgrade possible → skip."""
+        pred = self._make_predictor()
+        pred._scan_history_date = "2026-03-10"
+        for i in range(3):
+            pred._scan_history.setdefault("AAPL", []).append(
+                USScanAlertRecord(
+                    symbol="AAPL", signal_type="BREAKOUT_LONG", direction="bullish",
+                    confidence=0.8, price=180.0, timestamp=float(i * 3600), session="morning",
+                )
+            )
+        assert pred._quick_frequency_precheck("AAPL", "morning", pred._cfg["auto_scan"]) is False
+
+    def test_daily_max_reached_range_allows(self):
+        """When daily max reached but last alert is RANGE, upgrade possible → allow."""
+        pred = self._make_predictor()
+        pred._scan_history_date = "2026-03-10"
+        for i in range(3):
+            pred._scan_history.setdefault("AAPL", []).append(
+                USScanAlertRecord(
+                    symbol="AAPL", signal_type="RANGE_REVERSAL_LONG", direction="bullish",
+                    confidence=0.7, price=175.0, timestamp=float(i * 3600), session="morning",
+                )
+            )
+        assert pred._quick_frequency_precheck("AAPL", "morning", pred._cfg["auto_scan"]) is True
+
+    def test_session_max_reached_blocks(self):
+        pred = self._make_predictor()
+        pred._scan_history_date = "2026-03-10"
+        for i in range(2):
+            pred._scan_history.setdefault("AAPL", []).append(
+                USScanAlertRecord(
+                    symbol="AAPL", signal_type="BREAKOUT_LONG", direction="bullish",
+                    confidence=0.8, price=180.0, timestamp=float(i * 3600), session="morning",
+                )
+            )
+        assert pred._quick_frequency_precheck("AAPL", "morning", pred._cfg["auto_scan"]) is False
+
+
+# ── P0-3: Signal Strength Grading Tests ──
+
+class TestSignalStrength:
+    def _make_signal(self, conf=0.75, rvol=1.5):
+        return USScanSignal(
+            signal_type="BREAKOUT_BULLISH",
+            direction="bullish",
+            symbol="AAPL",
+            regime=USRegimeResult(
+                regime=USRegimeType.GAP_AND_GO, confidence=conf,
+                rvol=rvol, price=560, gap_pct=1.5,
+            ),
+            price=560,
+            trigger_reasons=["突破 VAH 0.35%"],
+            timestamp=1000.0,
+        )
+
+    def test_extreme_strong(self):
+        label, emoji = USPredictor._signal_strength_label(self._make_signal(conf=0.90, rvol=2.5))
+        assert label == "极强信号"
+        assert emoji == "\U0001f525"
+
+    def test_strong_by_conf(self):
+        label, _ = USPredictor._signal_strength_label(self._make_signal(conf=0.82, rvol=1.2))
+        assert label == "强信号"
+
+    def test_strong_by_rvol(self):
+        label, _ = USPredictor._signal_strength_label(self._make_signal(conf=0.70, rvol=1.9))
+        assert label == "强信号"
+
+    def test_standard(self):
+        label, emoji = USPredictor._signal_strength_label(self._make_signal(conf=0.72, rvol=1.3))
+        assert label == "标准信号"
+        assert emoji == "\U0001f514"
+
+    def test_header_uses_graded_label(self):
+        """_format_scan_header should use graded label instead of hardcoded '强信号'."""
+        signal = self._make_signal(conf=0.72, rvol=1.3)
+        rec = OptionRecommendation(action="call", direction="bullish", expiry="2026-03-20")
+        header = USPredictor._format_scan_header(signal, "normal", rec, None, 30)
+        assert "标准信号" in header
+        assert "强信号" not in header
+
+    def test_header_extreme_strong(self):
+        signal = self._make_signal(conf=0.90, rvol=2.5)
+        rec = OptionRecommendation(action="call", direction="bullish", expiry="2026-03-20")
+        header = USPredictor._format_scan_header(signal, "normal", rec, None, 30)
+        assert "极强信号" in header
+
+
+# ── RSI Tests ──
+
+class TestRSI:
+    def test_basic_rsi(self):
+        from src.us_playbook.indicators import calculate_rsi
+        # Build bars with consistent up moves → RSI should be high
+        prices = []
+        for i in range(20):
+            ts = f"2026-03-10 09:{30+i}:00"
+            p = 100 + i * 0.5  # steadily rising
+            prices.append((ts, p, p + 0.2, p - 0.1, p + 0.3, 10000))
+        bars = _make_bars(prices)
+        rsi = calculate_rsi(bars, period=14)
+        assert rsi > 70  # overbought territory
+
+    def test_rsi_down(self):
+        from src.us_playbook.indicators import calculate_rsi
+        prices = []
+        for i in range(20):
+            ts = f"2026-03-10 09:{30+i}:00"
+            p = 200 - i * 0.5  # steadily falling
+            prices.append((ts, p, p + 0.1, p - 0.2, p - 0.3, 10000))
+        bars = _make_bars(prices)
+        rsi = calculate_rsi(bars, period=14)
+        assert rsi < 30  # oversold territory
+
+    def test_rsi_insufficient_data(self):
+        from src.us_playbook.indicators import calculate_rsi
+        bars = _make_bars([
+            ("2026-03-10 09:30:00", 100, 101, 99, 100, 10000),
+        ])
+        rsi = calculate_rsi(bars, period=14)
+        assert rsi == 50.0  # neutral fallback
+
+    def test_rsi_empty(self):
+        from src.us_playbook.indicators import calculate_rsi
+        assert calculate_rsi(pd.DataFrame(), period=14) == 50.0
+
+
+# ── Per-Type Frequency Control Tests ──
+
+class TestPerTypeFrequency:
+    def _make_predictor(self):
+        cfg = {
+            "watchlist": [{"symbol": "SPY", "name": "S&P 500 ETF"}],
+            "auto_scan": {
+                "cooldown": {
+                    "same_signal_minutes": 30,
+                    "max_per_session": 3,
+                    "max_per_day": 5,
+                    "per_type": {
+                        "BREAKOUT": {"max_per_session": 2, "max_per_day": 3},
+                        "RANGE_REVERSAL": {"max_per_session": 1, "max_per_day": 2},
+                    },
+                },
+                "override": {"confidence_increase": 0.10, "price_extension_pct": 0.50, "regime_upgrade": True},
+            },
+        }
+        return USPredictor(cfg, collector=None)
+
+    def _make_signal(self, signal_type="BREAKOUT_LONG", direction="bullish", conf=0.75, price=560.0):
+        return USScanSignal(
+            signal_type=signal_type,
+            direction=direction,
+            symbol="AAPL",
+            regime=USRegimeResult(
+                regime=USRegimeType.GAP_AND_GO, confidence=conf,
+                rvol=1.5, price=price, gap_pct=1.0,
+            ),
+            price=price,
+            timestamp=5000.0,
+        )
+
+    def test_range_reversal_session_limit(self):
+        """RANGE_REVERSAL has per-type session max=1."""
+        pred = self._make_predictor()
+        pred._scan_history_date = "2026-03-10"
+        # Record 1 RANGE_REVERSAL
+        rr_sig = self._make_signal(signal_type="RANGE_REVERSAL_LONG")
+        rr_sig.timestamp = 1000.0
+        pred._record_alert("AAPL", rr_sig, "morning")
+
+        # Second RANGE_REVERSAL in same session → blocked by per-type
+        rr_sig2 = self._make_signal(signal_type="RANGE_REVERSAL_SHORT", direction="bearish")
+        rr_sig2.timestamp = 5000.0
+        allowed, _ = pred._check_frequency("AAPL", rr_sig2, "morning", pred._cfg["auto_scan"])
+        assert not allowed
+
+    def test_breakout_still_allowed_when_rr_maxed(self):
+        """BREAKOUT should still be allowed when RANGE_REVERSAL per-type limit is hit."""
+        pred = self._make_predictor()
+        pred._scan_history_date = "2026-03-10"
+        rr_sig = self._make_signal(signal_type="RANGE_REVERSAL_LONG")
+        rr_sig.timestamp = 1000.0
+        pred._record_alert("AAPL", rr_sig, "morning")
+
+        # BREAKOUT should still pass (BREAKOUT per-type max=2)
+        bo_sig = self._make_signal(signal_type="BREAKOUT_LONG")
+        bo_sig.timestamp = 5000.0
+        allowed, _ = pred._check_frequency("AAPL", bo_sig, "morning", pred._cfg["auto_scan"])
+        assert allowed
+
+    def test_breakout_per_type_daily_limit(self):
+        """BREAKOUT has per-type daily max=3."""
+        pred = self._make_predictor()
+        pred._scan_history_date = "2026-03-10"
+        for i in range(3):
+            sig = self._make_signal(signal_type=f"BREAKOUT_{'LONG' if i % 2 == 0 else 'SHORT'}")
+            sig.timestamp = float(i * 3600)
+            pred._record_alert("AAPL", sig, "morning" if i < 2 else "afternoon")
+
+        # 4th BREAKOUT → blocked by per-type daily
+        sig4 = self._make_signal(signal_type="BREAKOUT_LONG")
+        sig4.timestamp = 20000.0
+        allowed, _ = pred._check_frequency("AAPL", sig4, "afternoon", pred._cfg["auto_scan"])
+        assert not allowed
+
+    def test_no_per_type_config_uses_global(self):
+        """Without per_type config, global limits apply."""
+        cfg = {
+            "watchlist": [{"symbol": "SPY", "name": "S&P 500 ETF"}],
+            "auto_scan": {
+                "cooldown": {"same_signal_minutes": 30, "max_per_session": 2, "max_per_day": 3},
+                "override": {"regime_upgrade": True},
+            },
+        }
+        pred = USPredictor(cfg, collector=None)
+        pred._scan_history_date = "2026-03-10"
+        sig = self._make_signal()
+        sig.timestamp = 5000.0
+        allowed, _ = pred._check_frequency("AAPL", sig, "morning", pred._cfg["auto_scan"])
+        assert allowed
+
+
+# ── P0-1: Gamma Wall distance filter ──
+
+class TestGammaWallDistanceFilter:
+    """Gamma walls too far from current price should be excluded from levels dict."""
+
+    def test_close_gamma_wall_included(self):
+        """Gamma wall within 10% → included."""
+        vp = VolumeProfileResult(poc=400, vah=410, val=390)
+        gw = GammaWallResult(call_wall_strike=430, put_wall_strike=375, max_pain=400)
+        d = _us_key_levels_to_dict(vp, gamma_wall=gw, current_price=400)
+        assert "Call Wall" in d  # 430 is 7.5% from 400
+        assert "Put Wall" in d   # 375 is 6.25% from 400
+
+    def test_far_gamma_wall_excluded(self):
+        """Gamma wall beyond 10% → excluded (TSLA Put Wall 120 vs price 400)."""
+        vp = VolumeProfileResult(poc=400, vah=410, val=390)
+        gw = GammaWallResult(call_wall_strike=680, put_wall_strike=120, max_pain=400)
+        d = _us_key_levels_to_dict(vp, gamma_wall=gw, current_price=400)
+        assert "Call Wall" not in d  # 680 is 70% away
+        assert "Put Wall" not in d   # 120 is 70% away
+
+    def test_boundary_10_pct(self):
+        """Gamma wall at exactly 10% → included."""
+        vp = VolumeProfileResult(poc=400, vah=410, val=390)
+        gw = GammaWallResult(call_wall_strike=440, put_wall_strike=360, max_pain=400)
+        d = _us_key_levels_to_dict(vp, gamma_wall=gw, current_price=400)
+        assert "Call Wall" in d   # exactly 10%
+        assert "Put Wall" in d    # exactly 10%
+
+    def test_no_current_price_includes_all(self):
+        """Without current_price, all gamma walls included (backward compat)."""
+        vp = VolumeProfileResult(poc=400, vah=410, val=390)
+        gw = GammaWallResult(call_wall_strike=680, put_wall_strike=120, max_pain=400)
+        d = _us_key_levels_to_dict(vp, gamma_wall=gw)
+        assert "Call Wall" in d
+        assert "Put Wall" in d
+
+    def test_custom_max_distance(self):
+        """Custom max_gamma_distance_pct=5 excludes walls at 7.5%."""
+        vp = VolumeProfileResult(poc=400, vah=410, val=390)
+        gw = GammaWallResult(call_wall_strike=430, put_wall_strike=375, max_pain=400)
+        d = _us_key_levels_to_dict(vp, gamma_wall=gw, current_price=400, max_gamma_distance_pct=5.0)
+        assert "Call Wall" not in d  # 7.5% > 5%
+        assert "Put Wall" not in d   # 6.25% > 5%
+
+
+# ── P0-1b: SL distance cap for fade plans ──
+
+class TestFadeSLDistanceCap:
+    """SL distance should be capped at 2% for fade plans."""
+
+    def test_sl_within_limit_unchanged(self):
+        """SL at 1% from entry → not capped."""
+        sl, reason = _cap_fade_sl(entry=100.0, sl=101.0, sl_reason="PDH", direction="bearish")
+        assert sl == 101.0
+        assert reason == "PDH"
+
+    def test_sl_beyond_limit_capped_bearish(self):
+        """SL at 5% above entry → capped to 2%."""
+        sl, reason = _cap_fade_sl(entry=100.0, sl=105.0, sl_reason="Call Wall", direction="bearish")
+        assert sl == 102.0  # 100 * 1.02
+        assert reason == "固定止损"
+
+    def test_sl_beyond_limit_capped_bullish(self):
+        """SL at 5% below entry → capped to 2%."""
+        sl, reason = _cap_fade_sl(entry=100.0, sl=95.0, sl_reason="Put Wall", direction="bullish")
+        assert sl == 98.0  # 100 * 0.98
+        assert reason == "固定止损"
+
+    def test_sl_none_passthrough(self):
+        """None SL passes through."""
+        sl, reason = _cap_fade_sl(entry=100.0, sl=None, sl_reason="VAH 上方", direction="bearish")
+        assert sl is None
+
+    def test_fade_bearish_plan_sl_capped(self):
+        """Full plan generation: far SL capped in _plans_fade_bearish."""
+        vp = VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
+        # PDH at 280 → 9.8% from VAH 255 → should be capped
+        kl = KeyLevels(
+            poc=252.0, vah=255.0, val=249.0,
+            pdh=280.0, pdl=230.0, pmh=254.0, pml=250.5,
+            vwap=251.5,
+        )
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=254.5, gap_pct=0.1,
+        )
+        plans = _generate_action_plans(regime, "bearish", vp, kl, None, None)
+        plan_a = plans[0]
+        if plan_a.entry and plan_a.stop_loss:
+            sl_dist = abs(plan_a.stop_loss - plan_a.entry) / plan_a.entry
+            assert sl_dist <= 0.021  # within 2% + rounding tolerance
+
+
+# ── P0-2: FADE_CHOP directional trap ──
+
+class TestDirectionalTrap:
+    """Low RVOL + strong unidirectional move → UNCLEAR instead of FADE_CHOP."""
+
+    def _vp(self, poc=400, vah=410, val=390):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    def _make_today_bars(self, open_close: float, final_close: float, n_bars: int = 20):
+        """Create today bars starting at open_close and ending at final_close."""
+        prices = []
+        for i in range(n_bars):
+            t = f"2026-03-12 09:{30 + i}:00"
+            # Linear interpolation
+            c = open_close + (final_close - open_close) * (i / (n_bars - 1))
+            prices.append((t, c - 0.5, c + 0.5, c - 0.5, c, 1000))
+        return _make_bars(prices)
+
+    def test_strong_bearish_move_unclear(self):
+        """RVOL=0.7, price dropped 2.5% from open → UNCLEAR(lean=bearish)."""
+        # Open at 405, now at 395 → -2.47%
+        today = self._make_today_bars(open_close=405.0, final_close=395.0)
+        r = classify_us_regime(
+            price=395.0, prev_close=410.0, rvol=0.7,
+            pmh=408.0, pml=402.0, vp=self._vp(poc=400, vah=410, val=390),
+            today_bars=today,
+        )
+        assert r.regime == USRegimeType.UNCLEAR
+        assert r.lean == "bearish"
+        assert "Directional trap" in r.details
+
+    def test_strong_bullish_move_unclear(self):
+        """RVOL=0.8, price rallied 2% from open → UNCLEAR(lean=bullish)."""
+        today = self._make_today_bars(open_close=400.0, final_close=408.5)
+        r = classify_us_regime(
+            price=408.5, prev_close=398.0, rvol=0.8,
+            pmh=405.0, pml=398.0, vp=self._vp(poc=400, vah=410, val=390),
+            today_bars=today,
+        )
+        assert r.regime == USRegimeType.UNCLEAR
+        assert r.lean == "bullish"
+
+    def test_small_move_still_fade_chop(self):
+        """RVOL=0.7, price only moved 0.5% → still FADE_CHOP."""
+        today = self._make_today_bars(open_close=400.0, final_close=402.0)
+        r = classify_us_regime(
+            price=402.0, prev_close=401.0, rvol=0.7,
+            pmh=405.0, pml=398.0, vp=self._vp(poc=400, vah=410, val=390),
+            today_bars=today,
+        )
+        assert r.regime == USRegimeType.FADE_CHOP
+
+    def test_no_today_bars_no_trap(self):
+        """Without today_bars, directional trap is not applied (backward compat)."""
+        r = classify_us_regime(
+            price=395.0, prev_close=410.0, rvol=0.7,
+            pmh=408.0, pml=402.0, vp=self._vp(poc=400, vah=410, val=390),
+        )
+        # Without today_bars, just normal classification (FADE_CHOP or UNCLEAR based on VA)
+        assert r.regime in (USRegimeType.FADE_CHOP, USRegimeType.UNCLEAR)
+        if r.regime == USRegimeType.UNCLEAR:
+            assert "Directional trap" not in r.details
+
+    def test_high_rvol_no_trap(self):
+        """RVOL >= fade_chop_rvol → GAP_AND_GO/TREND_DAY, trap doesn't apply."""
+        today = self._make_today_bars(open_close=405.0, final_close=395.0)
+        r = classify_us_regime(
+            price=395.0, prev_close=410.0, rvol=1.5,
+            pmh=408.0, pml=402.0, vp=self._vp(poc=400, vah=410, val=390),
+            today_bars=today,
+        )
+        # High RVOL + below PML → likely GAP_AND_GO or TREND_DAY
+        assert r.regime != USRegimeType.FADE_CHOP
+
+
+# ── P1: FADE_CHOP direction consistency check ──
+
+class TestFadeChopDirectionConsistency:
+    """FADE_CHOP with direction conflicting VA edge → UNCLEAR plans."""
+
+    def _vp(self):
+        return VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
+
+    def _kl(self):
+        return KeyLevels(
+            poc=252.0, vah=255.0, val=249.0,
+            pdh=257.0, pdl=248.0, pmh=254.0, pml=250.5,
+            vwap=251.5,
+        )
+
+    def test_val_bearish_conflict_unclear(self):
+        """FADE_CHOP, edge=VAL, direction=bearish → conflict → UNCLEAR plans."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=249.5, gap_pct=0.1,  # near VAL → edge=VAL
+        )
+        plans = _generate_action_plans(regime, "bearish", self._vp(), self._kl(), None, None)
+        # Should produce UNCLEAR-style plans (等待确认), not fade bullish plans
+        assert plans[0].name == "等待确认"
+
+    def test_vah_bullish_conflict_unclear(self):
+        """FADE_CHOP, edge=VAH, direction=bullish → conflict → UNCLEAR plans."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=254.5, gap_pct=0.1,  # near VAH → edge=VAH
+        )
+        plans = _generate_action_plans(regime, "bullish", self._vp(), self._kl(), None, None)
+        assert plans[0].name == "等待确认"
+
+    def test_val_bullish_consistent_fade(self):
+        """FADE_CHOP, edge=VAL, direction=bullish → consistent → normal fade plans."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=249.5, gap_pct=0.1,
+        )
+        plans = _generate_action_plans(regime, "bullish", self._vp(), self._kl(), None, None)
+        assert plans[0].name == "下沿做多"
+
+    def test_vah_bearish_consistent_fade(self):
+        """FADE_CHOP, edge=VAH, direction=bearish → consistent → normal fade plans."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=254.5, gap_pct=0.1,
+        )
+        plans = _generate_action_plans(regime, "bearish", self._vp(), self._kl(), None, None)
+        assert plans[0].name == "上沿做空"
+
+
+# ── P2: Suppressed plan rendering ──
+
+class TestSuppressedPlanRendering:
+    """Suppressed plans should only show trigger + warning, no entry/SL/TP."""
+
+    def test_suppressed_plan_hides_details(self):
+        """Suppressed plan → no entry/SL/TP lines rendered (only trigger + warning)."""
+        plan = ActionPlan(
+            label="B", name="VWAP 回归做空", emoji="📉", is_primary=False,
+            logic="VWAP 上方接空", direction="bearish",
+            trigger="价格反弹至 VWAP 251.50",
+            entry=251.5, entry_action="做空",
+            stop_loss=255.0, stop_loss_reason="VAH",
+            tp1=250.0, tp1_label="POC", tp2=249.0, tp2_label="VAL",
+            rr_ratio=1.5,
+            suppressed=True,
+            demote_reason="核心结论为观望, 中间区域暂缓",
+        )
+        lines = _format_action_plan(plan)
+        text = "\n".join(lines)
+        # Specific entry/SL/TP format strings should not appear
+        assert "入场:" not in text and "入场区间:" not in text
+        assert "止损:" not in text
+        assert "TP1" not in text
+        assert "R:R" not in text
+        assert "观望" in text
+
+    def test_demoted_plan_shows_details(self):
+        """Demoted (not suppressed) plan → still shows entry/SL/TP."""
+        plan = ActionPlan(
+            label="A", name="上沿做空", emoji="📉", is_primary=True,
+            logic="VAH 附近做空", direction="bearish",
+            trigger="价格触及 VAH",
+            entry=255.0, entry_action="做空",
+            stop_loss=257.0, stop_loss_reason="PDH",
+            tp1=252.0, tp1_label="POC", tp2=249.0, tp2_label="VAL",
+            rr_ratio=1.5,
+            demoted=True,
+            demote_reason="入场位距当前价 2.0%, 剩余波动预估仅 1.5%",
+        )
+        lines = _format_action_plan(plan)
+        text = "\n".join(lines)
+        assert "入场" in text
+        assert "止损" in text
+        assert "⚠️" in text

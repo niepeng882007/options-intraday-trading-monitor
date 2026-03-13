@@ -360,8 +360,15 @@ def _us_key_levels_to_dict(
     vp: VolumeProfileResult,
     kl: KeyLevels | None = None,
     gamma_wall: GammaWallResult | None = None,
+    current_price: float = 0.0,
+    max_gamma_distance_pct: float = 10.0,
 ) -> dict[str, float]:
-    """Convert US-specific VP/KeyLevels/GammaWall types to a flat dict."""
+    """Convert US-specific VP/KeyLevels/GammaWall types to a flat dict.
+
+    Gamma wall strikes farther than *max_gamma_distance_pct* % from
+    *current_price* are excluded — they cannot serve as meaningful
+    intraday SL/TP targets and would produce extreme R:R values.
+    """
     d: dict[str, float] = {}
     if vp.poc > 0:
         d["POC"] = vp.poc
@@ -380,7 +387,17 @@ def _us_key_levels_to_dict(
             d["PMH"] = kl.pmh
         if kl.pml > 0:
             d["PML"] = kl.pml
-    if gamma_wall:
+    if gamma_wall and current_price > 0:
+        if gamma_wall.call_wall_strike > 0:
+            dist = abs(gamma_wall.call_wall_strike - current_price) / current_price * 100
+            if dist <= max_gamma_distance_pct:
+                d["Call Wall"] = gamma_wall.call_wall_strike
+        if gamma_wall.put_wall_strike > 0:
+            dist = abs(current_price - gamma_wall.put_wall_strike) / current_price * 100
+            if dist <= max_gamma_distance_pct:
+                d["Put Wall"] = gamma_wall.put_wall_strike
+    elif gamma_wall:
+        # No current_price → include both (backward compat)
         if gamma_wall.call_wall_strike > 0:
             d["Call Wall"] = gamma_wall.call_wall_strike
         if gamma_wall.put_wall_strike > 0:
@@ -397,7 +414,7 @@ def _nearest_levels(
     n: int = 2,
 ) -> list[tuple[str, float]]:
     """Find nearest key levels above/below current price (wrapper)."""
-    levels = _us_key_levels_to_dict(vp, kl, gamma_wall)
+    levels = _us_key_levels_to_dict(vp, kl, gamma_wall, current_price=price)
     return _nearest_levels_common(price, side, levels, n)
 
 
@@ -406,9 +423,10 @@ def _find_fade_entry_zone(
     opposite_edge: float,
     kl: KeyLevels,
     gamma_wall: GammaWallResult | None,
+    current_price: float = 0.0,
 ) -> tuple[str, float] | None:
     """Find the nearest structural level within the VA upper/lower third (wrapper)."""
-    levels = _us_key_levels_to_dict(VolumeProfileResult(0, 0, 0), kl, gamma_wall)
+    levels = _us_key_levels_to_dict(VolumeProfileResult(0, 0, 0), kl, gamma_wall, current_price=current_price)
     return _find_fade_entry_zone_common(va_edge, opposite_edge, levels)
 
 
@@ -842,9 +860,10 @@ def _cap_tp1(
     plan: ActionPlan, ctx: PlanContext,
     vp: VolumeProfileResult, kl: KeyLevels,
     gamma_wall: GammaWallResult | None,
+    current_price: float = 0.0,
 ) -> ActionPlan:
     """Cap TP1 to reachable range (wrapper)."""
-    levels = _us_key_levels_to_dict(vp, kl, gamma_wall)
+    levels = _us_key_levels_to_dict(vp, kl, gamma_wall, current_price=current_price)
     return _cap_tp1_common(plan, ctx, levels)
 
 
@@ -852,9 +871,10 @@ def _cap_tp2(
     plan: ActionPlan, ctx: PlanContext,
     vp: VolumeProfileResult, kl: KeyLevels,
     gamma_wall: GammaWallResult | None,
+    current_price: float = 0.0,
 ) -> ActionPlan:
     """Cap TP2 to reachable range (wrapper)."""
-    levels = _us_key_levels_to_dict(vp, kl, gamma_wall)
+    levels = _us_key_levels_to_dict(vp, kl, gamma_wall, current_price=current_price)
     return _cap_tp2_common(plan, ctx, levels)
 
 
@@ -878,7 +898,17 @@ def _generate_action_plans(
             plans = _plans_trend_bearish(price, vp, kl, gamma_wall, option_line)
     elif regime.regime == USRegimeType.FADE_CHOP:
         edge, _ = _closest_value_area_edge(price, vp)
-        if edge == "VAH":
+        # P1: direction consistency check — if direction conflicts with VA edge,
+        # fall through to UNCLEAR plans instead of generating contradictory fade plans.
+        # e.g., edge=VAL + direction=bearish means "price near support but trending down"
+        #       → fade long would fight the trend, so go to UNCLEAR instead.
+        direction_conflicts = (
+            (edge == "VAL" and direction == "bearish")
+            or (edge == "VAH" and direction == "bullish")
+        )
+        if direction_conflicts:
+            plans = _plans_unclear(price, vp, kl, gamma_wall, regime, option_line)
+        elif edge == "VAH":
             plans = _plans_fade_bearish(price, vp, kl, gamma_wall, option_line)
         else:
             plans = _plans_fade_bullish(price, vp, kl, gamma_wall, option_line)
@@ -888,8 +918,8 @@ def _generate_action_plans(
 
     # 后处理（仅当有 ctx 时执行）
     if ctx:
-        plans = [_cap_tp1(p, ctx, vp, kl, gamma_wall) for p in plans]
-        plans = [_cap_tp2(p, ctx, vp, kl, gamma_wall) for p in plans]
+        plans = [_cap_tp1(p, ctx, vp, kl, gamma_wall, current_price=price) for p in plans]
+        plans = [_cap_tp2(p, ctx, vp, kl, gamma_wall, current_price=price) for p in plans]
         plans = [_check_entry_reachability(p, price, ctx) for p in plans]
         plans = _apply_vwap_deviation_warning_common(plans, price, kl.vwap)
         plans = _apply_wait_coherence(plans, ctx)
@@ -1012,6 +1042,23 @@ def _plans_trend_bearish(
     return [plan_a, plan_b, plan_c]
 
 
+_FADE_MAX_SL_DISTANCE_PCT = 0.02  # 2% — max SL distance for fade plans
+
+
+def _cap_fade_sl(entry: float, sl: float | None, sl_reason: str, direction: str) -> tuple[float | None, str]:
+    """Cap SL distance for fade plans to _FADE_MAX_SL_DISTANCE_PCT."""
+    if sl is None or entry <= 0:
+        return sl, sl_reason
+    dist = abs(sl - entry) / entry
+    if dist > _FADE_MAX_SL_DISTANCE_PCT:
+        if direction == "bearish":
+            capped = round(entry * (1 + _FADE_MAX_SL_DISTANCE_PCT), 2)
+        else:
+            capped = round(entry * (1 - _FADE_MAX_SL_DISTANCE_PCT), 2)
+        return capped, "固定止损"
+    return sl, sl_reason
+
+
 def _plans_fade_bearish(
     price: float, vp: VolumeProfileResult, kl: KeyLevels,
     gamma_wall: GammaWallResult | None, option_line: str | None,
@@ -1020,7 +1067,12 @@ def _plans_fade_bearish(
     above = _nearest_levels(vp.vah, "above", vp, kl, gamma_wall, n=1)
     sl_a = above[0] if above else None
 
-    zone = _find_fade_entry_zone(vp.vah, vp.val, kl, gamma_wall)
+    zone = _find_fade_entry_zone(vp.vah, vp.val, kl, gamma_wall, current_price=price)
+
+    # P0-1b: Cap SL distance for fade plans
+    raw_sl = sl_a[1] if sl_a else None
+    raw_sl_reason = sl_a[0] if sl_a else "VAH 上方"
+    capped_sl, capped_sl_reason = _cap_fade_sl(vp.vah, raw_sl, raw_sl_reason, "bearish")
 
     plan_a = ActionPlan(
         label="A", name="上沿做空", emoji="📉", is_primary=True,
@@ -1032,11 +1084,11 @@ def _plans_fade_bearish(
         entry=vp.vah, entry_action="做空",
         entry_zone_price=zone[1] if zone else None,
         entry_zone_label=zone[0] if zone else "",
-        stop_loss=sl_a[1] if sl_a else None,
-        stop_loss_reason=sl_a[0] if sl_a else "VAH 上方",
+        stop_loss=capped_sl,
+        stop_loss_reason=capped_sl_reason,
         tp1=vp.poc, tp1_label="POC",
         tp2=vp.val, tp2_label="VAL",
-        rr_ratio=_calculate_rr(vp.vah, sl_a[1] if sl_a else None, vp.poc),
+        rr_ratio=_calculate_rr(vp.vah, capped_sl, vp.poc),
         option_line=option_line,
     )
 
@@ -1081,7 +1133,12 @@ def _plans_fade_bullish(
     below = _nearest_levels(vp.val, "below", vp, kl, gamma_wall, n=1)
     sl_a = below[0] if below else None
 
-    zone = _find_fade_entry_zone(vp.val, vp.vah, kl, gamma_wall)
+    zone = _find_fade_entry_zone(vp.val, vp.vah, kl, gamma_wall, current_price=price)
+
+    # P0-1b: Cap SL distance for fade plans
+    raw_sl = sl_a[1] if sl_a else None
+    raw_sl_reason = sl_a[0] if sl_a else "VAL 下方"
+    capped_sl, capped_sl_reason = _cap_fade_sl(vp.val, raw_sl, raw_sl_reason, "bullish")
 
     plan_a = ActionPlan(
         label="A", name="下沿做多", emoji="📈", is_primary=True,
@@ -1093,11 +1150,11 @@ def _plans_fade_bullish(
         entry=vp.val, entry_action="做多",
         entry_zone_price=zone[1] if zone else None,
         entry_zone_label=zone[0] if zone else "",
-        stop_loss=sl_a[1] if sl_a else None,
-        stop_loss_reason=sl_a[0] if sl_a else "VAL 下方",
+        stop_loss=capped_sl,
+        stop_loss_reason=capped_sl_reason,
         tp1=vp.poc, tp1_label="POC",
         tp2=vp.vah, tp2_label="VAH",
-        rr_ratio=_calculate_rr(vp.val, sl_a[1] if sl_a else None, vp.poc),
+        rr_ratio=_calculate_rr(vp.val, capped_sl, vp.poc),
         option_line=option_line,
     )
 
@@ -1137,20 +1194,37 @@ def _plans_fade_bullish(
 def _make_unclear_fade_plan(
     lean: str, vp: VolumeProfileResult, kl: KeyLevels,
     gamma_wall: GammaWallResult | None, option_line: str | None,
-) -> ActionPlan:
+) -> ActionPlan | None:
     """Build a mean-reversion fade plan for UNCLEAR + low RVOL + directional lean.
 
     Uses single-point entry at VWAP (no entry_zone) with nearest VA edge as TP1
     and nearest structural level as SL.  This avoids the wide entry_zone problem
     that occurs when VWAP is far from structure.
+
+    Returns None when VWAP is too close to the target VA edge (< 0.15%),
+    making the fade unprofitable after spread costs.
     """
+    _MIN_FADE_REWARD_PCT = 0.0015  # 0.15% — min distance between entry and TP1
+    _MAX_SL_DISTANCE_PCT = 0.01   # 1.0% — cap SL distance for low-vol fade
+    _MIN_FADE_RR = 0.8            # min R:R for fade to be actionable
+
     if lean == "bearish":
         # Price above VA → fade short back to VA edge
         tp1_price = vp.vah if vp.vah > 0 else vp.poc
         tp1_label = "VAH" if vp.vah > 0 else "POC"
+        # Guard: VWAP too close to target → fade unprofitable
+        if kl.vwap > 0 and abs(tp1_price - kl.vwap) / kl.vwap < _MIN_FADE_REWARD_PCT:
+            return None
         sl_candidates = _nearest_levels(kl.vwap, "above", vp, kl, gamma_wall, n=1)
         sl_price = sl_candidates[0][1] if sl_candidates else vp.vah
         sl_label = sl_candidates[0][0] if sl_candidates else "VAH"
+        # Cap SL distance — low-vol fade shouldn't have wide stops
+        if kl.vwap > 0 and abs(sl_price - kl.vwap) / kl.vwap > _MAX_SL_DISTANCE_PCT:
+            sl_price = round(kl.vwap * (1 + _MAX_SL_DISTANCE_PCT), 2)
+            sl_label = "固定止损"
+        # Pre-check: R:R too low → don't show misleading plan
+        if _calculate_rr(kl.vwap, sl_price, tp1_price) < _MIN_FADE_RR:
+            return None
         return ActionPlan(
             label="B", name="均值回归做空", emoji="📉", is_primary=False,
             logic="低 RVOL + UNCLEAR, 博均值回归做空",
@@ -1168,9 +1242,19 @@ def _make_unclear_fade_plan(
         # lean == "bullish", price below VA → fade long back to VA edge
         tp1_price = vp.val if vp.val > 0 else vp.poc
         tp1_label = "VAL" if vp.val > 0 else "POC"
+        # Guard: VWAP too close to target → fade unprofitable
+        if kl.vwap > 0 and abs(tp1_price - kl.vwap) / kl.vwap < _MIN_FADE_REWARD_PCT:
+            return None
         sl_candidates = _nearest_levels(kl.vwap, "below", vp, kl, gamma_wall, n=1)
         sl_price = sl_candidates[0][1] if sl_candidates else vp.val
         sl_label = sl_candidates[0][0] if sl_candidates else "VAL"
+        # Cap SL distance — low-vol fade shouldn't have wide stops
+        if kl.vwap > 0 and abs(sl_price - kl.vwap) / kl.vwap > _MAX_SL_DISTANCE_PCT:
+            sl_price = round(kl.vwap * (1 - _MAX_SL_DISTANCE_PCT), 2)
+            sl_label = "固定止损"
+        # Pre-check: R:R too low → don't show misleading plan
+        if _calculate_rr(kl.vwap, sl_price, tp1_price) < _MIN_FADE_RR:
+            return None
         return ActionPlan(
             label="B", name="均值回归做多", emoji="📈", is_primary=False,
             logic="低 RVOL + UNCLEAR, 博均值回归做多",
@@ -1233,6 +1317,8 @@ def _plans_unclear(
     if lean in ("bullish", "bearish"):
         if is_chop_likely:
             plan_b = _make_unclear_fade_plan(lean, vp, kl, gamma_wall, option_line)
+            if plan_b is None:
+                plan_b = _make_unclear_directional_plan(lean, vp, kl, option_line)
         else:
             plan_b = _make_unclear_directional_plan(lean, vp, kl, option_line)
     else:

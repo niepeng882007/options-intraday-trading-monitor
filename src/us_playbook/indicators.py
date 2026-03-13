@@ -160,6 +160,32 @@ def _fallback_profile(
     )
 
 
+def calculate_rsi(bars: pd.DataFrame, period: int = 14) -> float:
+    """Calculate RSI (Relative Strength Index) using the last ``period`` bars.
+
+    Returns 50.0 (neutral) if insufficient data.
+    """
+    if bars.empty or len(bars) < period + 1:
+        return 50.0
+
+    close = bars["Close"].astype(float)
+    delta = close.diff().iloc[1:]  # skip NaN
+    if delta.empty:
+        return 50.0
+
+    gains = delta.clip(lower=0)
+    losses = (-delta.clip(upper=0))
+
+    avg_gain = float(gains.iloc[-period:].mean())
+    avg_loss = float(losses.iloc[-period:].mean())
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+
+    rs = avg_gain / avg_loss
+    return 100.0 - 100.0 / (1.0 + rs)
+
+
 # Re-export shared VWAP for backward compatibility
 from src.common.indicators import calculate_vwap  # noqa: F401, E402
 

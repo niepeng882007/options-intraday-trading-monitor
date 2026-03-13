@@ -39,6 +39,7 @@ filters:
 gamma_wall:
   enabled: true
   use_weekly_expiry: true
+  max_distance_pct: 10        # exclude gamma walls >10% from current price in level dict
 
 auto_scan:
   enabled: true
@@ -57,10 +58,22 @@ auto_scan:
     rvol_min: 0.50
     rvol_max: 1.00
     va_proximity_pct: 0.20
+    rsi:
+      enabled: false
+      period: 14
+      overbought: 70
+      oversold: 30
   cooldown:
     same_signal_minutes: 30
     max_per_session: 2
     max_per_day: 3
+    per_type:
+      BREAKOUT:
+        max_per_session: 2
+        max_per_day: 3
+      RANGE_REVERSAL:
+        max_per_session: 1
+        max_per_day: 2
   override:
     confidence_increase: 0.10
     price_extension_pct: 0.50

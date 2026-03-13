@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pandas as pd
+
 from src.common.types import GammaWallResult, VolumeProfileResult
 from src.us_playbook import USRegimeResult, USRegimeType
 from src.us_playbook.indicators import RvolProfile
@@ -93,6 +95,7 @@ def classify_us_regime(
     gap_significance_threshold: float = 0.3,
     pm_source: str = "futu",
     open_price: float = 0.0,
+    today_bars: pd.DataFrame | None = None,
 ) -> USRegimeResult:
     """Classify US intraday regime into 4 styles.
 
@@ -194,6 +197,33 @@ def classify_us_regime(
         )
 
     # ── FADE_CHOP ──
+    # P0-2: Directional trap check — low RVOL + strong unidirectional move
+    # should NOT be classified as FADE_CHOP; route to UNCLEAR instead.
+    _directional_trap = False
+    if (
+        result is None
+        and rvol < fade_chop_rvol
+        and today_bars is not None
+        and len(today_bars) >= 15
+    ):
+        _open_bar_price = float(today_bars.iloc[0]["Close"])
+        if _open_bar_price > 0:
+            _intraday_move = abs(price - _open_bar_price) / _open_bar_price
+            if _intraday_move > 0.015:  # >1.5% unidirectional since open
+                _directional_trap = True
+                _trap_lean = "bearish" if price < _open_bar_price else "bullish"
+                result = USRegimeResult(
+                    regime=USRegimeType.UNCLEAR, confidence=0.30,
+                    rvol=rvol, price=price, gap_pct=gap_pct,
+                    spy_regime=spy_regime,
+                    adaptive_thresholds=adaptive_info,
+                    details=(
+                        f"Directional trap: RVOL {rvol:.2f} < {fade_chop_rvol:.2f} "
+                        f"but {_intraday_move:.1%} move since open"
+                    ),
+                    lean=_trap_lean,
+                )
+
     if result is None and rvol < fade_chop_rvol and (inside_va or near_gamma):
         reason = "in value area" if inside_va else "near Gamma wall"
         confidence = min(1.0, (fade_chop_rvol - rvol) / 0.3 * 0.3 + 0.5)

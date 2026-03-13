@@ -256,8 +256,13 @@ async def main() -> None:
         if scan_cfg.get("enabled", False):
             interval = scan_cfg.get("interval_seconds", 180)
 
-            async def _us_send_fn(text: str, parse_mode: str = "HTML") -> None:
+            async def _us_send_fn(text: str, parse_mode: str = "HTML", photo: bytes | None = None) -> None:
                 if app and chat_id:
+                    if photo:
+                        try:
+                            await app.bot.send_photo(chat_id=chat_id, photo=photo)
+                        except Exception:
+                            logger.warning("US auto-scan: failed to send chart photo")
                     await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
                     message_archive.log("us_playbook", "auto_scan", text, "us")
                 else:
