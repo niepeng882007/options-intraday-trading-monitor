@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from src.common.action_plan import (  # noqa: F401 — re-export for backward compat
     ActionPlan,
     PlanContext,
+    apply_gamma_wall_warning as _apply_gamma_wall_warning_common,
     apply_min_rr_gate as _apply_min_rr_gate,
     apply_vwap_deviation_warning as _apply_vwap_deviation_warning_common,
     apply_wait_coherence as _apply_wait_coherence,
@@ -45,6 +46,7 @@ from src.common.types import (
     VolumeProfileResult,
 )
 from src.us_playbook import KeyLevels, MarketTone, USPlaybookResult, USRegimeResult, USRegimeType
+from src.us_playbook.option_recommend import _decide_direction
 from src.utils.logger import setup_logger
 
 logger = setup_logger("us_playbook")
@@ -922,6 +924,7 @@ def _generate_action_plans(
         plans = [_cap_tp2(p, ctx, vp, kl, gamma_wall, current_price=price) for p in plans]
         plans = [_check_entry_reachability(p, price, ctx) for p in plans]
         plans = _apply_vwap_deviation_warning_common(plans, price, kl.vwap)
+        plans = _apply_gamma_wall_warning_common(plans, price, gamma_wall, ctx)
         plans = _apply_wait_coherence(plans, ctx)
         plans = _apply_min_rr_gate(plans, ctx)
     return plans
@@ -1472,19 +1475,26 @@ def format_us_playbook_message(
     gamma_wall = result.gamma_wall
     quote = result.quote
 
-    # Determine direction from price vs VA for emoji/strategy
-    if r.price > vp.vah:
-        _direction = "bullish"
-    elif r.price < vp.val:
-        _direction = "bearish"
-    elif vp.poc > 0:
-        _direction = "bullish" if r.price > vp.poc else "bearish"
-    else:
-        _direction = "bullish"
+    vwap = kl.vwap
+
+    # Determine direction via unified logic (structure-aware)
+    _direction = _decide_direction(
+        r, vp, vwap=vwap, pdl=kl.pdl, pdh=kl.pdh, pml=kl.pml, pmh=kl.pmh,
+    )
+    if _direction == "neutral":
+        if r.price > vp.vah:
+            _direction = "bullish"
+        elif r.price < vp.val:
+            _direction = "bearish"
+        elif vwap > 0:
+            _direction = "bullish" if r.price > vwap else "bearish"
+        elif vp.poc > 0:
+            _direction = "bullish" if r.price > vp.poc else "bearish"
+        else:
+            _direction = "bullish"
     emoji = get_regime_emoji(r.regime, _direction)
     option_market = result.option_market
     recommendation = result.option_rec
-    vwap = kl.vwap
 
     lines: list[str] = []
     sep = "━" * 20

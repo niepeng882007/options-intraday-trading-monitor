@@ -241,3 +241,130 @@ class TestSubscribeQuotes:
         args = mock_ctx.subscribe.call_args[0]
         assert len(args[0]) == 1
         assert c._subscription_count == 3
+
+
+# ── Watchdog tests ──
+
+
+class TestSafeCloseCtx:
+    def test_close_sets_none(self, collector):
+        c, mock_ctx = collector
+        assert c._ctx is not None
+        c._safe_close_ctx()
+        assert c._ctx is None
+        mock_ctx.close.assert_called_once()
+
+    def test_close_when_already_none(self, collector):
+        c, _ = collector
+        c._ctx = None
+        c._safe_close_ctx()  # should not raise
+        assert c._ctx is None
+
+    def test_close_suppresses_exception(self, collector):
+        c, mock_ctx = collector
+        mock_ctx.close.side_effect = RuntimeError("boom")
+        c._safe_close_ctx()  # should not raise
+        assert c._ctx is None
+
+
+class TestWatchdogLifecycle:
+    @pytest.mark.asyncio
+    async def test_start_stop(self, collector):
+        c, mock_ctx = collector
+        from futu import RET_OK
+        mock_ctx.get_global_state.return_value = (RET_OK, {})
+
+        await c.start_watchdog(interval=600)  # long interval, won't fire
+        assert c._watchdog_task is not None
+        assert not c._watchdog_task.done()
+
+        await c.stop_watchdog()
+        assert c._watchdog_task is None
+
+    @pytest.mark.asyncio
+    async def test_start_is_idempotent(self, collector):
+        c, _ = collector
+        await c.start_watchdog(interval=600)
+        task1 = c._watchdog_task
+        await c.start_watchdog(interval=600)
+        assert c._watchdog_task is task1  # same task, not replaced
+        await c.stop_watchdog()
+
+    @pytest.mark.asyncio
+    async def test_stop_when_not_started(self, collector):
+        c, _ = collector
+        await c.stop_watchdog()  # should not raise
+
+
+class TestWatchdogProbe:
+    @pytest.mark.asyncio
+    async def test_healthy_probe_updates_timestamp(self, collector):
+        c, mock_ctx = collector
+        from futu import RET_OK
+        mock_ctx.get_global_state.return_value = (RET_OK, {})
+
+        old_ts = c._last_ok_ts
+        # Run one iteration manually via the internal loop
+        await c.start_watchdog(interval=1)
+        await asyncio.sleep(1.5)  # let one probe fire
+        await c.stop_watchdog()
+
+        assert c._healthy is True
+        assert c._last_ok_ts > old_ts
+
+    @pytest.mark.asyncio
+    async def test_failed_probe_recycles_ctx(self, collector):
+        c, mock_ctx = collector
+        from futu import RET_ERROR
+        mock_ctx.get_global_state.return_value = (RET_ERROR, "dead")
+
+        await c.start_watchdog(interval=1)
+        await asyncio.sleep(1.5)
+        await c.stop_watchdog()
+
+        assert c._healthy is False
+        assert c._ctx is None  # recycled
+
+    @pytest.mark.asyncio
+    async def test_close_stops_watchdog(self, collector):
+        c, mock_ctx = collector
+        from futu import RET_OK
+        mock_ctx.get_global_state.return_value = (RET_OK, {})
+        mock_ctx.close.return_value = None
+
+        await c.start_watchdog(interval=600)
+        assert c._watchdog_task is not None
+        await c.close()
+        assert c._watchdog_task is None
+
+
+class TestRetryUpdatesLastOk:
+    @pytest.mark.asyncio
+    async def test_successful_retry_updates_ts(self, collector):
+        c, mock_ctx = collector
+        from futu import RET_OK
+        mock_ctx.get_stock_quote.return_value = (RET_OK, _make_quote_df("US.SPY", 500.0))
+
+        old_ts = c._last_ok_ts
+        await c.get_stock_quote("SPY")
+        assert c._last_ok_ts > old_ts
+
+
+class TestRunSyncSafeClose:
+    @pytest.mark.asyncio
+    async def test_timeout_calls_safe_close(self, collector):
+        c, mock_ctx = collector
+        import src.collector.futu as futu_mod
+
+        def blocking():
+            import time as t
+            t.sleep(5)
+
+        original_timeout = futu_mod.CALL_TIMEOUT_SECONDS
+        futu_mod.CALL_TIMEOUT_SECONDS = 0.1
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await c._run_sync(blocking)
+            assert c._ctx is None
+        finally:
+            futu_mod.CALL_TIMEOUT_SECONDS = original_timeout

@@ -363,6 +363,83 @@ def cap_tp1(
     return plan
 
 
+def apply_gamma_wall_warning(
+    plans: list[ActionPlan],
+    price: float,
+    gamma_wall: object | None,
+    ctx: PlanContext,
+    *,
+    max_pain_adr_ratio: float = 0.5,
+    wall_proximity_adr_ratio: float = 0.3,
+) -> list[ActionPlan]:
+    """Warn or demote when gamma wall structure conflicts with plan direction.
+
+    Thresholds are adaptive: ADR * ratio.  Falls back to fixed 1.0% / 1.5%
+    when ADR is unavailable (ctx.avg_daily_range_pct == 0).
+    """
+    if gamma_wall is None or price <= 0:
+        return plans
+
+    max_pain = getattr(gamma_wall, "max_pain", 0.0)
+    call_wall = getattr(gamma_wall, "call_wall_strike", 0.0)
+    put_wall = getattr(gamma_wall, "put_wall_strike", 0.0)
+
+    if max_pain <= 0 and call_wall <= 0 and put_wall <= 0:
+        return plans
+
+    adr = ctx.avg_daily_range_pct
+    if adr > 0:
+        warn_thr = adr * max_pain_adr_ratio      # MaxPain deviation %
+        prox_thr = adr * wall_proximity_adr_ratio  # wall proximity %
+    else:
+        warn_thr = 1.0
+        prox_thr = 1.5
+
+    for plan in plans:
+        if plan.label == "C" or plan.entry is None:
+            continue
+
+        warnings: list[str] = []
+
+        if plan.direction == "bullish":
+            # MaxPain below price → gravitational pull down
+            if max_pain > 0:
+                mp_dev = (price - max_pain) / price * 100
+                if mp_dev > warn_thr:
+                    warnings.append(f"MaxPain({max_pain:,.1f})低于现价 {mp_dev:.1f}%, 期权引力偏空")
+            # Call wall close above → resistance cap
+            if call_wall > 0:
+                cw_dist = (call_wall - price) / price * 100
+                if 0 < cw_dist < prox_thr:
+                    warnings.append(f"Call Wall({call_wall:,.1f})近在 {cw_dist:.1f}%, 上方压制")
+            # Put wall above price → structure hostile
+            if put_wall > 0 and put_wall > price:
+                plan.demoted = True
+                plan.demote_reason = plan.demote_reason or "期权结构不支持做多 (Put Wall 高于现价)"
+
+        elif plan.direction == "bearish":
+            # MaxPain above price → gravitational pull up
+            if max_pain > 0:
+                mp_dev = (max_pain - price) / price * 100
+                if mp_dev > warn_thr:
+                    warnings.append(f"MaxPain({max_pain:,.1f})高于现价 {mp_dev:.1f}%, 期权引力偏多")
+            # Put wall close below → support cushion
+            if put_wall > 0:
+                pw_dist = (price - put_wall) / price * 100
+                if 0 < pw_dist < prox_thr:
+                    warnings.append(f"Put Wall({put_wall:,.1f})近在 {pw_dist:.1f}%, 下方承接")
+            # Call wall below price → structure hostile
+            if call_wall > 0 and call_wall < price:
+                plan.demoted = True
+                plan.demote_reason = plan.demote_reason or "期权结构不支持做空 (Call Wall 低于现价)"
+
+        if warnings:
+            new_warning = "; ".join(warnings)
+            plan.warning = f"{plan.warning}; {new_warning}" if plan.warning else new_warning
+
+    return plans
+
+
 def apply_vwap_deviation_warning(
     plans: list[ActionPlan],
     price: float,

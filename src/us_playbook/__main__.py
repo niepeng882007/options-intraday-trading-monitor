@@ -111,6 +111,7 @@ async def main() -> None:
         port=futu_cfg.get("port", 11111),
     )
     await collector.connect()
+    await collector.start_watchdog()
 
     predictor = USPredictor(cfg, collector)
 

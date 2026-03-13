@@ -29,9 +29,12 @@ BACKOFF_BASE_SECONDS = 1
 BACKOFF_MAX_SECONDS = 60
 MAX_RETRIES = 3
 CALL_TIMEOUT_SECONDS = 30
+WATCHDOG_PROBE_TIMEOUT = 5
 
 # Futu protocol requires serial access — use a single-thread pool.
 _thread_pool = ThreadPoolExecutor(max_workers=1)
+# Independent watchdog pool — never blocked by a hung API call on _thread_pool.
+_watchdog_pool = ThreadPoolExecutor(max_workers=1)
 
 ET = timezone(timedelta(hours=-5))
 
@@ -115,6 +118,9 @@ class FutuCollector(BaseCollector):
         self._ctx: OpenQuoteContext | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._quote_cache: dict[str, StockQuote] = {}
+        self._watchdog_task: asyncio.Task | None = None
+        self._healthy = True
+        self._last_ok_ts: float = 0.0
 
     # ── Lifecycle ──
 
@@ -124,6 +130,7 @@ class FutuCollector(BaseCollector):
         logger.info("Connected to FutuOpenD at %s:%d", self._host, self._port)
 
     async def close(self) -> None:
+        await self.stop_watchdog()
         if self._ctx is not None:
             await self._run_sync(self._ctx.close)
             self._ctx = None
@@ -139,6 +146,56 @@ class FutuCollector(BaseCollector):
         if ret != RET_OK:
             raise RuntimeError(f"Futu health check failed: {data}")
         return data
+
+    def _safe_close_ctx(self) -> None:
+        """Close the current context and release the TCP socket."""
+        if self._ctx is not None:
+            try:
+                self._ctx.close()
+            except Exception:
+                pass
+            self._ctx = None
+
+    # ── Watchdog ──
+
+    async def start_watchdog(self, interval: int = 30) -> None:
+        """Launch a background task that probes FutuOpenD every *interval* seconds."""
+        if self._watchdog_task is not None:
+            return
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop(interval))
+        logger.info("Watchdog started (interval=%ds)", interval)
+
+    async def stop_watchdog(self) -> None:
+        """Cancel the watchdog task."""
+        task = self._watchdog_task
+        if task is not None:
+            self._watchdog_task = None
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Watchdog stopped")
+
+    async def _watchdog_loop(self, interval: int) -> None:
+        was_healthy = True
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                loop = asyncio.get_running_loop()
+                fut = loop.run_in_executor(_watchdog_pool, self._check_connection)
+                await asyncio.wait_for(fut, timeout=WATCHDOG_PROBE_TIMEOUT)
+                self._healthy = True
+                self._last_ok_ts = time.time()
+                if not was_healthy:
+                    logger.info("Reconnected to FutuOpenD")
+                    was_healthy = True
+            except Exception as exc:
+                self._healthy = False
+                was_healthy = False
+                logger.warning("Watchdog probe failed: %s — recycling context", exc)
+                self._safe_close_ctx()
+                self._reset_thread_pool()
 
     async def get_connection_info(self) -> dict:
         """Return detailed Futu connection status."""
@@ -199,7 +256,7 @@ class FutuCollector(BaseCollector):
                 "Futu call timed out after %ds, resetting thread pool",
                 CALL_TIMEOUT_SECONDS,
             )
-            self._ctx = None
+            self._safe_close_ctx()
             self._reset_thread_pool()
             raise
 
@@ -208,7 +265,9 @@ class FutuCollector(BaseCollector):
         last_exc: Exception | None = None
         for attempt in range(retries):
             try:
-                return await self._run_sync(fn, *args)
+                result = await self._run_sync(fn, *args)
+                self._last_ok_ts = time.time()
+                return result
             except Exception as exc:
                 last_exc = exc
                 logger.warning(
@@ -218,7 +277,7 @@ class FutuCollector(BaseCollector):
                     exc,
                 )
                 if reconnect_on_fail:
-                    self._ctx = None
+                    self._safe_close_ctx()
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
         raise RuntimeError(

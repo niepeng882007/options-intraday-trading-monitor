@@ -41,6 +41,7 @@ from src.us_playbook.levels import (
     get_today_bars,
 )
 from src.us_playbook.option_recommend import (
+    _decide_direction,
     compute_local_trend,
     option_quotes_to_df,
     recommend,
@@ -322,6 +323,8 @@ class USPredictor:
             pm_source=pm_source,
             open_price=quote_snapshot.open_price,
             today_bars=today,
+            structure_trend_cfg=regime_cfg.get("structure_trend"),
+            vwap=vwap,
         )
 
         # 9a. P1-1: FADE_CHOP exec chain — independent from analysis chain
@@ -359,6 +362,7 @@ class USPredictor:
                 chase_risk_cfg=chase_risk_cfg,
                 option_cfg=option_cfg,
                 today_bars=today,
+                pdl=pdl, pdh=pdh, pml=pml, pmh=pmh,
             )
         except Exception:
             logger.warning("Option recommendation failed for %s", symbol, exc_info=True)
@@ -366,10 +370,10 @@ class USPredictor:
         # 11. Build key levels
         key_levels = build_key_levels(vp, pdh, pdl, pmh, pml, vwap, gamma_wall, pm_source=pm_source)
 
-        # 12. Strategy text (direction-aware)
-        _dir = "bullish" if price > vp.vah or (vp.poc > 0 and price > vp.poc) else "bearish"
-        if price < vp.val:
-            _dir = "bearish"
+        # 12. Strategy text (direction-aware, unified with option_recommend)
+        _dir = _decide_direction(regime, vp, vwap=vwap, pdl=pdl, pdh=pdh, pml=pml, pmh=pmh)
+        if _dir == "neutral":
+            _dir = "bearish" if price < vp.poc else "bullish"
         strategy_text = get_regime_strategy(regime.regime, _dir)
 
         name = self.watchlist.get_name(symbol)
@@ -848,6 +852,7 @@ class USPredictor:
                 min_trend_day_floor=adaptive_cfg.get("min_trend_day_floor", 1.0),
             )
 
+        l1_vwap = calculate_vwap(today)
         regime = classify_us_regime(
             price=price,
             prev_close=prev_close,
@@ -866,6 +871,8 @@ class USPredictor:
             pm_source=cached_entry.pm_source,
             open_price=snap.get("open_price", 0.0),
             today_bars=today,
+            structure_trend_cfg=regime_cfg.get("structure_trend"),
+            vwap=l1_vwap,
         )
 
         # Build L1 result for reuse in L2
@@ -1069,6 +1076,7 @@ class USPredictor:
                 min_trend_day_floor=adaptive_cfg.get("min_trend_day_floor", 1.0),
             )
 
+        transition_vwap = calculate_vwap(today)
         transitioned, new_regime = detect_regime_transition(
             original=original,
             current_rvol=rvol,
@@ -1085,6 +1093,9 @@ class USPredictor:
             gap_significance_threshold=adaptive_cfg.get("gap_significance_threshold", 0.3),
             pm_source=cached_entry.pm_source,
             open_price=snap.get("open_price", 0.0),
+            today_bars=today,
+            structure_trend_cfg=regime_cfg.get("structure_trend"),
+            vwap=transition_vwap,
         )
 
         if not transitioned or new_regime is None:
@@ -1253,6 +1264,8 @@ class USPredictor:
             pm_source=cached_entry.pm_source,
             open_price=quote_snapshot.open_price,
             today_bars=today,
+            structure_trend_cfg=regime_cfg.get("structure_trend"),
+            vwap=vwap,
         )
 
         # FADE_CHOP exec chain
@@ -1290,6 +1303,8 @@ class USPredictor:
                 chase_risk_cfg=chase_risk_cfg,
                 option_cfg=option_cfg,
                 today_bars=today,
+                pdl=cached_entry.pdl, pdh=cached_entry.pdh,
+                pml=cached_entry.pml, pmh=cached_entry.pmh,
             )
         except Exception:
             logger.warning("L2 incremental: option rec failed for %s", symbol, exc_info=True)
@@ -1301,10 +1316,14 @@ class USPredictor:
             vwap, gamma_wall, pm_source=cached_entry.pm_source,
         )
 
-        # Strategy text
-        _dir = "bullish" if price > vp.vah or (vp.poc > 0 and price > vp.poc) else "bearish"
-        if price < vp.val:
-            _dir = "bearish"
+        # Strategy text (unified with option_recommend)
+        _dir = _decide_direction(
+            regime, vp, vwap=vwap,
+            pdl=cached_entry.pdl, pdh=cached_entry.pdh,
+            pml=cached_entry.pml, pmh=cached_entry.pmh,
+        )
+        if _dir == "neutral":
+            _dir = "bearish" if price < vp.poc else "bullish"
         strategy_text = get_regime_strategy(regime.regime, _dir)
 
         name = self.watchlist.get_name(symbol)

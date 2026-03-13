@@ -22,7 +22,7 @@ from src.us_playbook.levels import (
     get_today_bars, get_history_bars, compute_volume_profile, build_key_levels,
     calc_fetch_calendar_days,
 )
-from src.us_playbook.regime import classify_us_regime, regime_to_signal_type
+from src.us_playbook.regime import classify_us_regime, detect_price_structure, regime_to_signal_type
 from src.us_playbook.filter import check_us_filters, _is_monthly_opex
 from src.us_playbook.playbook import (
     format_us_playbook_message, _collect_levels,
@@ -35,6 +35,7 @@ from src.us_playbook.playbook import (
 )
 from src.common.action_plan import (
     cap_tp1 as _cap_tp1_common,
+    apply_gamma_wall_warning as _apply_gamma_wall_warning,
     apply_vwap_deviation_warning as _apply_vwap_deviation_warning,
     format_action_plan as _format_action_plan,
 )
@@ -4616,3 +4617,610 @@ class TestSuppressedPlanRendering:
         assert "入场" in text
         assert "止损" in text
         assert "⚠️" in text
+
+
+class TestStructureOverrideDirection:
+    """Test _decide_direction with structural level overrides (long bias fix)."""
+
+    def test_extreme_bearish_structure_override(self):
+        """price < PDL + VWAP + PML → forced bearish even if price > VAH."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.8,
+            rvol=1.5, price=548, gap_pct=0.5,
+        )
+        # price=548 > VAH=545 → old logic would say bullish
+        vp = VolumeProfileResult(poc=540, vah=545, val=535)
+        result = _decide_direction(
+            regime, vp, vwap=550, pdl=550, pdh=560, pml=552, pmh=565,
+        )
+        # price < PDL(550), price < VWAP(550), price < PML(552) → bearish_count=3
+        assert result == "bearish"
+
+    def test_extreme_bullish_structure_override(self):
+        """price > PDH + VWAP + PMH → forced bullish even if price < VAL."""
+        regime = USRegimeResult(
+            regime=USRegimeType.GAP_AND_GO, confidence=0.85,
+            rvol=2.0, price=570, gap_pct=1.5,
+        )
+        # price=570 < VAL=575 → old logic would say bearish
+        vp = VolumeProfileResult(poc=580, vah=585, val=575)
+        result = _decide_direction(
+            regime, vp, vwap=565, pdl=555, pdh=565, pml=560, pmh=568,
+        )
+        # price > PDH(565), price > VWAP(565), price > PMH(568) → bullish_count=3
+        assert result == "bullish"
+
+    def test_vwap_contradiction_neutral(self):
+        """price > VAH but < VWAP → neutral (VWAP contradiction veto)."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            rvol=1.3, price=556, gap_pct=0.3,
+        )
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        # price=556 > VAH=555, but price=556 < VWAP=560 → neutral
+        result = _decide_direction(regime, vp, vwap=560)
+        assert result == "neutral"
+
+    def test_vwap_contradiction_bearish_side(self):
+        """price < VAL but > VWAP → neutral (VWAP contradiction veto)."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            rvol=1.3, price=544, gap_pct=-0.3,
+        )
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        # price=544 < VAL=545, but price=544 > VWAP=540 → neutral
+        result = _decide_direction(regime, vp, vwap=540)
+        assert result == "neutral"
+
+    def test_poc_zero_vwap_fallback(self):
+        """POC=0 should use VWAP for direction, not hardcode bullish."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.7,
+            rvol=1.2, price=548, gap_pct=0.2,
+        )
+        vp = VolumeProfileResult(poc=0, vah=555, val=545)
+        # price=548 is between VAL and VAH, POC=0
+        # price=548 < VWAP=550 → bearish (not the old default "bullish")
+        result = _decide_direction(regime, vp, vwap=550)
+        assert result == "bearish"
+
+    def test_poc_zero_no_vwap_neutral(self):
+        """POC=0 and VWAP=0 → neutral (not hardcode bullish)."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.7,
+            rvol=1.2, price=548, gap_pct=0.2,
+        )
+        vp = VolumeProfileResult(poc=0, vah=555, val=545)
+        result = _decide_direction(regime, vp, vwap=0)
+        assert result == "neutral"
+
+    def test_backward_compat_no_structure_args(self):
+        """Without new params, behavior matches old logic."""
+        regime = USRegimeResult(
+            regime=USRegimeType.GAP_AND_GO, confidence=0.85,
+            rvol=2.0, price=560, gap_pct=1.5,
+        )
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        # price > VAH → bullish (same as before)
+        assert _decide_direction(regime, vp) == "bullish"
+
+        regime2 = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.8,
+            rvol=1.5, price=540, gap_pct=-0.5,
+        )
+        # price < VAL → bearish (same as before)
+        assert _decide_direction(regime2, vp) == "bearish"
+
+    def test_fade_chop_vwap_veto(self):
+        """FADE_CHOP bullish direction but VWAP < VAL → neutral."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            rvol=0.8, price=252, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=255, vah=260, val=250)
+        # price=252 → ratio=0.2 edge zone → base bullish
+        # But VWAP=248 < VAL=250 → veto to neutral
+        result = _decide_direction(regime, vp, vwap=248)
+        assert result == "neutral"
+
+    def test_fade_chop_vwap_veto_bearish(self):
+        """FADE_CHOP bearish direction but VWAP > VAH → neutral."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            rvol=0.8, price=258, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=255, vah=260, val=250)
+        # price=258 → ratio=0.8 edge zone → base bearish
+        # But VWAP=262 > VAH=260 → veto to neutral
+        result = _decide_direction(regime, vp, vwap=262)
+        assert result == "neutral"
+
+    def test_structure_override_only_for_trend_regimes(self):
+        """FADE_CHOP should NOT trigger extreme structure override."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            rvol=0.8, price=252, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=255, vah=260, val=250)
+        # Even with extreme structure: price < PDL, < VWAP, < PML
+        # FADE_CHOP should still use VA zone logic, not forced bearish
+        result = _decide_direction(
+            regime, vp, vwap=253, pdl=253, pdh=260, pml=254, pmh=262,
+        )
+        # price=252 → ratio=0.2, edge zone bullish (VWAP=253 > VAL=250, no veto)
+        assert result == "bullish"
+
+    def test_single_structure_signal_not_enough(self):
+        """Only 1 structural level aligned → no override (need >=2)."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.8,
+            rvol=1.5, price=556, gap_pct=0.5,
+        )
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        # price=556 > VAH=555 → normally bullish
+        # Only price > PDH(554), but price < VWAP(560) and PMH=0 → bullish_count=1
+        # Not enough for override, but VWAP veto: price > VAH but < VWAP → neutral
+        result = _decide_direction(regime, vp, vwap=560, pdh=554)
+        assert result == "neutral"  # VWAP contradiction veto
+
+
+# ── Structure-based TREND_DAY ──
+
+class TestStructureTrendDay:
+    """Price structure detection for low-RVOL trend days (slow bleed / slow grind)."""
+
+    _ENABLED_CFG = {
+        "enabled": True,
+        "window": 15,
+        "min_windows": 3,
+        "consistency": 0.67,
+        "fast_min_bars": 20,
+        "fast_side_pct": 0.80,
+        "fast_r2_min": 0.70,
+    }
+
+    def _vp(self, poc=400, vah=410, val=390):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    def _make_declining_bars(self, n_bars: int, start_price: float = 200.0, drop_per_bar: float = 0.15):
+        """Create steady declining bars (LH + LL pattern)."""
+        prices = []
+        for i in range(n_bars):
+            t = f"2026-03-13 09:{30 + i}:00" if i < 30 else f"2026-03-13 10:{i - 30:02d}:00"
+            c = start_price - drop_per_bar * i
+            h = c + 0.3  # small wick above
+            l = c - 0.2  # small wick below
+            o = c + 0.1
+            prices.append((t, o, h, l, c, 500))
+        return _make_bars(prices)
+
+    def _make_rising_bars(self, n_bars: int, start_price: float = 200.0, rise_per_bar: float = 0.15):
+        """Create steady rising bars (HH + HL pattern)."""
+        prices = []
+        for i in range(n_bars):
+            t = f"2026-03-13 09:{30 + i}:00" if i < 30 else f"2026-03-13 10:{i - 30:02d}:00"
+            c = start_price + rise_per_bar * i
+            h = c + 0.2
+            l = c - 0.3
+            o = c - 0.1
+            prices.append((t, o, h, l, c, 500))
+        return _make_bars(prices)
+
+    def _make_choppy_bars(self, n_bars: int, center: float = 200.0):
+        """Create oscillating bars with no clear direction."""
+        prices = []
+        for i in range(n_bars):
+            t = f"2026-03-13 09:{30 + i}:00" if i < 30 else f"2026-03-13 10:{i - 30:02d}:00"
+            # Zigzag around center
+            offset = 1.0 if i % 2 == 0 else -1.0
+            c = center + offset * (i % 3)
+            h = c + 0.5
+            l = c - 0.5
+            o = c - offset * 0.3
+            prices.append((t, o, h, l, c, 500))
+        return _make_bars(prices)
+
+    # ── detect_price_structure unit tests ──
+
+    def test_structure_l1_bearish(self):
+        """20+ bars + close < VWAP 80%+ + R² > 0.70 → L1 bearish."""
+        # Steeper decline to ensure VWAP slope exceeds flat_threshold
+        bars = self._make_declining_bars(25, start_price=200.0, drop_per_bar=0.50)
+        result = detect_price_structure(bars, fast_min_bars=20, fast_r2_min=0.70)
+        assert result is not None
+        assert result.direction == "bearish"
+        assert result.layer == 1
+        assert 0.40 <= result.confidence <= 0.50
+
+    def test_structure_l2_bearish(self):
+        """4 declining windows → L2 bearish with VWAP slope confirmation."""
+        # 60 bars = 4 windows of 15 bars each, steady decline
+        bars = self._make_declining_bars(60, start_price=200.0, drop_per_bar=0.10)
+        result = detect_price_structure(bars, window=15, min_windows=3, fast_min_bars=20)
+        assert result is not None
+        assert result.direction == "bearish"
+        assert result.layer == 2
+        assert 0.45 <= result.confidence <= 0.65
+
+    def test_structure_l2_overrides_l1(self):
+        """45+ bars satisfying both layers → L2 is preferred (higher layer)."""
+        bars = self._make_declining_bars(60, start_price=200.0, drop_per_bar=0.12)
+        result = detect_price_structure(bars, window=15, min_windows=3, fast_min_bars=20)
+        assert result is not None
+        assert result.layer == 2  # L2 preferred over L1
+
+    def test_structure_bullish(self):
+        """HH + HL + positive VWAP slope → bullish."""
+        bars = self._make_rising_bars(60, start_price=200.0, rise_per_bar=0.10)
+        result = detect_price_structure(bars, window=15, min_windows=3, fast_min_bars=20)
+        assert result is not None
+        assert result.direction == "bullish"
+
+    def test_structure_no_pattern(self):
+        """Choppy bars → no structure detected."""
+        bars = self._make_choppy_bars(60, center=200.0)
+        result = detect_price_structure(bars, window=15, min_windows=3, fast_min_bars=20)
+        assert result is None
+
+    def test_structure_low_r2_no_l1(self):
+        """R² < 0.70 → Layer 1 does not trigger."""
+        # Choppy bars but only 25 (not enough for L2)
+        bars = self._make_choppy_bars(25, center=200.0)
+        result = detect_price_structure(bars, fast_min_bars=20, fast_r2_min=0.70)
+        assert result is None
+
+    def test_structure_insufficient_bars(self):
+        """< 20 bars → no structure."""
+        bars = self._make_declining_bars(15, start_price=200.0, drop_per_bar=0.20)
+        result = detect_price_structure(bars, fast_min_bars=20)
+        assert result is None
+
+    # ── classify_us_regime integration tests ──
+
+    def test_structure_disabled_config(self):
+        """enabled: false → structure detection skipped."""
+        bars = self._make_declining_bars(60, start_price=200.0, drop_per_bar=0.10)
+        final_price = 200.0 - 0.10 * 59
+        r = classify_us_regime(
+            price=final_price, prev_close=201.0, rvol=0.7,
+            pmh=201.0, pml=198.0, vp=self._vp(poc=196, vah=200, val=192),
+            today_bars=bars,
+            structure_trend_cfg={"enabled": False},
+        )
+        assert r.regime != USRegimeType.TREND_DAY
+
+    def test_structure_triggers_trend_day_in_classify(self):
+        """Low RVOL + clear declining structure → TREND_DAY via structure path."""
+        bars = self._make_declining_bars(60, start_price=200.0, drop_per_bar=0.10)
+        final_price = 200.0 - 0.10 * 59  # ~194.1
+        r = classify_us_regime(
+            price=final_price, prev_close=201.0, rvol=0.7,
+            pmh=201.0, pml=198.0, vp=self._vp(poc=196, vah=200, val=192),
+            today_bars=bars,
+            structure_trend_cfg=self._ENABLED_CFG,
+        )
+        assert r.regime == USRegimeType.TREND_DAY
+        assert "Structure" in r.details
+
+    def test_structure_does_not_override_rvol_trend_day(self):
+        """RVOL-based TREND_DAY fires first (higher priority)."""
+        bars = self._make_declining_bars(60, start_price=200.0, drop_per_bar=0.10)
+        final_price = 200.0 - 0.10 * 59  # ~194.1
+        r = classify_us_regime(
+            price=final_price, prev_close=194.5, rvol=1.3,  # RVOL 1.3 >= trend_day 1.2, small gap
+            pmh=201.0, pml=190.0,  # pml=190 so no pm_breakout → avoids GAP_AND_GO
+            vp=self._vp(poc=198, vah=198, val=195),  # price 194.1 < val 195 → outside VA
+            today_bars=bars,
+            structure_trend_cfg=self._ENABLED_CFG,
+        )
+        assert r.regime == USRegimeType.TREND_DAY
+        assert "Structure" not in r.details  # RVOL path, not structure
+
+    def test_structure_stop_hunt_l2_fallback_l1(self):
+        """Stop hunt breaks L2 pattern but L1 (VWAP trend) still holds."""
+        # Create declining bars but insert a spike in the middle that breaks L2
+        bars = self._make_declining_bars(45, start_price=200.0, drop_per_bar=0.10)
+        # Inject a stop-hunt spike in window 2 (bars 15-29) — higher high than window 1
+        spike_idx = 20
+        bars.iloc[spike_idx, bars.columns.get_loc("High")] = 202.0  # breaks LH pattern
+        bars.iloc[spike_idx, bars.columns.get_loc("Close")] = 199.0  # close stays low
+
+        result = detect_price_structure(
+            bars, window=15, min_windows=3, fast_min_bars=20, fast_r2_min=0.70,
+        )
+        # Even if L2 fails, L1 should still detect via VWAP trend + R²
+        assert result is not None
+        assert result.direction == "bearish"
+
+
+# ── TREND_DAY Persistence Tests ──
+
+class TestTrendPersistence:
+    """TREND_DAY persistence: inside VA + strong intraday return + VWAP agreement."""
+
+    @staticmethod
+    def _make_n_bars(n: int, base: str = "2026-03-13 10:00") -> pd.DataFrame:
+        """Create n 1-minute bars starting from base timestamp."""
+        rows = []
+        start = pd.Timestamp(base, tz="America/New_York")
+        for i in range(n):
+            ts = start + pd.Timedelta(minutes=i)
+            rows.append({
+                "Open": 100.0, "High": 100.5, "Low": 99.5,
+                "Close": 100.0, "Volume": 1000,
+            })
+        idx = pd.DatetimeIndex(
+            [start + pd.Timedelta(minutes=i) for i in range(n)], name="Datetime"
+        )
+        return pd.DataFrame(rows, index=idx)
+
+    def test_trend_persistence_bearish(self):
+        """inside_va + return<-1% + price<VWAP + >=30 bars → TREND_DAY bearish."""
+        bars = self._make_n_bars(35)
+        # open_price=100, price=98.5 → return=-1.5%, inside VA [98..102]
+        r = classify_us_regime(
+            price=98.5, prev_close=100.0, rvol=1.3,
+            pmh=101.0, pml=97.0,
+            vp=VolumeProfileResult(poc=100.0, vah=102.0, val=98.0, trading_days=5),
+            open_price=100.0,
+            today_bars=bars,
+            vwap=99.0,  # price 98.5 < vwap 99.0 → agrees with bearish
+            trend_day_rvol=1.2,
+        )
+        assert r.regime == USRegimeType.TREND_DAY
+        assert r.lean == "bearish"
+        assert "persistence" in r.details.lower()
+
+    def test_trend_persistence_vshape_guard(self):
+        """return<-1% but price>VWAP → V-shape guard blocks persistence."""
+        bars = self._make_n_bars(35)
+        r = classify_us_regime(
+            price=98.5, prev_close=100.0, rvol=1.3,
+            pmh=101.0, pml=97.0,
+            vp=VolumeProfileResult(poc=100.0, vah=102.0, val=98.0, trading_days=5),
+            open_price=100.0,
+            today_bars=bars,
+            vwap=98.0,  # price 98.5 > vwap 98.0 → disagrees with bearish
+            trend_day_rvol=1.2,
+        )
+        # Should NOT be TREND_DAY via persistence (V-shape guard)
+        assert r.regime != USRegimeType.TREND_DAY or "persistence" not in r.details.lower()
+
+    def test_trend_persistence_early_session(self):
+        """inside_va + return<-1% but <30 bars → not triggered."""
+        bars = self._make_n_bars(20)  # only 20 bars
+        r = classify_us_regime(
+            price=98.5, prev_close=100.0, rvol=1.3,
+            pmh=101.0, pml=97.0,
+            vp=VolumeProfileResult(poc=100.0, vah=102.0, val=98.0, trading_days=5),
+            open_price=100.0,
+            today_bars=bars,
+            vwap=99.0,
+            trend_day_rvol=1.2,
+        )
+        # With <30 bars, persistence should not activate
+        assert r.regime != USRegimeType.TREND_DAY or "persistence" not in r.details.lower()
+
+
+# ── Direction Override VWAP Tests ──
+
+class TestDirectionOverrideVWAP:
+    """Playbook neutral fallback uses VWAP instead of POC."""
+
+    def test_inside_va_below_vwap_bearish(self):
+        """price inside VA, below VWAP → direction=bearish."""
+        from src.us_playbook.playbook import format_us_playbook_message
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.30,
+            rvol=1.0, price=100.0, gap_pct=0.1,
+            lean="neutral",
+        )
+        vp = VolumeProfileResult(poc=99.5, vah=102.0, val=98.0, trading_days=5)
+        kl = KeyLevels(
+            poc=99.5, vah=102.0, val=98.0,
+            pdh=101.0, pdl=99.0, pmh=101.5, pml=99.5,
+            vwap=100.5,  # price 100.0 < vwap 100.5 → bearish
+        )
+        # _decide_direction for UNCLEAR with lean="neutral" returns "neutral"
+        # Neutral fallback should use VWAP: 100 < 100.5 → bearish
+        _direction = _decide_direction(regime, vp, vwap=kl.vwap)
+        # _decide_direction returns "neutral" for UNCLEAR lean=neutral
+        assert _direction == "neutral"
+        # The playbook neutral fallback should pick bearish via VWAP
+        # Test the fallback logic directly
+        if _direction == "neutral":
+            if regime.price > vp.vah:
+                _direction = "bullish"
+            elif regime.price < vp.val:
+                _direction = "bearish"
+            elif kl.vwap > 0:
+                _direction = "bullish" if regime.price > kl.vwap else "bearish"
+            elif vp.poc > 0:
+                _direction = "bullish" if regime.price > vp.poc else "bearish"
+            else:
+                _direction = "bullish"
+        assert _direction == "bearish"
+
+
+# ── UNCLEAR Lean Override Tests ──
+
+class TestUnclearLeanOverride:
+    """UNCLEAR lean override: intraday return + VWAP double-confirmation."""
+
+    @staticmethod
+    def _make_n_bars(n: int) -> pd.DataFrame:
+        rows = []
+        start = pd.Timestamp("2026-03-13 10:00", tz="America/New_York")
+        for i in range(n):
+            rows.append({
+                "Open": 100.0, "High": 100.5, "Low": 99.5,
+                "Close": 100.0, "Volume": 1000,
+            })
+        idx = pd.DatetimeIndex(
+            [start + pd.Timedelta(minutes=i) for i in range(n)], name="Datetime"
+        )
+        return pd.DataFrame(rows, index=idx)
+
+    def test_unclear_lean_bearish_override(self):
+        """return<-0.5% + price<VWAP + >=30 bars → lean=bearish."""
+        bars = self._make_n_bars(35)
+        # Sub-type 2: inside_va + rvol >= trend_day → default lean = price vs POC
+        # price=99.8, POC=99.5 → default lean would be bullish
+        # But override: open=100, price=99.3 → return=-0.7%, vwap=99.5, price<vwap → bearish
+        r = classify_us_regime(
+            price=99.3, prev_close=100.0, rvol=1.3,
+            pmh=101.0, pml=97.0,
+            vp=VolumeProfileResult(poc=99.5, vah=102.0, val=98.0, trading_days=5),
+            open_price=100.0,
+            today_bars=bars,
+            vwap=99.5,  # price 99.3 < vwap 99.5 → bearish
+            trend_day_rvol=1.2,
+        )
+        # With persistence, this might be TREND_DAY. If UNCLEAR, check lean.
+        # return=-0.7% < -1% threshold for persistence, so persistence won't fire.
+        # RVOL 1.3 >= 1.2 + inside VA → sub-type 2 UNCLEAR.
+        # Override: return=-0.7%, |0.7%| > 0.5%, ret_lean=bearish, price<vwap → vwap_lean=bearish → match
+        assert r.regime == USRegimeType.UNCLEAR
+        assert r.lean == "bearish"
+
+    def test_unclear_lean_no_override_conflicting(self):
+        """return<0 but price>VWAP → conflicting, no override."""
+        bars = self._make_n_bars(35)
+        # open=100, price=99.3 → return=-0.7% (bearish return)
+        # vwap=99.0, price 99.3 > vwap → bullish VWAP → conflict → no override
+        r = classify_us_regime(
+            price=99.3, prev_close=100.0, rvol=1.3,
+            pmh=101.0, pml=97.0,
+            vp=VolumeProfileResult(poc=99.5, vah=102.0, val=98.0, trading_days=5),
+            open_price=100.0,
+            today_bars=bars,
+            vwap=99.0,  # price 99.3 > vwap 99.0 → bullish VWAP, conflicts with bearish return
+            trend_day_rvol=1.2,
+        )
+        # Default sub-type 2 lean: price(99.3) < poc(99.5) → bearish (from POC, not override)
+        # The override should NOT fire because ret_lean(bearish) != vwap_lean(bullish)
+        assert r.regime == USRegimeType.UNCLEAR
+        # lean stays as default POC-based: price < poc → bearish
+        assert r.lean == "bearish"
+
+
+# ── Gamma Wall Adverse Warning Tests ──
+
+class TestGammaWallAdverseWarning:
+    """Tests for gamma wall adverse warning / demote logic."""
+
+    def _plan(self, direction="bullish", entry=250.0):
+        return ActionPlan(
+            label="A", name="test", emoji="📈", is_primary=True,
+            logic="test", direction=direction, trigger="test",
+            entry=entry, entry_action="做多" if direction == "bullish" else "做空",
+            stop_loss=248.0 if direction == "bullish" else 252.0,
+            stop_loss_reason="SL",
+            tp1=255.0 if direction == "bullish" else 245.0,
+            tp1_label="VAH",
+            tp2=None, tp2_label="", rr_ratio=2.5,
+        )
+
+    def _ctx(self, adr=1.2):
+        return PlanContext(avg_daily_range_pct=adr)
+
+    def _gw(self, max_pain=250.0, call_wall=260.0, put_wall=240.0):
+        return GammaWallResult(
+            call_wall_strike=call_wall,
+            put_wall_strike=put_wall,
+            max_pain=max_pain,
+        )
+
+    def test_bullish_max_pain_below_warns(self):
+        """Bullish plan + MaxPain well below price → warning."""
+        plan = self._plan(direction="bullish", entry=250.0)
+        gw = self._gw(max_pain=245.0)  # 2% below 250
+        ctx = self._ctx(adr=1.2)  # warn_thr = 0.6%
+        plans = _apply_gamma_wall_warning([plan], price=250.0, gamma_wall=gw, ctx=ctx)
+        assert "期权引力偏空" in plans[0].warning
+
+    def test_bearish_max_pain_above_warns(self):
+        """Bearish plan + MaxPain well above price → warning."""
+        plan = self._plan(direction="bearish", entry=250.0)
+        gw = self._gw(max_pain=256.0)  # 2.4% above 250
+        ctx = self._ctx(adr=1.2)
+        plans = _apply_gamma_wall_warning([plan], price=250.0, gamma_wall=gw, ctx=ctx)
+        assert "期权引力偏多" in plans[0].warning
+
+    def test_bullish_put_wall_above_price_demotes(self):
+        """Bullish plan + Put Wall above price → demote."""
+        plan = self._plan(direction="bullish", entry=250.0)
+        gw = self._gw(put_wall=252.0)  # put wall above price
+        ctx = self._ctx(adr=1.2)
+        plans = _apply_gamma_wall_warning([plan], price=250.0, gamma_wall=gw, ctx=ctx)
+        assert plans[0].demoted is True
+        assert "不支持做多" in plans[0].demote_reason
+
+    def test_bearish_call_wall_below_price_demotes(self):
+        """Bearish plan + Call Wall below price → demote."""
+        plan = self._plan(direction="bearish", entry=250.0)
+        gw = self._gw(call_wall=248.0)  # call wall below price
+        ctx = self._ctx(adr=1.2)
+        plans = _apply_gamma_wall_warning([plan], price=250.0, gamma_wall=gw, ctx=ctx)
+        assert plans[0].demoted is True
+        assert "不支持做空" in plans[0].demote_reason
+
+    def test_gamma_wall_none_no_change(self):
+        """gamma_wall=None → plans unchanged."""
+        plan = self._plan(direction="bullish")
+        ctx = self._ctx()
+        plans = _apply_gamma_wall_warning([plan], price=250.0, gamma_wall=None, ctx=ctx)
+        assert plans[0].warning == ""
+        assert plans[0].demoted is False
+
+    def test_adr_zero_fallback_fixed_threshold(self):
+        """ADR=0 → falls back to fixed 1.0% warn / 1.5% proximity."""
+        plan = self._plan(direction="bullish", entry=250.0)
+        gw = self._gw(max_pain=246.0)  # 1.6% below → > 1.0% fixed threshold
+        ctx = self._ctx(adr=0.0)
+        plans = _apply_gamma_wall_warning([plan], price=250.0, gamma_wall=gw, ctx=ctx)
+        assert "期权引力偏空" in plans[0].warning
+
+    def test_no_overwrite_existing_vwap_warning(self):
+        """Existing VWAP warning preserved, gamma warning appended."""
+        plan = self._plan(direction="bullish", entry=250.0)
+        plan.warning = "价格已高于 VWAP 1.2%, 做多需等回调"
+        gw = self._gw(max_pain=245.0)
+        ctx = self._ctx(adr=1.2)
+        plans = _apply_gamma_wall_warning([plan], price=250.0, gamma_wall=gw, ctx=ctx)
+        assert "VWAP" in plans[0].warning
+        assert "期权引力偏空" in plans[0].warning
+        assert plans[0].warning.startswith("价格已高于 VWAP")
+
+    def test_plan_c_skipped(self):
+        """Plan C (invalidation) is always skipped."""
+        plan = ActionPlan(
+            label="C", name="失效", emoji="⚡", is_primary=False,
+            logic="test", direction="bullish", trigger="test",
+            entry=250.0, entry_action="观望",
+            stop_loss=None, stop_loss_reason="",
+            tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+        )
+        gw = self._gw(max_pain=240.0, put_wall=255.0)
+        ctx = self._ctx(adr=1.2)
+        plans = _apply_gamma_wall_warning([plan], price=250.0, gamma_wall=gw, ctx=ctx)
+        assert plans[0].warning == ""
+        assert plans[0].demoted is False
+
+    def test_bullish_call_wall_proximity_warns(self):
+        """Bullish plan + Call Wall very close above → proximity warning."""
+        plan = self._plan(direction="bullish", entry=250.0)
+        # call_wall at 250.5 → 0.2% from price, adr=1.2 → prox_thr=0.36%
+        gw = self._gw(max_pain=250.0, call_wall=250.5, put_wall=240.0)
+        ctx = self._ctx(adr=1.2)
+        plans = _apply_gamma_wall_warning([plan], price=250.0, gamma_wall=gw, ctx=ctx)
+        assert "上方压制" in plans[0].warning
+
+    def test_bearish_put_wall_proximity_warns(self):
+        """Bearish plan + Put Wall very close below → proximity warning."""
+        plan = self._plan(direction="bearish", entry=250.0)
+        # put_wall at 249.5 → 0.2% from price, adr=1.2 → prox_thr=0.36%
+        gw = self._gw(max_pain=250.0, call_wall=260.0, put_wall=249.5)
+        ctx = self._ctx(adr=1.2)
+        plans = _apply_gamma_wall_warning([plan], price=250.0, gamma_wall=gw, ctx=ctx)
+        assert "下方承接" in plans[0].warning

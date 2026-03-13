@@ -180,22 +180,62 @@ def _decide_direction(
     regime: USRegimeResult,
     vp: VolumeProfileResult,
     momentum: int = 0,
+    vwap: float = 0.0,
+    pdl: float = 0.0,
+    pdh: float = 0.0,
+    pml: float = 0.0,
+    pmh: float = 0.0,
 ) -> str:
     """Decide bullish / bearish / neutral based on US regime + price position.
+
+    For GAP_AND_GO / TREND_DAY:
+    - Extreme structure override: >=2 of (PDL/VWAP/PML) below → forced bearish;
+      >=2 of (PDH/VWAP/PMH) above → forced bullish.
+    - VWAP contradiction veto: price > VAH but < VWAP → neutral (and vice versa).
+    - POC=0 fallback: use VWAP instead of hardcoded bullish.
 
     For FADE_CHOP, uses VA three-zone logic with momentum confirmation:
     - Edge zone (position_ratio >= 0.70 or <= 0.30): gives direction;
       momentum=0 passes, opposing momentum → neutral.
     - Transition zone (0.30 < ratio < 0.70): requires momentum confirmation;
       momentum=0 → neutral.
+    - VWAP veto: bullish but VWAP < VAL → neutral; bearish but VWAP > VAH → neutral.
     """
     price = regime.price
 
     if regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+        # Extreme structure override (>=2 structural levels aligned)
+        bearish_count = sum([
+            pdl > 0 and price < pdl,
+            vwap > 0 and price < vwap,
+            pml > 0 and price < pml,
+        ])
+        if bearish_count >= 2:
+            return "bearish"
+        bullish_count = sum([
+            pdh > 0 and price > pdh,
+            vwap > 0 and price > vwap,
+            pmh > 0 and price > pmh,
+        ])
+        if bullish_count >= 2:
+            return "bullish"
+
+        # VWAP contradiction veto
+        if vwap > 0:
+            if price > vp.vah and price < vwap:
+                return "neutral"
+            if price < vp.val and price > vwap:
+                return "neutral"
+
         if price > vp.vah:
             return "bullish"
         if price < vp.val:
             return "bearish"
+        # POC=0 fallback: use VWAP
+        if vp.poc <= 0:
+            if vwap > 0:
+                return "bullish" if price > vwap else "bearish"
+            return "neutral"
         return "bullish" if price > vp.poc else "bearish"
 
     if regime.regime == USRegimeType.FADE_CHOP:
@@ -206,27 +246,36 @@ def _decide_direction(
         position_ratio = (price - vp.val) / va_range
         position_ratio = max(0.0, min(1.0, position_ratio))
 
+        fade_dir = "neutral"
         if position_ratio >= 0.70:
             # Edge zone — base direction is bearish (mean reversion from VAH)
             if momentum == 1:
-                return "neutral"  # momentum opposes
-            return "bearish"
+                fade_dir = "neutral"  # momentum opposes
+            else:
+                fade_dir = "bearish"
         elif position_ratio <= 0.30:
             # Edge zone — base direction is bullish (mean reversion from VAL)
             if momentum == -1:
-                return "neutral"  # momentum opposes
-            return "bullish"
+                fade_dir = "neutral"  # momentum opposes
+            else:
+                fade_dir = "bullish"
         else:
             # Transition zone — require momentum confirmation
             if position_ratio >= 0.50:
-                # Slightly above mid → base bearish, need momentum -1 to confirm
                 if momentum == -1:
-                    return "bearish"
+                    fade_dir = "bearish"
             else:
-                # Slightly below mid → base bullish, need momentum +1 to confirm
                 if momentum == 1:
-                    return "bullish"
-            return "neutral"
+                    fade_dir = "bullish"
+
+        # VWAP veto for FADE_CHOP
+        if vwap > 0 and fade_dir != "neutral":
+            if fade_dir == "bullish" and vwap < vp.val:
+                fade_dir = "neutral"
+            elif fade_dir == "bearish" and vwap > vp.vah:
+                fade_dir = "neutral"
+
+        return fade_dir
 
     # UNCLEAR: use lean hint if available (P0-3)
     if regime.regime == USRegimeType.UNCLEAR and hasattr(regime, "lean") and regime.lean != "neutral":
@@ -355,6 +404,10 @@ def recommend(
     chase_risk_cfg: dict | None = None,
     option_cfg: dict | None = None,
     today_bars: pd.DataFrame | None = None,
+    pdl: float = 0.0,
+    pdh: float = 0.0,
+    pml: float = 0.0,
+    pmh: float = 0.0,
 ) -> OptionRecommendation:
     """Generate US option recommendation."""
     price = regime.price
@@ -386,7 +439,10 @@ def recommend(
                 wait_conditions=["等待 VA 区间扩展或选择其他标的"],
             )
 
-    direction = _decide_direction(regime, vp, momentum=momentum)
+    direction = _decide_direction(
+        regime, vp, momentum=momentum,
+        vwap=vwap, pdl=pdl, pdh=pdh, pml=pml, pmh=pmh,
+    )
 
     # P0-1: Local trend veto for FADE_CHOP — structural rejection
     if regime.regime == USRegimeType.FADE_CHOP and direction != "neutral":

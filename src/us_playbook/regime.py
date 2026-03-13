@@ -1,13 +1,133 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+import numpy as np
 import pandas as pd
 
+from src.common.indicators import calculate_vwap_series, calculate_vwap_slope
 from src.common.types import GammaWallResult, VolumeProfileResult
 from src.us_playbook import USRegimeResult, USRegimeType
 from src.us_playbook.indicators import RvolProfile
 from src.utils.logger import setup_logger
 
 logger = setup_logger("us_regime")
+
+
+# ── Price Structure Detection ──
+
+
+@dataclass
+class StructureResult:
+    """Result of price structure detection."""
+    direction: str  # "bullish" | "bearish"
+    strength: float
+    layer: int  # 1 or 2
+    confidence: float
+
+
+def detect_price_structure(
+    today_bars: pd.DataFrame,
+    *,
+    window: int = 15,
+    min_windows: int = 3,
+    consistency: float = 0.67,
+    fast_min_bars: int = 20,
+    fast_side_pct: float = 0.80,
+    fast_r2_min: float = 0.70,
+    flat_threshold: float = 0.0005,
+) -> StructureResult | None:
+    """Detect directional price structure via two layers.
+
+    Layer 1 (fast): VWAP trend + price-side consistency + R² (≥20 bars).
+    Layer 2 (swing): Rolling window HH/HL or LH/LL (≥ window * min_windows bars).
+
+    Returns the highest-layer result, or None if no structure detected.
+    """
+    if today_bars is None or today_bars.empty:
+        return None
+
+    n_bars = len(today_bars)
+    l2_min_bars = window * min_windows
+
+    l2_result: StructureResult | None = None
+    l1_result: StructureResult | None = None
+
+    # ── Layer 2: Rolling window peaks/troughs ──
+    if n_bars >= l2_min_bars:
+        n_full_windows = n_bars // window
+        if n_full_windows >= min_windows:
+            highs = []
+            lows = []
+            for i in range(n_full_windows):
+                chunk = today_bars.iloc[i * window : (i + 1) * window]
+                highs.append(float(chunk["High"].max()))
+                lows.append(float(chunk["Low"].min()))
+
+            n = len(highs) - 1  # number of adjacent pairs
+            if n >= 2:
+                hh_count = sum(1 for i in range(n) if highs[i + 1] > highs[i])
+                hl_count = sum(1 for i in range(n) if lows[i + 1] > lows[i])
+                lh_count = sum(1 for i in range(n) if highs[i + 1] < highs[i])
+                ll_count = sum(1 for i in range(n) if lows[i + 1] < lows[i])
+
+                # Allow at most 1 outlier (stop hunt tolerance)
+                bearish_l2 = (n - lh_count) <= 1 and (n - ll_count) <= 1
+                bullish_l2 = (n - hh_count) <= 1 and (n - hl_count) <= 1
+
+                # VWAP slope cross-check for L2
+                vwap_slope = calculate_vwap_slope(today_bars, lookback=min(n_bars, 30))
+
+                if bearish_l2 and not bullish_l2 and vwap_slope < 0:
+                    strength = (lh_count + ll_count) / (2 * n)
+                    conf = 0.45 + min(0.20, strength * 0.25)
+                    l2_result = StructureResult("bearish", strength, 2, conf)
+                elif bullish_l2 and not bearish_l2 and vwap_slope > 0:
+                    strength = (hh_count + hl_count) / (2 * n)
+                    conf = 0.45 + min(0.20, strength * 0.25)
+                    l2_result = StructureResult("bullish", strength, 2, conf)
+
+    # ── Layer 1: VWAP trend fast check ──
+    if n_bars >= fast_min_bars:
+        vwap_slope = calculate_vwap_slope(today_bars, lookback=min(n_bars, 30))
+        if abs(vwap_slope) > flat_threshold:
+            # Check price-VWAP side consistency over last 20 bars
+            tail = today_bars.iloc[-fast_min_bars:]
+            vwap_series = calculate_vwap_series(today_bars)
+            vwap_tail = vwap_series.iloc[-fast_min_bars:]
+
+            closes = tail["Close"].values
+            vwaps = vwap_tail.values
+
+            if vwap_slope < 0:
+                side_count = np.sum(closes < vwaps)
+            else:
+                side_count = np.sum(closes > vwaps)
+
+            side_pct = side_count / fast_min_bars
+
+            if side_pct >= fast_side_pct:
+                # R² of close prices (linear regression fit)
+                y = closes.astype(float)
+                x = np.arange(len(y), dtype=float)
+                if np.std(y) > 0:
+                    slope_c, intercept = np.polyfit(x, y, 1)
+                    y_pred = slope_c * x + intercept
+                    ss_res = np.sum((y - y_pred) ** 2)
+                    ss_tot = np.sum((y - np.mean(y)) ** 2)
+                    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+                else:
+                    r2 = 0.0
+
+                if r2 >= fast_r2_min:
+                    direction = "bearish" if vwap_slope < 0 else "bullish"
+                    conf = 0.40 + min(0.10, (r2 - fast_r2_min) * 0.33)
+                    l1_result = StructureResult(direction, r2, 1, conf)
+
+    # Prefer L2 over L1
+    if l2_result is not None:
+        return l2_result
+    return l1_result
 
 
 def detect_regime_transition(
@@ -26,6 +146,9 @@ def detect_regime_transition(
     gap_significance_threshold: float = 0.3,
     pm_source: str = "futu",
     open_price: float = 0.0,
+    today_bars: pd.DataFrame | None = None,
+    structure_trend_cfg: dict | None = None,
+    vwap: float = 0.0,
 ) -> tuple[bool, USRegimeResult | None]:
     """Detect if regime has transitioned from original classification.
 
@@ -50,6 +173,9 @@ def detect_regime_transition(
         gap_significance_threshold=gap_significance_threshold,
         pm_source=pm_source,
         open_price=open_price,
+        today_bars=today_bars,
+        structure_trend_cfg=structure_trend_cfg,
+        vwap=vwap,
     )
 
     # Only signal meaningful upgrades
@@ -96,6 +222,8 @@ def classify_us_regime(
     pm_source: str = "futu",
     open_price: float = 0.0,
     today_bars: pd.DataFrame | None = None,
+    structure_trend_cfg: dict | None = None,
+    vwap: float = 0.0,
 ) -> USRegimeResult:
     """Classify US intraday regime into 4 styles.
 
@@ -196,6 +324,69 @@ def classify_us_regime(
             details=f"RVOL {rvol:.2f} >= {trend_day_rvol:.2f} ({threshold_label}), small gap {gap_pct:+.2f}%, price {direction}",
         )
 
+    # ── TREND_DAY (Structure-based) ──
+    _st_cfg = structure_trend_cfg or {}
+    if result is None and _st_cfg.get("enabled", False) and today_bars is not None:
+        structure = detect_price_structure(
+            today_bars,
+            window=_st_cfg.get("window", 15),
+            min_windows=_st_cfg.get("min_windows", 3),
+            consistency=_st_cfg.get("consistency", 0.67),
+            fast_min_bars=_st_cfg.get("fast_min_bars", 20),
+            fast_side_pct=_st_cfg.get("fast_side_pct", 0.80),
+            fast_r2_min=_st_cfg.get("fast_r2_min", 0.70),
+        )
+        if structure is not None:
+            confidence = structure.confidence
+            # SPY context adjustment (same as RVOL-based TREND_DAY)
+            if spy_regime == USRegimeType.FADE_CHOP:
+                confidence = max(0.1, confidence - 0.12)
+            elif spy_regime in (USRegimeType.TREND_DAY, USRegimeType.GAP_AND_GO):
+                confidence = min(1.0, confidence + 0.10)
+            layer_label = f"L{structure.layer}"
+            result = USRegimeResult(
+                regime=USRegimeType.TREND_DAY, confidence=confidence,
+                rvol=rvol, price=price, gap_pct=gap_pct,
+                spy_regime=spy_regime,
+                adaptive_thresholds=adaptive_info,
+                details=(
+                    f"Structure {layer_label} {structure.direction}: "
+                    f"strength {structure.strength:.2f}, "
+                    f"RVOL {rvol:.2f} (below {trend_day_rvol:.2f})"
+                ),
+                lean=structure.direction,
+            )
+
+    # ── TREND_DAY (Persistence — inside VA but still trending) ──
+    _enough_bars = today_bars is not None and len(today_bars) >= 30
+    if (result is None and rvol >= trend_day_rvol and small_gap
+            and inside_va and open_price > 0 and _enough_bars):
+        intraday_return = (price - open_price) / open_price
+        _trend_lean = "bearish" if intraday_return < 0 else "bullish"
+        # V-shape guard: intraday_return direction must agree with price vs VWAP
+        vwap_agrees = (vwap <= 0
+            or (_trend_lean == "bearish" and price < vwap)
+            or (_trend_lean == "bullish" and price > vwap))
+        if abs(intraday_return) > 0.01 and vwap_agrees:
+            base_confidence = min(1.0, (rvol - trend_day_rvol) / 0.5 * 0.3 + 0.5)
+            confidence = max(0.1, base_confidence - 0.15)
+            if spy_regime == USRegimeType.FADE_CHOP:
+                confidence = max(0.1, confidence - 0.12)
+            elif spy_regime in (USRegimeType.TREND_DAY, USRegimeType.GAP_AND_GO):
+                confidence = min(1.0, confidence + 0.10)
+            direction = "above VAH" if price > vp.vah else "below VAL" if price < vp.val else "in VA"
+            result = USRegimeResult(
+                regime=USRegimeType.TREND_DAY, confidence=confidence,
+                rvol=rvol, price=price, gap_pct=gap_pct,
+                spy_regime=spy_regime,
+                adaptive_thresholds=adaptive_info,
+                details=(
+                    f"Trend persistence: {intraday_return:+.2%} since open, "
+                    f"RVOL {rvol:.2f} >= {trend_day_rvol:.2f} ({threshold_label}), price {direction}"
+                ),
+                lean=_trend_lean,
+            )
+
     # ── FADE_CHOP ──
     # P0-2: Directional trap check — low RVOL + strong unidirectional move
     # should NOT be classified as FADE_CHOP; route to UNCLEAR instead.
@@ -257,6 +448,15 @@ def classify_us_regime(
             confidence = 0.30
         else:
             parts.append("Mixed signals")
+
+        # VWAP + intraday return double-confirmation override
+        _enough_bars_uc = today_bars is not None and len(today_bars) >= 30
+        if open_price > 0 and vwap > 0 and _enough_bars_uc:
+            intraday_ret = (price - open_price) / open_price
+            _ret_lean = "bearish" if intraday_ret < 0 else "bullish"
+            _vwap_lean = "bearish" if price < vwap else "bullish"
+            if abs(intraday_ret) > 0.005 and _ret_lean == _vwap_lean:
+                lean = _ret_lean
 
         result = USRegimeResult(
             regime=USRegimeType.UNCLEAR, confidence=confidence,

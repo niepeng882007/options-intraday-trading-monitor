@@ -31,6 +31,14 @@ regime:
     min_sample_days: 5
     min_trend_day_floor: 1.0
     gap_significance_threshold: 0.3
+  structure_trend:
+    enabled: true
+    window: 15              # Layer 2 window size (bars = minutes with 1m)
+    min_windows: 3          # Layer 2 minimum window count
+    consistency: 0.67       # Layer 2 direction consistency threshold
+    fast_min_bars: 20       # Layer 1 minimum bar count
+    fast_side_pct: 0.80     # Layer 1 price-VWAP same-side ratio
+    fast_r2_min: 0.70       # Layer 1 close regression R² threshold
 
 filters:
   calendar_file: "config/us_calendar.yaml"
@@ -40,6 +48,9 @@ gamma_wall:
   enabled: true
   use_weekly_expiry: true
   max_distance_pct: 10        # exclude gamma walls >10% from current price in level dict
+  adverse_warning:
+    max_pain_adr_ratio: 0.5   # MaxPain 偏离阈值 = ADR * ratio
+    wall_proximity_adr_ratio: 0.3  # Wall 靠墙阈值 = ADR * ratio
 
 auto_scan:
   enabled: true
