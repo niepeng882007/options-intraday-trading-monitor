@@ -182,6 +182,13 @@ def classify_regime(
     fade_chop_rvol: float = 0.0,    # 0 = fallback to range_rvol
     unclear_atr_pct: float = 0.5,
     unclear_vwap_proximity_pct: float = 0.5,
+    # Pulse trend + directional trap params
+    pulse_peak_ratio: float = 0.0,
+    pulse_displacement_pct: float = 0.0,
+    peak_rvol: float = 0.0,
+    directional_trap_pct: float = 1.5,
+    pulse_min_ratio: float = 2.5,
+    pulse_min_displacement_pct: float = 1.0,
 ) -> RegimeResult:
     """Classify current market regime into 5 classes.
 
@@ -351,12 +358,13 @@ def classify_regime(
     if ib_valid:
         ib_breakout = price > ibh or price < ibl
 
-    if rvol >= _trend_rvol and (outside_value or ib_breakout):
+    _effective_rvol = max(rvol, peak_rvol)
+    if _effective_rvol >= _trend_rvol and (outside_value or ib_breakout):
         trend_direction = "above VAH" if price > vp.vah else "below VAL"
         if not outside_value and ib_breakout:
             trend_direction = "above IBH" if price > ibh else "below IBL"
 
-        base = min(1.0, (rvol - _trend_rvol) / 0.5 * 0.5 + 0.5)
+        base = min(1.0, (_effective_rvol - _trend_rvol) / 0.5 * 0.5 + 0.5)
         va_adj = _price_va_distance_factor(price, vp.vah, vp.val, "TREND") * 0.1
         gw_adj = -0.05 if near_gamma_wall else 0.0
         confidence = min(1.0, max(0.0, base + va_adj + gw_adj))
@@ -445,7 +453,7 @@ def classify_regime(
         )
 
     # ── 4b. Momentum Trend — outside VA, low RVOL but significant distance ──
-    if outside_value and rvol < _trend_rvol:
+    if outside_value and _effective_rvol < _trend_rvol:
         if price > vp.vah:
             va_dist_pct = (price - vp.vah) / price * 100
         else:
@@ -508,6 +516,54 @@ def classify_regime(
                 gap_pct=gap_pct, direction=td_direction,
             )
 
+    # ── 4c. Pulse Trend — IB breakout + volume pulse despite low RVOL ──
+    if (
+        _effective_rvol < _trend_rvol
+        and ib_breakout
+        and pulse_peak_ratio >= pulse_min_ratio
+        and pulse_displacement_pct >= pulse_min_displacement_pct
+    ):
+        pulse_dir = "bullish" if price > ibh else "bearish"
+        surge_adj = min(0.05, (pulse_peak_ratio - pulse_min_ratio) / 5.0 * 0.05)
+        ib_adj = 0.05 if outside_value else 0.0
+        confidence = min(0.60, 0.45 + surge_adj + ib_adj)
+
+        details = (
+            f"Pulse Trend: peak {pulse_peak_ratio:.1f}x, displacement {pulse_displacement_pct:.2f}%, "
+            f"RVOL {rvol:.2f}"
+        )
+
+        # VWAP contradiction penalty
+        if vwap > 0:
+            if pulse_dir == "bullish" and price < vwap:
+                confidence -= 0.15
+                details += ", VWAP contradiction"
+            elif pulse_dir == "bearish" and price > vwap:
+                confidence -= 0.15
+                details += ", VWAP contradiction"
+
+        confidence = max(0.0, confidence)
+        return RegimeResult(
+            regime=RegimeType.TREND_DAY, confidence=confidence,
+            rvol=rvol, price=price, vah=vp.vah, val=vp.val, poc=vp.poc,
+            details=details,
+            gap_pct=gap_pct, direction=pulse_dir,
+        )
+
+    # ── 4d. Directional Trap — low RVOL but large price displacement from open ──
+    if (
+        _effective_rvol < _fade_rvol
+        and _open > 0
+        and abs(price - _open) / _open * 100 > directional_trap_pct
+    ):
+        trap_dir = "bullish" if price > _open else "bearish"
+        return RegimeResult(
+            regime=RegimeType.UNCLEAR, confidence=0.30,
+            rvol=rvol, price=price, vah=vp.vah, val=vp.val, poc=vp.poc,
+            details=f"Directional trap: price moved {abs(price - _open) / _open * 100:.1f}% from open, RVOL {rvol:.2f} < {_fade_rvol}",
+            gap_pct=gap_pct, direction=trap_dir, lean=trap_dir,
+        )
+
     # ── 5. FADE_CHOP: inside VA + low RVOL ──
     if rvol <= _fade_rvol and inside_value:
         base = min(1.0, (_fade_rvol - rvol) / 0.3 * 0.5 + 0.5)
@@ -560,6 +616,23 @@ def classify_regime(
                 confidence = max(0.0, confidence - surge_discount)
                 details += ", volume surge near VA edge"
                 if confidence < 0.40:
+                    return RegimeResult(
+                        regime=RegimeType.UNCLEAR, confidence=confidence,
+                        rvol=rvol, price=price, vah=vp.vah, val=vp.val, poc=vp.poc,
+                        details=details + " → downgraded to UNCLEAR",
+                        gap_pct=gap_pct, direction=direction,
+                    )
+
+        # Momentum discount: large unidirectional move toward VA edge
+        if _open > 0 and va_range > 0:
+            open_to_current_pct = abs(price - _open) / _open * 100
+            dist_to_nearest_edge = min(abs(price - vp.vah), abs(price - vp.val))
+            near_edge_ratio = dist_to_nearest_edge / va_range
+            if open_to_current_pct > 1.2 and near_edge_ratio < 0.25:
+                momentum_discount = min(0.20, (open_to_current_pct - 1.2) * 0.10)
+                confidence = max(0.0, confidence - momentum_discount)
+                details += f", momentum discount ({open_to_current_pct:.1f}% from open, near edge {near_edge_ratio:.2f})"
+                if confidence < 0.35:
                     return RegimeResult(
                         regime=RegimeType.UNCLEAR, confidence=confidence,
                         rvol=rvol, price=price, vah=vp.vah, val=vp.val, poc=vp.poc,

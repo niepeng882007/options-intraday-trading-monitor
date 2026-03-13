@@ -363,6 +363,81 @@ def cap_tp1(
     return plan
 
 
+def check_regime_consistency(
+    plans: list[ActionPlan],
+    regime_type: str,
+    price: float,
+    open_price: float,
+    ibh: float,
+    ibl: float,
+    vwap: float,
+) -> list[ActionPlan]:
+    """Demote plans when FADE_CHOP regime but price is outside IB range.
+
+    If price is >0.3% outside IB, demote A/B plans.
+    If |price - vwap| / vwap > 1.0%, add VWAP deviation warning.
+    Only applies to FADE_CHOP regime.
+    """
+    if regime_type != "FADE_CHOP":
+        return plans
+    if ibh <= 0 or ibl <= 0:
+        return plans
+
+    # Check if price is outside IB by > 0.3%
+    outside_ib = False
+    if price > ibh:
+        ib_dist_pct = (price - ibh) / ibh * 100
+        if ib_dist_pct > 0.3:
+            outside_ib = True
+    elif price < ibl:
+        ib_dist_pct = (ibl - price) / ibl * 100
+        if ib_dist_pct > 0.3:
+            outside_ib = True
+
+    if outside_ib:
+        for plan in plans:
+            if plan.label in ("A", "B") and plan.entry is not None:
+                plan.demoted = True
+                if not plan.demote_reason:
+                    plan.demote_reason = "FADE_CHOP 但价格已超出 IB 区间, 震荡逻辑存疑"
+
+    # VWAP deviation warning
+    if vwap > 0 and price > 0:
+        vwap_dev_pct = abs(price - vwap) / vwap * 100
+        if vwap_dev_pct > 1.0:
+            for plan in plans:
+                if plan.label in ("A", "B") and plan.entry is not None:
+                    w = f"价格偏离 VWAP {vwap_dev_pct:.1f}%, 均值回归风险"
+                    plan.warning = f"{plan.warning}; {w}" if plan.warning else w
+
+    return plans
+
+
+def check_entry_proximity(
+    plan: ActionPlan,
+    current_price: float,
+    min_dist_pct: float = 0.5,
+) -> ActionPlan:
+    """Demote plan if entry is too close to current price.
+
+    Skip Plan C and plans with no entry.
+    """
+    if plan.label == "C" or plan.entry is None:
+        return plan
+    if current_price <= 0:
+        return plan
+
+    dist_pct = abs(plan.entry - current_price) / current_price * 100
+    if dist_pct < min_dist_pct:
+        plan.demoted = True
+        if not plan.demote_reason:
+            plan.demote_reason = (
+                f"入场位距当前价仅 {dist_pct:.2f}%, "
+                f"低于最小距离 {min_dist_pct:.1f}%"
+            )
+    return plan
+
+
 def apply_gamma_wall_warning(
     plans: list[ActionPlan],
     price: float,

@@ -12,11 +12,16 @@ from datetime import datetime, timedelta, timezone
 from src.common.action_plan import (
     ActionPlan,
     PlanContext,
+    apply_gamma_wall_warning as _apply_gamma_wall_warning,
     apply_min_rr_gate as _apply_min_rr_gate,
+    apply_vwap_deviation_warning as _apply_vwap_deviation_warning,
     apply_wait_coherence as _apply_wait_coherence,
     calculate_rr as _calculate_rr,
+    cap_tp1 as _cap_tp1_common,
     cap_tp2 as _cap_tp2_common,
+    check_entry_proximity as _check_entry_proximity,
     check_entry_reachability as _check_entry_reachability,
+    check_regime_consistency as _check_regime_consistency,
     compact_option_line as _compact_option_line,
     find_fade_entry_zone as _find_fade_entry_zone_common,
     format_action_plan as _format_action_plan,
@@ -129,6 +134,12 @@ def _find_fade_entry_zone(
     va_edge: float, opposite_edge: float, levels: dict[str, float],
 ) -> tuple[str, float] | None:
     return _find_fade_entry_zone_common(va_edge, opposite_edge, levels)
+
+
+def _cap_tp1(
+    plan: ActionPlan, ctx: PlanContext, levels: dict[str, float],
+) -> ActionPlan:
+    return _cap_tp1_common(plan, ctx, levels)
 
 
 def _cap_tp2(
@@ -292,6 +303,11 @@ def _plans_fade_bearish(
 
     # Plan B: VWAP regression
     plan_b_entry = vwap if vwap > vp.poc else None
+    # VWAP direction check: bullish session (open < vwap < price) invalidates VWAP short
+    if plan_b_entry is not None:
+        _day_open = levels.get("Open", 0.0)
+        if _day_open > 0 and _day_open < vwap < price:
+            plan_b_entry = None
     if plan_b_entry:
         sl_b_candidates = _nearest_levels(plan_b_entry, "above", levels, n=1)
         sl_b_price = sl_b_candidates[0][1] if sl_b_candidates else vp.vah
@@ -353,6 +369,11 @@ def _plans_fade_bullish(
 
     # Plan B: VWAP regression
     plan_b_entry = vwap if vwap < vp.poc else None
+    # VWAP direction check: bearish session (price < vwap < open) invalidates VWAP long
+    if plan_b_entry is not None:
+        _day_open = levels.get("Open", 0.0)
+        if _day_open > 0 and price < vwap < _day_open:
+            plan_b_entry = None
     if plan_b_entry:
         sl_b_candidates = _nearest_levels(plan_b_entry, "below", levels, n=1)
         sl_b_price = sl_b_candidates[0][1] if sl_b_candidates else vp.val
@@ -502,6 +523,9 @@ def _generate_action_plans(
     vwap: float,
     option_rec: OptionRecommendation | None,
     ctx: PlanContext | None = None,
+    ibh: float = 0.0,
+    ibl: float = 0.0,
+    gamma_wall: GammaWallResult | None = None,
 ) -> list[ActionPlan]:
     """Generate A/B/C action plans based on regime and direction."""
     price = regime.price
@@ -526,10 +550,17 @@ def _generate_action_plans(
 
     # Post-processing
     if ctx:
+        plans = _check_regime_consistency(
+            plans, regime.regime.name, price, regime.price, ibh, ibl, vwap,
+        )
+        plans = [_cap_tp1(p, ctx, levels) for p in plans]
         plans = [_cap_tp2(p, ctx, levels) for p in plans]
         plans = [_check_entry_reachability(p, price, ctx) for p in plans]
+        plans = [_check_entry_proximity(p, price) for p in plans]
         plans = _apply_wait_coherence(plans, ctx)
         plans = _apply_min_rr_gate(plans, ctx)
+        plans = _apply_gamma_wall_warning(plans, price, gamma_wall, ctx)
+        plans = _apply_vwap_deviation_warning(plans, price, vwap)
     return plans
 
 
@@ -803,6 +834,9 @@ def format_playbook_message(
 
     plans = _generate_action_plans(
         regime, _direction, vp, levels, vwap, recommendation, ctx=_plan_ctx,
+        ibh=kl.ibh if kl else 0.0,
+        ibl=kl.ibl if kl else 0.0,
+        gamma_wall=gamma_wall,
     )
     for plan in plans:
         for plan_line in _format_action_plan(plan):

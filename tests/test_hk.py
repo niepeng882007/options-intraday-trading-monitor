@@ -3229,3 +3229,429 @@ class TestFadePlanB_NoEntry_NoSL:
         plan_b = plans[1]
         assert plan_b.entry == 102.0
         assert plan_b.stop_loss is not None
+
+
+# ── Fix: cap_tp1 integration ──
+
+
+class TestHKCapTP1:
+    """cap_tp1 should be applied in HK playbook post-processing."""
+
+    def test_cap_tp1_replaces_unreachable_tp1(self):
+        """TP1 beyond reachable range should be replaced by nearer level."""
+        from src.common.action_plan import ActionPlan, PlanContext, cap_tp1
+        plan = ActionPlan(
+            label="A", name="test", emoji="📈", is_primary=True,
+            logic="test", direction="bullish",
+            trigger="test", entry=100.0, entry_action="做多",
+            stop_loss=98.0, stop_loss_reason="below",
+            tp1=120.0, tp1_label="远端",
+            tp2=130.0, tp2_label="更远",
+            rr_ratio=10.0,
+        )
+        # Very limited reachable range
+        ctx = PlanContext(
+            minutes_to_close=30, total_session_minutes=330,
+            rvol=0.5, avg_daily_range_pct=2.0, intraday_range_pct=1.5,
+        )
+        levels = {"POC": 102.0, "VAH": 105.0, "VAL": 95.0, "PDH": 108.0}
+        result = cap_tp1(plan, ctx, levels)
+        # TP1 should be replaced by a nearer level or warning added
+        assert result.tp1 != 120.0 or result.warning
+
+    def test_cap_tp1_keeps_reachable_tp1(self):
+        """TP1 within reachable range should remain unchanged."""
+        from src.common.action_plan import ActionPlan, PlanContext, cap_tp1
+        plan = ActionPlan(
+            label="A", name="test", emoji="📈", is_primary=True,
+            logic="test", direction="bullish",
+            trigger="test", entry=100.0, entry_action="做多",
+            stop_loss=98.0, stop_loss_reason="below",
+            tp1=102.0, tp1_label="POC",
+            tp2=105.0, tp2_label="VAH",
+            rr_ratio=1.0,
+        )
+        ctx = PlanContext(
+            minutes_to_close=300, total_session_minutes=330,
+            rvol=1.2, avg_daily_range_pct=3.0,
+        )
+        levels = {"POC": 102.0, "VAH": 105.0, "VAL": 95.0}
+        result = cap_tp1(plan, ctx, levels)
+        assert result.tp1 == 102.0
+        assert not result.warning
+
+
+# ── Fix: VWAP direction-aware Plan B ──
+
+
+class TestFadeBearishVWAPDirection:
+    """Bullish session should nullify FADE_CHOP bearish Plan B entry."""
+
+    def test_bullish_session_nullifies_plan_b(self):
+        """open < vwap < price → bullish session → Plan B entry=None."""
+        from src.hk.playbook import _plans_fade_bearish
+        vp = VolumeProfileResult(poc=100, vah=105, val=95)
+        # Open=101, VWAP=102, price=104 → bullish session
+        levels = {"POC": 100.0, "VAH": 105.0, "VAL": 95.0, "Open": 101.0}
+        plans = _plans_fade_bearish(
+            price=104, vp=vp, levels=levels, vwap=102.0, option_line=None,
+        )
+        plan_b = plans[1]
+        assert plan_b.entry is None
+        assert plan_b.stop_loss is None
+
+    def test_bearish_session_keeps_plan_b(self):
+        """open > vwap → not a bullish session → Plan B entry preserved."""
+        from src.hk.playbook import _plans_fade_bearish
+        vp = VolumeProfileResult(poc=100, vah=105, val=95)
+        # Open=104, VWAP=102, price=103 → open > vwap, not bullish alignment
+        levels = {"POC": 100.0, "VAH": 105.0, "VAL": 95.0, "Open": 104.0}
+        plans = _plans_fade_bearish(
+            price=103, vp=vp, levels=levels, vwap=102.0, option_line=None,
+        )
+        plan_b = plans[1]
+        assert plan_b.entry == 102.0
+
+    def test_no_open_preserves_plan_b(self):
+        """No Open in levels → direction check skipped → Plan B preserved."""
+        from src.hk.playbook import _plans_fade_bearish
+        vp = VolumeProfileResult(poc=100, vah=105, val=95)
+        levels = {"POC": 100.0, "VAH": 105.0, "VAL": 95.0}
+        plans = _plans_fade_bearish(
+            price=104, vp=vp, levels=levels, vwap=102.0, option_line=None,
+        )
+        plan_b = plans[1]
+        assert plan_b.entry == 102.0
+
+    def test_fade_bullish_bearish_session_nullifies_plan_b(self):
+        """price < vwap < open → bearish session → bullish Plan B entry=None."""
+        from src.hk.playbook import _plans_fade_bullish
+        vp = VolumeProfileResult(poc=100, vah=105, val=95)
+        # Open=99, VWAP=98, price=96 → price < vwap < open → bearish session
+        levels = {"POC": 100.0, "VAH": 105.0, "VAL": 95.0, "Open": 99.0}
+        plans = _plans_fade_bullish(
+            price=96, vp=vp, levels=levels, vwap=98.0, option_line=None,
+        )
+        plan_b = plans[1]
+        assert plan_b.entry is None
+        assert plan_b.stop_loss is None
+
+
+# ── Fix: FADE_CHOP momentum discount ──
+
+
+class TestFadeChopMomentumDiscount:
+    """Large unidirectional move near VA edge should discount FADE_CHOP confidence."""
+
+    def test_momentum_discount_applied(self):
+        """open_to_current > 1.2% + near VA edge → confidence reduced."""
+        from src.hk.regime import classify_regime
+        vp = VolumeProfileResult(poc=100, vah=105, val=95)
+        # Open=100, price=104.5 → 4.5% move, near VAH (dist=0.5, ratio=0.05)
+        # rvol == fade_chop_rvol bypasses Directional Trap (strict <) but enters FADE_CHOP (<=)
+        result = classify_regime(
+            price=104.5, rvol=0.8, vp=vp,
+            open_price=100.0, prev_close=100.0,
+            fade_chop_rvol=0.8,
+        )
+        assert "momentum discount" in result.details
+
+    def test_momentum_discount_downgrades_to_unclear(self):
+        """Very large move with low base confidence → downgraded to UNCLEAR."""
+        from src.hk.regime import classify_regime
+        vp = VolumeProfileResult(poc=100, vah=105, val=95)
+        # wide intraday range + failed breakout to lower confidence first
+        bars = _make_bars([
+            ("2026-03-13 09:30", 100, 106, 99, 104.8, 1000),
+            *[("2026-03-13 09:%02d" % (31 + i), 104, 105, 103, 104.8, 500) for i in range(20)],
+        ])
+        # rvol == fade_chop_rvol bypasses Directional Trap (strict <) but enters FADE_CHOP (<=)
+        result = classify_regime(
+            price=104.8, rvol=0.8, vp=vp,
+            open_price=100.0, prev_close=100.0,
+            fade_chop_rvol=0.8,
+            intraday_range=7.0,  # wide range triggers additional discounts
+            today_bars=bars,
+            range_discount_threshold=0.3,
+        )
+        # Should be either UNCLEAR or have reduced confidence
+        if result.regime == RegimeType.FADE_CHOP:
+            assert "momentum discount" in result.details
+        else:
+            assert result.regime == RegimeType.UNCLEAR
+
+    def test_no_discount_when_price_near_center(self):
+        """Price near VA center (edge_ratio > 0.25) → no momentum discount."""
+        from src.hk.regime import classify_regime
+        vp = VolumeProfileResult(poc=100, vah=105, val=95)
+        # Open=98, price=100 → 2.0% move, but near POC center (dist_vah=5, dist_val=5, ratio=0.5)
+        # rvol == fade_chop_rvol bypasses Directional Trap (strict <) but enters FADE_CHOP (<=)
+        result = classify_regime(
+            price=100, rvol=0.8, vp=vp,
+            open_price=98.0, prev_close=98.0,
+            fade_chop_rvol=0.8,
+        )
+        assert "momentum discount" not in result.details
+
+    def test_no_discount_when_small_move(self):
+        """Small move from open (< 1.2%) → no momentum discount."""
+        from src.hk.regime import classify_regime
+        vp = VolumeProfileResult(poc=100, vah=105, val=95)
+        # Open=103.5, price=104 → 0.48% move
+        result = classify_regime(
+            price=104, rvol=0.6, vp=vp,
+            open_price=103.5, prev_close=103.5,
+            fade_chop_rvol=0.8,
+        )
+        assert "momentum discount" not in result.details
+
+
+# ── Pulse Trend + Directional Trap Tests ──
+
+
+class TestPulseTrend:
+    """P0-2: Volume pulse + IB breakout → TREND_DAY (capped at 0.60)."""
+
+    def _vp(self, poc=500, vah=510, val=490):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    def test_pulse_ib_breakout_bullish(self):
+        """Pulse peak + IB breakout above → TREND_DAY with confidence ≤ 0.60."""
+        result = classify_regime(
+            price=515, rvol=0.8, vp=self._vp(),
+            ibh=512, ibl=498,
+            trend_day_rvol=1.05, fade_chop_rvol=0.85,
+            pulse_peak_ratio=3.0, pulse_displacement_pct=1.5,
+            pulse_min_ratio=2.5, pulse_min_displacement_pct=1.0,
+        )
+        assert result.regime == RegimeType.TREND_DAY
+        assert result.confidence <= 0.60
+        assert "Pulse" in result.details
+
+    def test_pulse_overrides_trap(self):
+        """Pulse Trend (4c) should fire before Directional Trap (4d)."""
+        # price=505 is inside VA (val=490, vah=510) but above IBH=498
+        # so Momentum (4b) won't fire (inside_value=True, not outside_value)
+        # but IB breakout + pulse → Pulse Trend
+        result = classify_regime(
+            price=505, rvol=0.7, vp=self._vp(),
+            ibh=498, ibl=490,
+            open_price=496, prev_close=495,
+            trend_day_rvol=1.05, fade_chop_rvol=0.85,
+            pulse_peak_ratio=3.0, pulse_displacement_pct=1.2,
+            directional_trap_pct=1.5,
+            pulse_min_ratio=2.5, pulse_min_displacement_pct=1.0,
+        )
+        assert result.regime == RegimeType.TREND_DAY
+        assert "Pulse" in result.details
+
+    def test_bearish_pulse(self):
+        """Bearish pulse: price below IBL → TREND_DAY bearish."""
+        result = classify_regime(
+            price=485, rvol=0.8, vp=self._vp(),
+            ibh=512, ibl=498,
+            trend_day_rvol=1.05, fade_chop_rvol=0.85,
+            pulse_peak_ratio=3.5, pulse_displacement_pct=2.0,
+            pulse_min_ratio=2.5, pulse_min_displacement_pct=1.0,
+        )
+        assert result.regime == RegimeType.TREND_DAY
+        assert result.direction == "bearish"
+        assert result.confidence <= 0.60
+
+    def test_boundary_displacement_no_pulse(self):
+        """Displacement below threshold → no pulse, falls through to other logic."""
+        result = classify_regime(
+            price=515, rvol=0.8, vp=self._vp(),
+            ibh=512, ibl=498,
+            trend_day_rvol=1.05, fade_chop_rvol=0.85,
+            pulse_peak_ratio=3.0, pulse_displacement_pct=0.5,
+            pulse_min_ratio=2.5, pulse_min_displacement_pct=1.0,
+        )
+        # Should NOT be pulse trend
+        if result.regime == RegimeType.TREND_DAY:
+            assert "Pulse" not in result.details
+
+
+class TestDirectionalTrap:
+    """P0-1: Low RVOL + large price displacement from open → UNCLEAR with lean."""
+
+    def _vp(self, poc=500, vah=510, val=490):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    def test_directional_trap_bullish(self):
+        """Price moved >1.5% above open with low RVOL → UNCLEAR with bullish lean."""
+        result = classify_regime(
+            price=510, rvol=0.6, vp=self._vp(),
+            open_price=500, prev_close=498,
+            ibh=0, ibl=0,  # No IB data
+            trend_day_rvol=1.05, fade_chop_rvol=0.85,
+            directional_trap_pct=1.5,
+        )
+        assert result.regime == RegimeType.UNCLEAR
+        assert result.confidence == 0.30
+        assert result.lean == "bullish"
+        assert "Directional trap" in result.details
+
+
+# ── Regime Consistency Check Tests ──
+
+
+class TestCheckRegimeConsistency:
+    """P1-1: FADE_CHOP + price outside IB → demoted."""
+
+    def test_fade_chop_outside_ib_demoted(self):
+        from src.common.action_plan import ActionPlan, check_regime_consistency
+        plans = [
+            ActionPlan(
+                label="A", name="test", emoji="📉", is_primary=True,
+                logic="test", direction="bearish", trigger="test",
+                entry=100.0, entry_action="做空",
+                stop_loss=102.0, stop_loss_reason="test",
+                tp1=98.0, tp1_label="POC", tp2=96.0, tp2_label="VAL",
+                rr_ratio=1.0,
+            ),
+        ]
+        result = check_regime_consistency(
+            plans, "FADE_CHOP", price=103.5, open_price=100.0,
+            ibh=101.0, ibl=99.0, vwap=100.0,
+        )
+        assert result[0].demoted is True
+        assert "IB" in result[0].demote_reason
+
+    def test_non_fade_chop_passthrough(self):
+        from src.common.action_plan import ActionPlan, check_regime_consistency
+        plans = [
+            ActionPlan(
+                label="A", name="test", emoji="📈", is_primary=True,
+                logic="test", direction="bullish", trigger="test",
+                entry=100.0, entry_action="做多",
+                stop_loss=98.0, stop_loss_reason="test",
+                tp1=102.0, tp1_label="VAH", tp2=104.0, tp2_label="PDH",
+                rr_ratio=1.0,
+            ),
+        ]
+        result = check_regime_consistency(
+            plans, "TREND_DAY", price=103.5, open_price=100.0,
+            ibh=101.0, ibl=99.0, vwap=100.0,
+        )
+        assert result[0].demoted is False
+
+    def test_fade_chop_inside_ib_no_demotion(self):
+        from src.common.action_plan import ActionPlan, check_regime_consistency
+        plans = [
+            ActionPlan(
+                label="A", name="test", emoji="📉", is_primary=True,
+                logic="test", direction="bearish", trigger="test",
+                entry=100.0, entry_action="做空",
+                stop_loss=102.0, stop_loss_reason="test",
+                tp1=98.0, tp1_label="POC", tp2=96.0, tp2_label="VAL",
+                rr_ratio=1.0,
+            ),
+        ]
+        result = check_regime_consistency(
+            plans, "FADE_CHOP", price=100.2, open_price=100.0,
+            ibh=101.0, ibl=99.0, vwap=100.0,
+        )
+        assert result[0].demoted is False
+
+
+# ── Entry Proximity Check Tests ──
+
+
+class TestCheckEntryProximity:
+    """P1-2: Entry too close to current price → demoted."""
+
+    def test_entry_too_close_demoted(self):
+        from src.common.action_plan import ActionPlan, check_entry_proximity
+        plan = ActionPlan(
+            label="A", name="test", emoji="📈", is_primary=True,
+            logic="test", direction="bullish", trigger="test",
+            entry=100.2, entry_action="做多",
+            stop_loss=99.0, stop_loss_reason="test",
+            tp1=102.0, tp1_label="VAH", tp2=104.0, tp2_label="PDH",
+            rr_ratio=1.5,
+        )
+        result = check_entry_proximity(plan, current_price=100.0, min_dist_pct=0.5)
+        assert result.demoted is True
+        assert "入场位距当前价" in result.demote_reason
+
+
+# ── Peak Session RVOL Tests ──
+
+
+class TestPeakSessionRVOL:
+    """P2: Peak session RVOL = max(morning, afternoon)."""
+
+    @staticmethod
+    def _make_session_bars(date_str, start_h, start_m, count, volume):
+        """Generate bars with proper time increments."""
+        from datetime import datetime as dt, timedelta as td
+        base = dt.strptime(f"{date_str} {start_h:02d}:{start_m:02d}:00", "%Y-%m-%d %H:%M:%S")
+        return [
+            ((base + td(minutes=i)).strftime("%Y-%m-%d %H:%M:%S"), 100, 101, 99, 100, volume)
+            for i in range(count)
+        ]
+
+    def test_morning_dominates(self):
+        """Morning has higher volume → peak should reflect morning RVOL."""
+        from src.hk.indicators import calculate_peak_session_rvol
+        morning = self._make_session_bars("2026-03-09", 9, 30, 20, 20000)
+        afternoon = self._make_session_bars("2026-03-09", 13, 0, 20, 5000)
+        today = _make_bars(morning + afternoon)
+
+        hist_data = []
+        for d in ("2026-03-07", "2026-03-08"):
+            hist_data.extend(self._make_session_bars(d, 9, 30, 80, 10000))
+            hist_data.extend(self._make_session_bars(d, 13, 0, 80, 10000))
+        hist = _make_bars(hist_data)
+
+        peak = calculate_peak_session_rvol(today, hist)
+        assert peak > 1.0  # morning has 2x volume
+
+    def test_insufficient_afternoon_bars(self):
+        """Afternoon with < min_session_bars → excluded, only morning counts."""
+        from src.hk.indicators import calculate_peak_session_rvol
+        morning = self._make_session_bars("2026-03-09", 9, 30, 20, 10000)
+        afternoon = self._make_session_bars("2026-03-09", 13, 0, 3, 10000)
+        today = _make_bars(morning + afternoon)
+
+        hist_data = []
+        for d in ("2026-03-07", "2026-03-08"):
+            hist_data.extend(self._make_session_bars(d, 9, 30, 80, 10000))
+            hist_data.extend(self._make_session_bars(d, 13, 0, 80, 10000))
+        hist = _make_bars(hist_data)
+
+        peak = calculate_peak_session_rvol(today, hist, min_session_bars=15)
+        # Should only use morning, afternoon excluded
+        assert peak >= 0.5  # morning RVOL ~ 1.0
+
+
+# ── Volume Pulse Detection Tests ──
+
+
+class TestDetectVolumePulse:
+    """P0-2: detect_volume_pulse() basic tests."""
+
+    def test_no_pulse_uniform_volume(self):
+        from src.hk.indicators import detect_volume_pulse
+        bars = _make_bars([
+            (f"2026-03-09 {9 + i // 60:02d}:{30 + i % 60:02d}:00", 100, 101, 99, 100, 1000)
+            for i in range(20)
+        ])
+        result = detect_volume_pulse(bars, multiplier=2.5)
+        assert result is None
+
+    def test_pulse_detected_with_surge(self):
+        from src.hk.indicators import detect_volume_pulse
+        base = [
+            (f"2026-03-09 {9 + i // 60:02d}:{30 + i % 60:02d}:00", 100, 101, 99, 100, 1000)
+            for i in range(15)
+        ]
+        # Add surge bars with price move
+        base.append(("2026-03-09 09:45:00", 100, 103, 100, 102, 5000))
+        base.append(("2026-03-09 09:46:00", 102, 104, 102, 103, 6000))
+        bars = _make_bars(base)
+        result = detect_volume_pulse(bars, multiplier=2.5)
+        assert result is not None
+        assert result.peak_ratio >= 2.5
+        assert result.direction == "bullish"

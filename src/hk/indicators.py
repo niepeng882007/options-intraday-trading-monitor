@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, time as dt_time, timedelta, timezone
 
 import numpy as np
@@ -130,6 +131,135 @@ def calculate_rvol(
         session, today_vol, avg_vol, rvol,
     )
     return float(rvol)
+
+
+@dataclass
+class PulseEvent:
+    """Represents a volume pulse (sudden surge) with price displacement."""
+    peak_ratio: float           # max bar volume / expanding median
+    displacement_pct: float     # price move % during pulse context window
+    surge_bar_count: int        # number of bars exceeding threshold
+    direction: str              # "bullish" / "bearish"
+
+
+def detect_volume_pulse(
+    today_bars: pd.DataFrame,
+    multiplier: float = 2.5,
+    context_bars: int = 2,
+    min_surge_bars: int = 1,
+) -> PulseEvent | None:
+    """Detect a volume pulse event in today's bars.
+
+    Uses expanding window median as baseline. Scans for bars where
+    volume >= median * multiplier, then calculates price displacement
+    over the surge + context window.
+
+    Returns PulseEvent if detected, None otherwise.
+    """
+    if today_bars.empty or len(today_bars) < 10:
+        return None
+
+    volumes = today_bars["Volume"].values
+    closes = today_bars["Close"].values
+
+    # Expanding median baseline (cumulative median up to each bar)
+    surge_indices: list[int] = []
+    peak_ratio = 0.0
+    for i in range(5, len(volumes)):
+        median_so_far = float(np.median(volumes[:i]))
+        if median_so_far <= 0:
+            continue
+        ratio = volumes[i] / median_so_far
+        if ratio >= multiplier:
+            surge_indices.append(i)
+            peak_ratio = max(peak_ratio, ratio)
+
+    if len(surge_indices) < min_surge_bars:
+        return None
+
+    # Context window: from (first_surge - context_bars) to (last_surge + context_bars)
+    ctx_start = max(0, surge_indices[0] - context_bars)
+    ctx_end = min(len(closes) - 1, surge_indices[-1] + context_bars)
+
+    price_start = float(closes[ctx_start])
+    price_end = float(closes[ctx_end])
+    if price_start <= 0:
+        return None
+
+    displacement_pct = abs(price_end - price_start) / price_start * 100
+    direction = "bullish" if price_end > price_start else "bearish"
+
+    return PulseEvent(
+        peak_ratio=peak_ratio,
+        displacement_pct=displacement_pct,
+        surge_bar_count=len(surge_indices),
+        direction=direction,
+    )
+
+
+def calculate_peak_session_rvol(
+    today_bars: pd.DataFrame,
+    history_bars: pd.DataFrame,
+    lookback_days: int = 10,
+    min_session_bars: int = 15,
+) -> float:
+    """Calculate peak session RVOL = max(morning_rvol, afternoon_rvol).
+
+    Filters out history days with < 150 bars (anomalous/partial).
+    Sessions with < min_session_bars today bars are excluded from max.
+    Falls back to 1.0 when data is insufficient.
+    """
+    if today_bars.empty or history_bars.empty:
+        return 1.0
+
+    # Filter anomalous history days (< 150 bars)
+    hist_dates = (
+        history_bars.index.date
+        if hasattr(history_bars.index, "date")
+        else pd.to_datetime(history_bars.index).date
+    )
+    unique_dates = sorted(set(hist_dates))
+    valid_dates: list = []
+    for d in unique_dates:
+        day_data = (
+            history_bars[history_bars.index.date == d]
+            if hasattr(history_bars.index, "date")
+            else history_bars[pd.to_datetime(history_bars.index).date == d]
+        )
+        if len(day_data) >= 150:
+            valid_dates.append(d)
+
+    if not valid_dates:
+        return 1.0
+
+    # Rebuild filtered history
+    valid_set = set(valid_dates)
+    if hasattr(history_bars.index, "date"):
+        mask = [d in valid_set for d in history_bars.index.date]
+    else:
+        mask = [d in valid_set for d in pd.to_datetime(history_bars.index).date]
+    filtered_hist = history_bars[mask]
+
+    # Count today's session bars
+    def _count_session_bars(df: pd.DataFrame, session: str) -> int:
+        times = df.index.time if hasattr(df.index, "time") else pd.to_datetime(df.index).time
+        if session == "morning":
+            return sum(1 for t in times if MORNING_OPEN <= t <= MORNING_CLOSE)
+        return sum(1 for t in times if AFTERNOON_OPEN <= t <= AFTERNOON_CLOSE)
+
+    valid_rvols: list[float] = []
+
+    for sess in ("morning", "afternoon"):
+        if _count_session_bars(today_bars, sess) < min_session_bars:
+            continue
+        sess_rvol = calculate_rvol(
+            today_bars, filtered_hist,
+            lookback_days=lookback_days,
+            session=sess,
+        )
+        valid_rvols.append(sess_rvol)
+
+    return max(valid_rvols) if valid_rvols else 1.0
 
 
 def get_today_bars(bars: pd.DataFrame) -> pd.DataFrame:

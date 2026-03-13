@@ -68,6 +68,9 @@ regime:
   gap_warning_pct: 3.0        # 跳空 >= 3% 触发特殊处理
   va_penetration_min_pct: 0.3  # VA 边界最小渗透 % 才给满置信度
   failed_breakout_pct: 0.5    # 日内 breach VA 边界 >= 0.5% 视为 failed breakout
+  pulse_min_ratio: 2.5         # 脉冲量比阈值 (bar volume / expanding median)
+  pulse_min_displacement_pct: 1.0  # 脉冲价格位移 >= 1.0% 才触发 Pulse Trend
+  directional_trap_pct: 1.5    # 低 RVOL + 价格偏移 open > 1.5% → Directional Trap
 
 market_context:
   hsi_symbol: "HK.800000"

@@ -32,8 +32,10 @@ from src.hk.indicators import (
     build_hk_key_levels,
     calculate_avg_daily_range,
     calculate_initial_balance,
+    calculate_peak_session_rvol,
     calculate_rvol,
     calculate_vwap,
+    detect_volume_pulse,
     get_history_bars,
     get_today_bars,
     minutes_to_close_hk,
@@ -332,6 +334,12 @@ class HKPredictor:
         if surge_warnings:
             filters.warnings.extend(surge_warnings)
 
+        # 8a. Pulse detection + peak session RVOL
+        pulse = detect_volume_pulse(today_bars)
+        p_peak_ratio = pulse.peak_ratio if pulse else 0.0
+        p_displacement = pulse.displacement_pct if pulse else 0.0
+        peak_session_rvol = calculate_peak_session_rvol(today_bars, hist_bars)
+
         # 8b. Regime classification
         intraday_range = quote_snapshot.high_price - quote_snapshot.low_price
         regime = classify_regime(
@@ -365,6 +373,13 @@ class HKPredictor:
             fade_chop_rvol=regime_cfg.get("fade_chop_rvol", 0.0),
             unclear_atr_pct=regime_cfg.get("unclear_atr_pct", 0.5),
             unclear_vwap_proximity_pct=regime_cfg.get("unclear_vwap_proximity_pct", 0.5),
+            # Pulse + peak RVOL params
+            pulse_peak_ratio=p_peak_ratio,
+            pulse_displacement_pct=p_displacement,
+            peak_rvol=peak_session_rvol,
+            directional_trap_pct=regime_cfg.get("directional_trap_pct", 1.5),
+            pulse_min_ratio=regime_cfg.get("pulse_min_ratio", 2.5),
+            pulse_min_displacement_pct=regime_cfg.get("pulse_min_displacement_pct", 1.0),
         )
 
         # 8c. Build HKKeyLevels
@@ -464,6 +479,11 @@ class HKPredictor:
             has_surge = _has_volume_surge(today_bars)
             intraday_range = float(today_bars["High"].max() - today_bars["Low"].min()) if not today_bars.empty else 0.0
 
+            pulse = detect_volume_pulse(today_bars)
+            p_peak = pulse.peak_ratio if pulse else 0.0
+            p_disp = pulse.displacement_pct if pulse else 0.0
+            peak_rvol = calculate_peak_session_rvol(today_bars, hist_bars)
+
             result = classify_regime(
                 price=price,
                 rvol=rvol,
@@ -490,6 +510,12 @@ class HKPredictor:
                 fade_chop_rvol=regime_cfg.get("fade_chop_rvol", 0.0),
                 unclear_atr_pct=regime_cfg.get("unclear_atr_pct", 0.5),
                 unclear_vwap_proximity_pct=regime_cfg.get("unclear_vwap_proximity_pct", 0.5),
+                pulse_peak_ratio=p_peak,
+                pulse_displacement_pct=p_disp,
+                peak_rvol=peak_rvol,
+                directional_trap_pct=regime_cfg.get("directional_trap_pct", 1.5),
+                pulse_min_ratio=regime_cfg.get("pulse_min_ratio", 2.5),
+                pulse_min_displacement_pct=regime_cfg.get("pulse_min_displacement_pct", 1.0),
             )
 
             self._market_context_cache[symbol] = (result, time.time())
@@ -621,6 +647,12 @@ class HKPredictor:
         # L1 VWAP (lightweight, ~1ms)
         l1_vwap = calculate_vwap(today_bars) if not today_bars.empty else 0.0
 
+        # Pulse detection + peak session RVOL
+        l1_pulse = detect_volume_pulse(today_bars)
+        l1_p_peak = l1_pulse.peak_ratio if l1_pulse else 0.0
+        l1_p_disp = l1_pulse.displacement_pct if l1_pulse else 0.0
+        l1_peak_rvol = calculate_peak_session_rvol(today_bars, hist_bars)
+
         # Preliminary regime (no option chain / gamma wall — lightweight)
         regime_cfg = self._cfg.get("regime", {})
         ib_window = regime_cfg.get("ib_window_minutes", 30)
@@ -652,6 +684,12 @@ class HKPredictor:
             fade_chop_rvol=regime_cfg.get("fade_chop_rvol", 0.0),
             unclear_atr_pct=regime_cfg.get("unclear_atr_pct", 0.5),
             unclear_vwap_proximity_pct=regime_cfg.get("unclear_vwap_proximity_pct", 0.5),
+            pulse_peak_ratio=l1_p_peak,
+            pulse_displacement_pct=l1_p_disp,
+            peak_rvol=l1_peak_rvol,
+            directional_trap_pct=regime_cfg.get("directional_trap_pct", 1.5),
+            pulse_min_ratio=regime_cfg.get("pulse_min_ratio", 2.5),
+            pulse_min_displacement_pct=regime_cfg.get("pulse_min_displacement_pct", 1.0),
         )
 
         # ── TREND / GAP_AND_GO L1 check (both sessions) ──
