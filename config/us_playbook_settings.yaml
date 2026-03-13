@@ -37,8 +37,9 @@ regime:
     min_windows: 3          # Layer 2 minimum window count
     consistency: 0.67       # Layer 2 direction consistency threshold
     fast_min_bars: 20       # Layer 1 minimum bar count
-    fast_side_pct: 0.80     # Layer 1 price-VWAP same-side ratio
-    fast_r2_min: 0.70       # Layer 1 close regression R² threshold
+    fast_side_pct: 0.80     # Layer 1 VWAP side cross-validation ratio
+    fast_r2_min: 0.70       # Layer 1 close regression R² entry gate
+    # flat_threshold: DEPRECATED — no longer used as L1 gate (kept for config compat)
 
 filters:
   calendar_file: "config/us_calendar.yaml"

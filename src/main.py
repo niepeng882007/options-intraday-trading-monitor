@@ -27,7 +27,8 @@ logger = setup_logger("main")
 TELEGRAM_READ_TIMEOUT_SECONDS = 30
 TELEGRAM_WRITE_TIMEOUT_SECONDS = 30
 TELEGRAM_CONNECT_TIMEOUT_SECONDS = 15
-TELEGRAM_POOL_TIMEOUT_SECONDS = 5
+TELEGRAM_POOL_TIMEOUT_SECONDS = 10
+TELEGRAM_CONNECTION_POOL_SIZE = 8
 TELEGRAM_POLL_START_RETRIES = 3
 TELEGRAM_POLL_RETRY_BASE_SECONDS = 2
 
@@ -39,6 +40,7 @@ def _build_telegram_application(bot_token: str) -> Application:
         write_timeout=TELEGRAM_WRITE_TIMEOUT_SECONDS,
         connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
         pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS,
+        connection_pool_size=TELEGRAM_CONNECTION_POOL_SIZE,
         proxy=proxy_url,
     )
     get_updates_request = HTTPXRequest(
@@ -46,6 +48,7 @@ def _build_telegram_application(bot_token: str) -> Application:
         write_timeout=TELEGRAM_WRITE_TIMEOUT_SECONDS,
         connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
         pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS,
+        connection_pool_size=TELEGRAM_CONNECTION_POOL_SIZE,
         proxy=proxy_url,
     )
     return (

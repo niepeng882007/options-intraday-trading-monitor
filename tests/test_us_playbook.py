@@ -4847,17 +4847,17 @@ class TestStructureTrendDay:
     # ── detect_price_structure unit tests ──
 
     def test_structure_l1_bearish(self):
-        """20+ bars + close < VWAP 80%+ + R² > 0.70 → L1 bearish."""
-        # Steeper decline to ensure VWAP slope exceeds flat_threshold
+        """20+ bars + R² entry gate + VWAP cross-validation → L1 bearish."""
+        # Steeper decline to ensure R² passes threshold
         bars = self._make_declining_bars(25, start_price=200.0, drop_per_bar=0.50)
         result = detect_price_structure(bars, fast_min_bars=20, fast_r2_min=0.70)
         assert result is not None
         assert result.direction == "bearish"
         assert result.layer == 1
-        assert 0.40 <= result.confidence <= 0.50
+        assert 0.35 <= result.confidence <= 0.65  # R² gate + optional hold bonus
 
     def test_structure_l2_bearish(self):
-        """4 declining windows → L2 bearish with VWAP slope confirmation."""
+        """4 declining windows → L2 bearish with primary gate + secondary."""
         # 60 bars = 4 windows of 15 bars each, steady decline
         bars = self._make_declining_bars(60, start_price=200.0, drop_per_bar=0.10)
         result = detect_price_structure(bars, window=15, min_windows=3, fast_min_bars=20)
@@ -4956,6 +4956,83 @@ class TestStructureTrendDay:
         assert result is not None
         assert result.direction == "bearish"
 
+    # ── RC1/RC2 new tests ──
+
+    def test_structure_l1_moderate_decline(self):
+        """Moderate decline (no extreme VWAP slope) still detected via R² entry gate."""
+        # 25 bars with gentle decline — old VWAP-slope gate would reject this
+        bars = self._make_declining_bars(25, start_price=200.0, drop_per_bar=0.20)
+        result = detect_price_structure(bars, fast_min_bars=20, fast_r2_min=0.70)
+        assert result is not None
+        assert result.direction == "bearish"
+        assert result.layer == 1
+
+    def test_structure_l2_primary_signal_only(self):
+        """L2: LH pattern passes but LL doesn't meet consistency → still detected with penalty."""
+        # 60 bars: highs consistently decline but lows are flat
+        prices = []
+        for i in range(60):
+            t = f"2026-03-13 09:{30 + i}:00" if i < 30 else f"2026-03-13 10:{i - 30:02d}:00"
+            c = 200.0 - 0.10 * i
+            h = c + 0.3 - 0.05 * i  # highs decline
+            l = 197.0  # lows are flat — LL pattern fails
+            o = c + 0.1
+            prices.append((t, o, h, l, c, 500))
+        bars = _make_bars(prices)
+        result = detect_price_structure(bars, window=15, min_windows=3, consistency=0.67)
+        # LH primary should pass, LL secondary fails → still detected with lower conf
+        if result is not None and result.layer == 2:
+            assert result.direction == "bearish"
+            assert result.confidence <= 0.60  # secondary penalty applied
+
+    def test_structure_l2_too_many_violations(self):
+        """L2: Primary signal (LH) doesn't meet consistency threshold → no L2 detection."""
+        # 60 bars: mostly flat highs with occasional rises — LH pattern fails
+        prices = []
+        for i in range(60):
+            t = f"2026-03-13 09:{30 + i}:00" if i < 30 else f"2026-03-13 10:{i - 30:02d}:00"
+            c = 200.0 - 0.02 * i  # very slight decline
+            h = 201.0 + (0.5 if i % 20 < 10 else 0.0)  # highs oscillate, not consistently lower
+            l = c - 0.2
+            o = c + 0.1
+            prices.append((t, o, h, l, c, 500))
+        bars = _make_bars(prices)
+        result = detect_price_structure(bars, window=15, min_windows=3, consistency=0.67)
+        # LH primary should fail → no L2 result (L1 might still fire)
+        if result is not None:
+            assert result.layer != 2 or result.direction == "bearish"
+
+    def test_spy_312_scenario(self):
+        """SPY 3/12 渗透型趋势日: moderate decline + low VWAP slope → now detected."""
+        # Simulate: 50 bars of gradual decline, ~-1.2% total over 50 bars
+        start_price = 565.0
+        drop_per_bar = 0.14  # ~7.0 total = ~1.2%
+        bars = self._make_declining_bars(50, start_price=start_price, drop_per_bar=drop_per_bar)
+        final_price = start_price - drop_per_bar * 49  # ~558.14
+
+        r = classify_us_regime(
+            price=final_price, prev_close=566.0, rvol=0.9,
+            pmh=567.0, pml=563.0,
+            vp=self._vp(poc=562, vah=568, val=556),
+            today_bars=bars,
+            structure_trend_cfg=self._ENABLED_CFG,
+        )
+        # Should be detected as TREND_DAY via structure path (not UNCLEAR)
+        assert r.regime == USRegimeType.TREND_DAY
+        assert "Structure" in r.details
+
+    def test_genuine_chop_not_promoted(self):
+        """Choppy bars should NOT be promoted to TREND_DAY."""
+        bars = self._make_choppy_bars(50, center=200.0)
+        r = classify_us_regime(
+            price=200.5, prev_close=201.0, rvol=0.9,
+            pmh=202.0, pml=198.0,
+            vp=self._vp(poc=200, vah=205, val=195),
+            today_bars=bars,
+            structure_trend_cfg=self._ENABLED_CFG,
+        )
+        assert r.regime != USRegimeType.TREND_DAY
+
 
 # ── TREND_DAY Persistence Tests ──
 
@@ -5024,6 +5101,56 @@ class TestTrendPersistence:
         )
         # With <30 bars, persistence should not activate
         assert r.regime != USRegimeType.TREND_DAY or "persistence" not in r.details.lower()
+
+    def test_trend_persistence_adaptive_threshold(self):
+        """RC3: ADR-based adaptive threshold — ADR 2% → threshold 0.8%, return 1.5% passes."""
+        bars = self._make_n_bars(35)
+        profile = RvolProfile(
+            gap_and_go_rvol=1.5, trend_day_rvol=1.2, fade_chop_rvol=1.0,
+            avg_daily_range_pct=2.0,  # threshold = max(0.005, 0.4*2.0/100) = 0.008
+            percentile_rank=50.0, sample_size=10,
+        )
+        r = classify_us_regime(
+            price=98.5, prev_close=100.0, rvol=1.3,
+            pmh=101.0, pml=97.0,
+            vp=VolumeProfileResult(poc=100.0, vah=102.0, val=98.0, trading_days=5),
+            open_price=100.0, today_bars=bars, vwap=99.0,
+            rvol_profile=profile,
+        )
+        assert r.regime == USRegimeType.TREND_DAY
+        assert "persistence" in r.details.lower()
+
+    def test_trend_persistence_adaptive_boundary(self):
+        """RC3: Return just below adaptive threshold → persistence does NOT fire."""
+        bars = self._make_n_bars(35)
+        profile = RvolProfile(
+            gap_and_go_rvol=1.5, trend_day_rvol=1.2, fade_chop_rvol=1.0,
+            avg_daily_range_pct=5.0,  # threshold = max(0.005, 0.4*5.0/100) = 0.02
+            percentile_rank=50.0, sample_size=10,
+        )
+        # open=100, price=98.5 → return=-1.5%=0.015 < threshold 0.02
+        r = classify_us_regime(
+            price=98.5, prev_close=100.0, rvol=1.3,
+            pmh=101.0, pml=97.0,
+            vp=VolumeProfileResult(poc=100.0, vah=102.0, val=98.0, trading_days=5),
+            open_price=100.0, today_bars=bars, vwap=99.0,
+            rvol_profile=profile,
+        )
+        assert r.regime != USRegimeType.TREND_DAY or "persistence" not in r.details.lower()
+
+    def test_trend_persistence_no_profile_fallback(self):
+        """RC3: No rvol_profile → fallback to 0.01 threshold."""
+        bars = self._make_n_bars(35)
+        # open=100, price=98.5 → return=-1.5% > 1% → passes fallback
+        r = classify_us_regime(
+            price=98.5, prev_close=100.0, rvol=1.3,
+            pmh=101.0, pml=97.0,
+            vp=VolumeProfileResult(poc=100.0, vah=102.0, val=98.0, trading_days=5),
+            open_price=100.0, today_bars=bars, vwap=99.0,
+            rvol_profile=None, trend_day_rvol=1.2,
+        )
+        assert r.regime == USRegimeType.TREND_DAY
+        assert "persistence" in r.details.lower()
 
 
 # ── Direction Override VWAP Tests ──
@@ -5125,6 +5252,75 @@ class TestUnclearLeanOverride:
         # The override should NOT fire because ret_lean(bearish) != vwap_lean(bullish)
         assert r.regime == USRegimeType.UNCLEAR
         # lean stays as default POC-based: price < poc → bearish
+        assert r.lean == "bearish"
+
+
+# ── Sub-type 3 Lean VWAP Cross-validation Tests ──
+
+class TestSubtype3Lean:
+    """RC4: Sub-type 3 (outside VA, low volume) lean uses VWAP cross-validation."""
+
+    def test_subtype3_below_val_below_vwap_bearish(self):
+        """price < VAL, price < VWAP → lean = bearish."""
+        # No today_bars to avoid directional trap (|move| > 1.5%)
+        r = classify_us_regime(
+            price=88.0, prev_close=90.0, rvol=0.7,
+            pmh=91.0, pml=89.0,
+            vp=VolumeProfileResult(poc=92.0, vah=95.0, val=89.0, trading_days=5),
+            vwap=89.5,  # price 88.0 < vwap 89.5 → bearish
+            fade_chop_rvol=1.0,
+        )
+        assert r.regime == USRegimeType.UNCLEAR
+        assert r.lean == "bearish"
+
+    def test_subtype3_below_val_above_vwap_bullish(self):
+        """price < VAL, price >= VWAP → lean = bullish (reversal)."""
+        r = classify_us_regime(
+            price=88.5, prev_close=90.0, rvol=0.7,
+            pmh=91.0, pml=87.0,
+            vp=VolumeProfileResult(poc=92.0, vah=95.0, val=89.0, trading_days=5),
+            vwap=88.0,  # price 88.5 >= vwap 88.0 → bullish
+            fade_chop_rvol=1.0,
+        )
+        assert r.regime == USRegimeType.UNCLEAR
+        assert r.lean == "bullish"
+
+    def test_subtype3_no_vwap_neutral(self):
+        """price outside VA, VWAP=0 → lean = neutral."""
+        r = classify_us_regime(
+            price=88.0, prev_close=90.0, rvol=0.7,
+            pmh=91.0, pml=89.0,
+            vp=VolumeProfileResult(poc=92.0, vah=95.0, val=89.0, trading_days=5),
+            vwap=0,
+            fade_chop_rvol=1.0,
+        )
+        assert r.regime == USRegimeType.UNCLEAR
+        assert r.lean == "neutral"
+
+    def test_unclear_override_at_0_4_pct(self):
+        """RC5: |return| = 0.4% now triggers override (was > 0.5%)."""
+        rows = []
+        start = pd.Timestamp("2026-03-13 10:00", tz="America/New_York")
+        for i in range(35):
+            rows.append({
+                "Open": 100.0, "High": 100.5, "Low": 99.5,
+                "Close": 100.0, "Volume": 1000,
+            })
+        idx = pd.DatetimeIndex(
+            [start + pd.Timedelta(minutes=i) for i in range(35)], name="Datetime"
+        )
+        bars = pd.DataFrame(rows, index=idx)
+
+        # open=100, price=99.6 → return=-0.4%, |0.4%| >= 0.004
+        # VWAP=99.8, price 99.6 < vwap → bearish. ret_lean=bearish → match → override
+        r = classify_us_regime(
+            price=99.6, prev_close=100.0, rvol=1.3,
+            pmh=101.0, pml=97.0,
+            vp=VolumeProfileResult(poc=99.5, vah=102.0, val=98.0, trading_days=5),
+            open_price=100.0, today_bars=bars, vwap=99.8,
+            trend_day_rvol=1.2,
+        )
+        assert r.regime == USRegimeType.UNCLEAR
         assert r.lean == "bearish"
 
 

@@ -14,6 +14,34 @@ from src.utils.logger import setup_logger
 logger = setup_logger("us_regime")
 
 
+def _vwap_hold_ratio(today_bars: pd.DataFrame) -> tuple[float, str]:
+    """Return (ratio, side) — fraction of bars on the dominant VWAP side.
+
+    ``side`` is "bullish" if majority closes > VWAP, "bearish" if <, else "neutral".
+    Returns ``(0.0, "neutral")`` on empty / NaN data.
+    """
+    if today_bars is None or today_bars.empty:
+        return 0.0, "neutral"
+
+    vwap_s = calculate_vwap_series(today_bars)
+    if vwap_s.empty or vwap_s.isna().all():
+        return 0.0, "neutral"
+
+    closes = today_bars["Close"].values
+    vwaps = vwap_s.values
+    valid = ~np.isnan(vwaps)
+    if valid.sum() == 0:
+        return 0.0, "neutral"
+
+    above = np.sum(closes[valid] > vwaps[valid])
+    below = np.sum(closes[valid] < vwaps[valid])
+    total = int(valid.sum())
+
+    if above >= below:
+        return above / total, "bullish"
+    return below / total, "bearish"
+
+
 # ── Price Structure Detection ──
 
 
@@ -35,11 +63,11 @@ def detect_price_structure(
     fast_min_bars: int = 20,
     fast_side_pct: float = 0.80,
     fast_r2_min: float = 0.70,
-    flat_threshold: float = 0.0005,
+    flat_threshold: float = 0.0005,  # DEPRECATED — kept for config compat, not used as gate
 ) -> StructureResult | None:
     """Detect directional price structure via two layers.
 
-    Layer 1 (fast): VWAP trend + price-side consistency + R² (≥20 bars).
+    Layer 1 (fast): Close R² entry gate + VWAP side cross-validation (≥20 bars).
     Layer 2 (swing): Rolling window HH/HL or LH/LL (≥ window * min_windows bars).
 
     Returns the highest-layer result, or None if no structure detected.
@@ -71,58 +99,64 @@ def detect_price_structure(
                 lh_count = sum(1 for i in range(n) if highs[i + 1] < highs[i])
                 ll_count = sum(1 for i in range(n) if lows[i + 1] < lows[i])
 
-                # Allow at most 1 outlier (stop hunt tolerance)
-                bearish_l2 = (n - lh_count) <= 1 and (n - ll_count) <= 1
-                bullish_l2 = (n - hh_count) <= 1 and (n - hl_count) <= 1
+                # RC2: Primary signal is hard gate; secondary only affects strength/confidence
+                bearish_primary = lh_count / n >= consistency  # LH is hard gate for bearish
+                bullish_primary = hh_count / n >= consistency  # HH is hard gate for bullish
 
                 # VWAP slope cross-check for L2
                 vwap_slope = calculate_vwap_slope(today_bars, lookback=min(n_bars, 30))
 
-                if bearish_l2 and not bullish_l2 and vwap_slope < 0:
+                if bearish_primary and not bullish_primary and vwap_slope < 0:
                     strength = (lh_count + ll_count) / (2 * n)
                     conf = 0.45 + min(0.20, strength * 0.25)
+                    if ll_count / n < consistency:
+                        conf = max(0.40, conf - 0.05)  # secondary shortfall penalty
                     l2_result = StructureResult("bearish", strength, 2, conf)
-                elif bullish_l2 and not bearish_l2 and vwap_slope > 0:
+                elif bullish_primary and not bearish_primary and vwap_slope > 0:
                     strength = (hh_count + hl_count) / (2 * n)
                     conf = 0.45 + min(0.20, strength * 0.25)
+                    if hl_count / n < consistency:
+                        conf = max(0.40, conf - 0.05)  # secondary shortfall penalty
                     l2_result = StructureResult("bullish", strength, 2, conf)
 
-    # ── Layer 1: VWAP trend fast check ──
+    # ── Layer 1: Close R² entry gate + VWAP side cross-validation ──
     if n_bars >= fast_min_bars:
-        vwap_slope = calculate_vwap_slope(today_bars, lookback=min(n_bars, 30))
-        if abs(vwap_slope) > flat_threshold:
-            # Check price-VWAP side consistency over last 20 bars
-            tail = today_bars.iloc[-fast_min_bars:]
+        tail = today_bars.iloc[-fast_min_bars:]
+        closes = tail["Close"].values.astype(float)
+        x = np.arange(len(closes), dtype=float)
+
+        if np.std(closes) > 0:
+            slope_c, intercept = np.polyfit(x, closes, 1)
+            y_pred = slope_c * x + intercept
+            ss_res = np.sum((closes - y_pred) ** 2)
+            ss_tot = np.sum((closes - np.mean(closes)) ** 2)
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        else:
+            slope_c = 0.0
+            r2 = 0.0
+
+        if r2 >= fast_r2_min:
+            direction = "bearish" if slope_c < 0 else "bullish"
+            conf = 0.40 + min(0.10, (r2 - fast_r2_min) * 0.33)
+
+            # VWAP side cross-validation (soft — penalty, not rejection)
             vwap_series = calculate_vwap_series(today_bars)
             vwap_tail = vwap_series.iloc[-fast_min_bars:]
-
-            closes = tail["Close"].values
             vwaps = vwap_tail.values
-
-            if vwap_slope < 0:
+            if direction == "bearish":
                 side_count = np.sum(closes < vwaps)
             else:
                 side_count = np.sum(closes > vwaps)
-
             side_pct = side_count / fast_min_bars
+            if side_pct < fast_side_pct:
+                conf = max(0.35, conf - 0.05)  # cross-validation shortfall
 
-            if side_pct >= fast_side_pct:
-                # R² of close prices (linear regression fit)
-                y = closes.astype(float)
-                x = np.arange(len(y), dtype=float)
-                if np.std(y) > 0:
-                    slope_c, intercept = np.polyfit(x, y, 1)
-                    y_pred = slope_c * x + intercept
-                    ss_res = np.sum((y - y_pred) ** 2)
-                    ss_tot = np.sum((y - np.mean(y)) ** 2)
-                    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-                else:
-                    r2 = 0.0
+            # Hold Duration bonus
+            hold_ratio, hold_side = _vwap_hold_ratio(today_bars)
+            if hold_ratio >= 0.75 and hold_side == direction:
+                conf = min(0.65, conf + 0.05)
 
-                if r2 >= fast_r2_min:
-                    direction = "bearish" if vwap_slope < 0 else "bullish"
-                    conf = 0.40 + min(0.10, (r2 - fast_r2_min) * 0.33)
-                    l1_result = StructureResult(direction, r2, 1, conf)
+            l1_result = StructureResult(direction, r2, 1, conf)
 
     # Prefer L2 over L1
     if l2_result is not None:
@@ -367,7 +401,17 @@ def classify_us_regime(
         vwap_agrees = (vwap <= 0
             or (_trend_lean == "bearish" and price < vwap)
             or (_trend_lean == "bullish" and price > vwap))
-        if abs(intraday_return) > 0.01 and vwap_agrees:
+        # RC3: Dynamic persistence threshold based on ADR
+        if rvol_profile and rvol_profile.avg_daily_range_pct > 0:
+            _adr = rvol_profile.avg_daily_range_pct
+            if not (0.1 < _adr < 20):
+                logger.warning("ADR %.2f%% outside sane range, fallback 0.01", _adr)
+                _persist_threshold = 0.01
+            else:
+                _persist_threshold = max(0.005, 0.4 * _adr / 100)
+        else:
+            _persist_threshold = 0.01
+        if abs(intraday_return) >= _persist_threshold and vwap_agrees:
             base_confidence = min(1.0, (rvol - trend_day_rvol) / 0.5 * 0.3 + 0.5)
             confidence = max(0.1, base_confidence - 0.15)
             if spy_regime == USRegimeType.FADE_CHOP:
@@ -438,10 +482,29 @@ def classify_us_regime(
             confidence = 0.40
             lean = "bullish" if price > vp.poc else "bearish"
         elif outside_va and rvol < fade_chop_rvol:
-            # Sub-type 3: price outside VA but low volume — likely false breakout
+            # Sub-type 3: price outside VA but low volume — VWAP cross-validation
             parts.append("Price outside VA but low volume")
             confidence = 0.25
-            lean = "bearish" if price > vp.vah else "bullish"  # lean reversal
+            # RC4: VWAP cross-validation for sub-type 3 lean
+            if price > vp.vah:
+                if vwap > 0 and price <= vwap:
+                    lean = "bearish"
+                else:
+                    lean = "neutral"
+            elif price < vp.val:
+                if vwap > 0 and price < vwap:
+                    lean = "bearish"
+                elif vwap > 0 and price >= vwap:
+                    lean = "bullish"
+                else:
+                    lean = "neutral"
+            else:
+                lean = "neutral"
+            # Hold ratio contradiction check
+            if lean != "neutral":
+                _hold_ratio, _hold_side = _vwap_hold_ratio(today_bars)
+                if _hold_ratio > 0.70 and _hold_side != lean:
+                    lean = "neutral"
         elif trend_day_rvol > rvol >= fade_chop_rvol:
             # Sub-type 1: RVOL in neutral zone — could go either way
             parts.append(f"RVOL {rvol:.2f} in neutral zone")
@@ -455,7 +518,7 @@ def classify_us_regime(
             intraday_ret = (price - open_price) / open_price
             _ret_lean = "bearish" if intraday_ret < 0 else "bullish"
             _vwap_lean = "bearish" if price < vwap else "bullish"
-            if abs(intraday_ret) > 0.005 and _ret_lean == _vwap_lean:
+            if abs(intraday_ret) >= 0.004 and _ret_lean == _vwap_lean:
                 lean = _ret_lean
 
         result = USRegimeResult(
