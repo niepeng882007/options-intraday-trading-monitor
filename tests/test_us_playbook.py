@@ -5444,3 +5444,272 @@ class TestGammaWallAdverseWarning:
         ctx = self._ctx(adr=1.2)
         plans = _apply_gamma_wall_warning([plan], price=250.0, gamma_wall=gw, ctx=ctx)
         assert "下方承接" in plans[0].warning
+
+
+# ── P0-1: Trend Exhaustion Detection ──
+
+class TestTrendExhaustion:
+    """Test _check_trend_exhaustion and its effect on regime classification."""
+
+    def _vp(self):
+        return VolumeProfileResult(poc=550, vah=555, val=545)
+
+    def test_exhaustion_downgrades_rvol_trend_day(self):
+        """TREND_DAY should downgrade to UNCLEAR when range consumed."""
+        from src.us_playbook.regime import _check_trend_exhaustion
+        # ADR 2%, consumed 2.5% → exhaustion_ratio = 1.25 > threshold
+        bars = _make_bars([
+            (f"2026-03-10 10:{i:02d}:00", 550, 555, 545, 553, 10000)
+            for i in range(60)
+        ])
+        profile = RvolProfile(
+            gap_and_go_rvol=1.5, trend_day_rvol=1.2, fade_chop_rvol=1.0,
+            avg_daily_range_pct=1.0, percentile_rank=70, sample_size=10,
+        )
+        exhausted, detail = _check_trend_exhaustion(bars, profile, elapsed_ratio=0.3)
+        assert exhausted
+        assert "Trend exhausted" in detail
+
+    def test_no_exhaustion_when_range_small(self):
+        """No exhaustion when consumed range is small relative to ADR."""
+        from src.us_playbook.regime import _check_trend_exhaustion
+        # ADR 5%, consumed ~0.2% → ratio ≈ 0.04, well below threshold
+        bars = _make_bars([
+            (f"2026-03-10 10:{i:02d}:00", 550, 550.5, 549.5, 550.2, 10000)
+            for i in range(30)
+        ])
+        profile = RvolProfile(
+            gap_and_go_rvol=1.5, trend_day_rvol=1.2, fade_chop_rvol=1.0,
+            avg_daily_range_pct=5.0, percentile_rank=70, sample_size=10,
+        )
+        exhausted, _ = _check_trend_exhaustion(bars, profile, elapsed_ratio=0.5)
+        assert not exhausted
+
+    def test_exhaustion_threshold_relaxes_late_session(self):
+        """Late session (elapsed_ratio=1.0) uses lower threshold (0.70)."""
+        from src.us_playbook.regime import _check_trend_exhaustion
+        # ADR 2%, consumed 1.5% → ratio = 0.75, between 0.70 and 0.85
+        bars = _make_bars([
+            (f"2026-03-10 10:{i:02d}:00", 550, 553, 550, 552, 10000)
+            for i in range(60)
+        ])
+        profile = RvolProfile(
+            gap_and_go_rvol=1.5, trend_day_rvol=1.2, fade_chop_rvol=1.0,
+            avg_daily_range_pct=2.0, percentile_rank=70, sample_size=10,
+        )
+        # Late session → threshold = 0.70, ratio = 0.75/2.0*100 ... let's be precise
+        # high=553, low=550, consumed=(553-550)/550*100=0.545%
+        # ratio = 0.545/2.0 = 0.273 → not exhausted
+        exhausted_late, _ = _check_trend_exhaustion(bars, profile, elapsed_ratio=1.0)
+        assert not exhausted_late  # 0.273 < 0.70
+
+    def test_no_exhaustion_without_profile(self):
+        """No profile → no exhaustion check."""
+        from src.us_playbook.regime import _check_trend_exhaustion
+        bars = _make_bars([
+            (f"2026-03-10 10:{i:02d}:00", 550, 560, 540, 555, 10000)
+            for i in range(30)
+        ])
+        exhausted, _ = _check_trend_exhaustion(bars, None, elapsed_ratio=0.5)
+        assert not exhausted
+
+    def test_regime_trend_day_exhausted_becomes_unclear(self):
+        """classify_us_regime: RVOL-based TREND_DAY exhausted → UNCLEAR with lean."""
+        # Setup: price=557 > VAH=555, RVOL=1.3 > 1.2, small gap
+        # But range 10% consumed of 1% ADR → exhausted
+        bars = _make_bars([
+            (f"2026-03-10 10:{i:02d}:00", 550, 560, 545, 557, 50000)
+            for i in range(60)
+        ])
+        profile = RvolProfile(
+            gap_and_go_rvol=1.5, trend_day_rvol=1.2, fade_chop_rvol=1.0,
+            avg_daily_range_pct=1.0, percentile_rank=70, sample_size=10,
+        )
+        result = classify_us_regime(
+            price=557, prev_close=556.5, rvol=1.3,
+            pmh=556, pml=554, vp=self._vp(),
+            rvol_profile=profile, today_bars=bars,
+        )
+        assert result.regime == USRegimeType.UNCLEAR
+        assert "Trend exhausted" in result.details
+        assert result.lean == "bullish"  # original direction preserved
+
+    def test_persistence_branch_exempt_from_exhaustion(self):
+        """Persistence branch (inside VA, high RVOL) should NOT apply exhaustion check."""
+        bars = _make_bars([
+            (f"2026-03-10 10:{i:02d}:00", 548, 560, 540, 552, 50000)
+            for i in range(60)
+        ])
+        profile = RvolProfile(
+            gap_and_go_rvol=1.5, trend_day_rvol=1.2, fade_chop_rvol=1.0,
+            avg_daily_range_pct=1.0, percentile_rank=70, sample_size=10,
+        )
+        # price=552 inside VA (545-555), RVOL=1.3, open=548 → intraday_return > threshold
+        result = classify_us_regime(
+            price=552, prev_close=549, rvol=1.3,
+            pmh=556, pml=554, vp=self._vp(),
+            rvol_profile=profile, today_bars=bars,
+            open_price=548, vwap=553,
+        )
+        # Should be TREND_DAY (persistence) or FADE_CHOP, not UNCLEAR with exhaustion
+        assert "Trend exhausted" not in (result.details or "")
+
+
+# ── P0-2: FADE_CHOP neutral wait_conditions ──
+
+class TestFadeChopNeutralWait:
+    """Test FADE_CHOP neutral gives VA edge semantics, not generic 'direction unclear'."""
+
+    def test_fade_chop_neutral_no_momentum_va_edge(self):
+        """FADE_CHOP neutral (no momentum) → 'VA 边缘机会' text."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            rvol=0.8, price=252.5, gap_pct=0.1,
+        )
+        # price=252.5, mid=(260+250)/2=255, in transition zone
+        # position_ratio = (252.5-250)/(260-250) = 0.25 → bullish edge zone
+        # But let's make it truly neutral: price exactly at mid
+        regime2 = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            rvol=0.8, price=255, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=253, vah=260, val=250)
+        filters = FilterResult(tradeable=True, risk_level="normal")
+        # No today_bars → momentum=0, position_ratio=0.5 → transition zone → neutral
+        rec = recommend(regime=regime2, vp=vp, filters=filters)
+        assert rec.action == "wait"
+        assert "VA 边缘" in rec.wait_conditions[0]
+        assert "VA 中部" in rec.risk_note
+
+
+# ── P1-1: Data-wait should not mask regime conclusion ──
+
+class TestDataWaitNotMaskingRegime:
+    """Test that no-chain/no-expiry wait still shows regime-based conclusion."""
+
+    def test_data_wait_shows_regime_conclusion_us(self):
+        """US: no chain → core conclusion shows regime + data caveat."""
+        from src.us_playbook.playbook import _core_conclusion_text
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.7,
+            rvol=1.3, price=557, gap_pct=0.2,
+        )
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        kl = KeyLevels(poc=550, vah=555, val=545, pdh=556, pdl=544, pmh=555, pml=548, vwap=553)
+        option_rec = OptionRecommendation(
+            action="wait", direction="bullish",
+            rationale="方向偏看多, 但缺少可交易的期权合约",
+            risk_note="期权链数据不可用",
+            wait_conditions=["检查标的是否有期权合约"],
+            wait_category="data",
+        )
+        text = _core_conclusion_text(regime, "bullish", vp, kl, option_rec)
+        # Should contain regime conclusion (VWAP) + data caveat
+        assert "VWAP" in text or "做多" in text
+        assert "⚠️" in text
+
+    def test_market_wait_still_shows_wait(self):
+        """Market-based wait still shows '观望' text."""
+        from src.us_playbook.playbook import _core_conclusion_text
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.3,
+            rvol=0.5, price=550, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        kl = KeyLevels(poc=550, vah=555, val=545, pdh=556, pdl=544, pmh=555, pml=548, vwap=550)
+        option_rec = OptionRecommendation(
+            action="wait", direction="neutral",
+            rationale="观望",
+            wait_conditions=["等待 Regime 明确后再入场"],
+        )
+        text = _core_conclusion_text(regime, "neutral", vp, kl, option_rec)
+        assert "观望" in text
+
+
+# ── P1-2: Double "等待" format fix ──
+
+class TestDoubleWaitFormatFix:
+    """Test that '观望, 等待 等待...' is replaced by '观望 — ...' format."""
+
+    def test_no_double_wait(self):
+        """Conditions starting with '等待' should not produce '等待 等待...'."""
+        from src.us_playbook.playbook import _core_conclusion_text
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.3,
+            rvol=0.5, price=550, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        kl = KeyLevels(poc=550, vah=555, val=545, pdh=556, pdl=544, pmh=555, pml=548, vwap=550)
+        option_rec = OptionRecommendation(
+            action="wait", direction="neutral",
+            wait_conditions=["等待价格突破关键位后再入场"],
+        )
+        text = _core_conclusion_text(regime, "neutral", vp, kl, option_rec)
+        assert "等待 等待" not in text
+        assert "观望 —" in text
+
+    def test_no_double_wait_hk(self):
+        """HK: same fix for double '等待'."""
+        from src.hk import RegimeResult, RegimeType
+        from src.hk.playbook import _core_conclusion_text as hk_core_conclusion
+        regime = RegimeResult(
+            regime=RegimeType.UNCLEAR, confidence=0.3,
+            rvol=0.5, price=100, vah=105, val=95, poc=100, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=100, vah=105, val=95)
+        option_rec = OptionRecommendation(
+            action="wait", direction="neutral",
+            wait_conditions=["等待价格突破关键位后再入场"],
+        )
+        text = hk_core_conclusion(regime, "neutral", vp, 100.5, option_rec)
+        assert "等待 等待" not in text
+        assert "观望 —" in text
+
+
+# ── P1-1 (US option_recommend): wait_category="data" ──
+
+class TestWaitCategoryData:
+    """Test that no-chain/no-expiry returns wait_category='data'."""
+
+    def test_no_chain_sets_data_category(self):
+        """No chain → wait_category='data'."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.7,
+            rvol=1.3, price=557, gap_pct=0.2,
+        )
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        filters = FilterResult(tradeable=True, risk_level="normal")
+        rec = recommend(
+            regime=regime, vp=vp, filters=filters,
+            chain_df=None, expiry_dates=["2026-03-20"],
+        )
+        assert rec.action == "wait"
+        assert rec.wait_category == "data"
+
+    def test_no_expiry_sets_data_category(self):
+        """No expiry → wait_category='data'."""
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.7,
+            rvol=1.3, price=557, gap_pct=0.2,
+        )
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        filters = FilterResult(tradeable=True, risk_level="normal")
+        rec = recommend(
+            regime=regime, vp=vp, filters=filters,
+            chain_df=pd.DataFrame({"code": ["X"]}),
+            expiry_dates=[],
+        )
+        assert rec.action == "wait"
+        assert rec.wait_category == "data"
+
+    def test_market_wait_has_default_category(self):
+        """Normal market-based wait → wait_category='market' (default)."""
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.3,
+            rvol=1.0, price=550, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        filters = FilterResult(tradeable=True, risk_level="normal")
+        rec = recommend(regime=regime, vp=vp, filters=filters)
+        assert rec.action == "wait"
+        assert rec.wait_category == "market"

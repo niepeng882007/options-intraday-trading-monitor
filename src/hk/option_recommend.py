@@ -147,7 +147,7 @@ def should_wait(
         reasons.append("高波洗盘日, 方向不明确")
         conditions.append("等待带量突破确认方向")
 
-    if regime.rvol < 0.5:
+    if regime.rvol < 0.5 and regime.regime not in (RegimeType.FADE_CHOP, RegimeType.RANGE):
         reasons.append(f"RVOL {regime.rvol:.2f} 极低, 量能不足")
         conditions.append(f"RVOL 回升至 0.8 以上")
 
@@ -160,6 +160,7 @@ def should_wait(
         dist_to_poc = abs(regime.price - vp.poc) / vp.poc
         if dist_to_poc < 0.003 and regime.regime not in (
             RegimeType.GAP_AND_GO, RegimeType.TREND_DAY, RegimeType.BREAKOUT,
+            RegimeType.FADE_CHOP, RegimeType.RANGE,
         ):
             reasons.append(f"价格距 POC 仅 {dist_to_poc:.1%}, 无方向性优势")
             conditions.append(f"价格突破 VAH {vp.vah:,.2f} 或跌破 VAL {vp.val:,.2f}")
@@ -303,7 +304,7 @@ def recommend(
             wait_conditions=[f"等待 DTE >= {range_min_dte} 的合约"],
         )
 
-    # No expiry or no chain → wait (recommendations require specific strike + expiry)
+    # No expiry or no chain → wait (data issue, not market-based)
     if not expiry or not has_chain:
         wait_reasons = []
         wait_conds = []
@@ -321,6 +322,7 @@ def recommend(
             risk_note="; ".join(wait_reasons),
             wait_conditions=wait_conds,
             liquidity_warning="该标的期权链不可用或流动性不足",
+            wait_category="data",
         )
 
     # Liquidity check

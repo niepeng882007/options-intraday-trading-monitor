@@ -704,10 +704,28 @@ def _core_conclusion_text(
 ) -> str:
     """One-line action directive."""
     if option_rec and option_rec.action == "wait":
+        # P1-1: data-wait (no chain/expiry) should not mask regime conclusion
+        if getattr(option_rec, "wait_category", "market") == "data":
+            regime_conclusion = _regime_based_conclusion_hk(regime, direction, vp, vwap)
+            data_note = option_rec.risk_note or "期权数据不可用"
+            return f"{regime_conclusion} (⚠️ {data_note})"
         if option_rec.wait_conditions:
-            return f"观望, 等待 {option_rec.wait_conditions[0]}"
+            cond = option_rec.wait_conditions[0]
+            # P1-2: avoid "观望, 等待 等待..." duplication
+            cond = cond.removeprefix("等待")
+            return f"观望 — {cond}"
         return "观望, 等待方向明确"
 
+    return _regime_based_conclusion_hk(regime, direction, vp, vwap)
+
+
+def _regime_based_conclusion_hk(
+    regime: RegimeResult,
+    direction: str,
+    vp: VolumeProfileResult,
+    vwap: float,
+) -> str:
+    """Regime-driven one-line conclusion (no option_rec dependency)."""
     price = regime.price
     if regime.regime in (RegimeType.GAP_AND_GO, RegimeType.TREND_DAY):
         if direction == "bullish":

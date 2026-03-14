@@ -1312,6 +1312,24 @@ class TestShouldWait:
         )
         assert wait
 
+    def test_no_wait_fade_chop_low_rvol(self):
+        """FADE_CHOP + low RVOL should NOT trigger wait — low vol is expected."""
+        wait, reasons, _ = should_wait(
+            self._regime(RegimeType.FADE_CHOP, rvol=0.3),
+            self._filters(), self._vp(),
+            chain_available=True, expiry_available=True,
+        )
+        assert not wait
+
+    def test_wait_trend_day_low_rvol_unchanged(self):
+        """TREND_DAY + low RVOL should still trigger wait (regression guard)."""
+        wait, reasons, _ = should_wait(
+            self._regime(RegimeType.TREND_DAY, rvol=0.3),
+            self._filters(), self._vp(),
+            chain_available=True, expiry_available=True,
+        )
+        assert wait
+
 
 class TestRecommend:
     def _vp(self):
@@ -3655,3 +3673,46 @@ class TestDetectVolumePulse:
         assert result is not None
         assert result.peak_ratio >= 2.5
         assert result.direction == "bullish"
+
+
+# ── P1-1 / P1-2: HK playbook core conclusion fixes ──
+
+class TestHKCoreConclusion:
+    """Test HK _core_conclusion_text with data-wait and double-wait fixes."""
+
+    def test_data_wait_shows_regime_conclusion(self):
+        """HK: no chain → core conclusion shows regime + data caveat."""
+        from src.hk import RegimeResult, RegimeType
+        from src.hk.playbook import _core_conclusion_text
+        from src.common.types import OptionRecommendation, VolumeProfileResult
+        regime = RegimeResult(
+            regime=RegimeType.TREND_DAY, confidence=0.7,
+            rvol=1.3, price=100, vah=102, val=95, poc=98, gap_pct=0.2,
+        )
+        vp = VolumeProfileResult(poc=98, vah=102, val=95)
+        option_rec = OptionRecommendation(
+            action="wait", direction="bullish",
+            rationale="方向偏看多, 但缺少可交易的期权合约",
+            risk_note="期权链数据不可用",
+            wait_conditions=["检查标的是否有期权合约"],
+            wait_category="data",
+        )
+        text = _core_conclusion_text(regime, "bullish", vp, 99.0, option_rec)
+        assert "⚠️" in text
+        # Should still contain regime-based conclusion
+        assert "做多" in text or "VWAP" in text
+
+    def test_hk_no_chain_sets_data_category(self):
+        """HK: no chain → wait_category='data'."""
+        from src.hk import RegimeResult, RegimeType
+        from src.hk.option_recommend import recommend as hk_recommend
+        from src.common.types import FilterResult, VolumeProfileResult
+        regime = RegimeResult(
+            regime=RegimeType.TREND_DAY, confidence=0.7,
+            rvol=1.3, price=100, vah=102, val=95, poc=98, gap_pct=0.2,
+        )
+        vp = VolumeProfileResult(poc=98, vah=102, val=95)
+        filters = FilterResult(tradeable=True, risk_level="normal")
+        rec = hk_recommend(regime=regime, vp=vp, filters=filters, chain_df=None, expiry_dates=[])
+        assert rec.action == "wait"
+        assert rec.wait_category == "data"

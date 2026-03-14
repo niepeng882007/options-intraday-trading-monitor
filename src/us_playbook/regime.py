@@ -14,6 +14,37 @@ from src.utils.logger import setup_logger
 logger = setup_logger("us_regime")
 
 
+def _check_trend_exhaustion(
+    today_bars: pd.DataFrame,
+    rvol_profile: RvolProfile | None,
+    elapsed_ratio: float,
+) -> tuple[bool, str]:
+    """Check if today's range has consumed most of the average daily range.
+
+    Returns (exhausted, detail_msg).
+
+    ``elapsed_ratio`` is fraction of trading session elapsed (0.0 = open, 1.0 = close).
+    Threshold is tighter early (0.85) and relaxes toward close (0.70).
+    """
+    if rvol_profile is None or rvol_profile.avg_daily_range_pct <= 0:
+        return False, ""
+    if today_bars is None or today_bars.empty:
+        return False, ""
+
+    today_high = float(today_bars["High"].max())
+    today_low = float(today_bars["Low"].min())
+    if today_low <= 0:
+        return False, ""
+
+    consumed_pct = (today_high - today_low) / today_low * 100
+    exhaustion_ratio = consumed_pct / rvol_profile.avg_daily_range_pct
+    threshold = 0.70 + 0.15 * (1 - elapsed_ratio)  # early 0.85, late 0.70
+    if exhaustion_ratio > threshold:
+        detail = f"Trend exhausted: consumed {consumed_pct:.1f}% of {rvol_profile.avg_daily_range_pct:.1f}% ADR ({exhaustion_ratio:.0%})"
+        return True, detail
+    return False, ""
+
+
 def _vwap_hold_ratio(today_bars: pd.DataFrame) -> tuple[float, str]:
     """Return (ratio, side) — fraction of bars on the dominant VWAP side.
 
@@ -341,6 +372,9 @@ def classify_us_regime(
             details=f"RVOL {rvol:.2f} >= {gap_and_go_rvol:.2f} ({threshold_label}), price {direction}, gap {gap_pct:+.2f}%",
         )
 
+    # Elapsed ratio for exhaustion check (US session = 390 1m bars)
+    _elapsed_ratio = min(1.0, len(today_bars) / 390) if today_bars is not None and not today_bars.empty else 0.0
+
     # ── TREND_DAY ──
     if result is None and rvol >= trend_day_rvol and small_gap and outside_va:
         direction = "above VAH" if price > vp.vah else "below VAL"
@@ -350,13 +384,26 @@ def classify_us_regime(
             confidence = max(0.1, confidence - 0.12)
         elif spy_regime in (USRegimeType.TREND_DAY, USRegimeType.GAP_AND_GO):
             confidence = min(1.0, confidence + 0.10)
-        result = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=confidence,
-            rvol=rvol, price=price, gap_pct=gap_pct,
-            spy_regime=spy_regime,
-            adaptive_thresholds=adaptive_info,
-            details=f"RVOL {rvol:.2f} >= {trend_day_rvol:.2f} ({threshold_label}), small gap {gap_pct:+.2f}%, price {direction}",
-        )
+        # P0-1: Trend exhaustion — downgrade to UNCLEAR if range consumed
+        _trend_dir = "bullish" if price > vp.vah else "bearish"
+        _exhausted, _exhaust_detail = _check_trend_exhaustion(today_bars, rvol_profile, _elapsed_ratio)
+        if _exhausted:
+            result = USRegimeResult(
+                regime=USRegimeType.UNCLEAR, confidence=0.30,
+                rvol=rvol, price=price, gap_pct=gap_pct,
+                spy_regime=spy_regime,
+                adaptive_thresholds=adaptive_info,
+                details=_exhaust_detail,
+                lean=_trend_dir,
+            )
+        else:
+            result = USRegimeResult(
+                regime=USRegimeType.TREND_DAY, confidence=confidence,
+                rvol=rvol, price=price, gap_pct=gap_pct,
+                spy_regime=spy_regime,
+                adaptive_thresholds=adaptive_info,
+                details=f"RVOL {rvol:.2f} >= {trend_day_rvol:.2f} ({threshold_label}), small gap {gap_pct:+.2f}%, price {direction}",
+            )
 
     # ── TREND_DAY (Structure-based) ──
     _st_cfg = structure_trend_cfg or {}
@@ -377,19 +424,31 @@ def classify_us_regime(
                 confidence = max(0.1, confidence - 0.12)
             elif spy_regime in (USRegimeType.TREND_DAY, USRegimeType.GAP_AND_GO):
                 confidence = min(1.0, confidence + 0.10)
-            layer_label = f"L{structure.layer}"
-            result = USRegimeResult(
-                regime=USRegimeType.TREND_DAY, confidence=confidence,
-                rvol=rvol, price=price, gap_pct=gap_pct,
-                spy_regime=spy_regime,
-                adaptive_thresholds=adaptive_info,
-                details=(
-                    f"Structure {layer_label} {structure.direction}: "
-                    f"strength {structure.strength:.2f}, "
-                    f"RVOL {rvol:.2f} (below {trend_day_rvol:.2f})"
-                ),
-                lean=structure.direction,
-            )
+            # P0-1: Trend exhaustion — downgrade to UNCLEAR if range consumed
+            _exhausted, _exhaust_detail = _check_trend_exhaustion(today_bars, rvol_profile, _elapsed_ratio)
+            if _exhausted:
+                result = USRegimeResult(
+                    regime=USRegimeType.UNCLEAR, confidence=0.30,
+                    rvol=rvol, price=price, gap_pct=gap_pct,
+                    spy_regime=spy_regime,
+                    adaptive_thresholds=adaptive_info,
+                    details=_exhaust_detail,
+                    lean=structure.direction,
+                )
+            else:
+                layer_label = f"L{structure.layer}"
+                result = USRegimeResult(
+                    regime=USRegimeType.TREND_DAY, confidence=confidence,
+                    rvol=rvol, price=price, gap_pct=gap_pct,
+                    spy_regime=spy_regime,
+                    adaptive_thresholds=adaptive_info,
+                    details=(
+                        f"Structure {layer_label} {structure.direction}: "
+                        f"strength {structure.strength:.2f}, "
+                        f"RVOL {rvol:.2f} (below {trend_day_rvol:.2f})"
+                    ),
+                    lean=structure.direction,
+                )
 
     # ── TREND_DAY (Persistence — inside VA but still trending) ──
     _enough_bars = today_bars is not None and len(today_bars) >= 30

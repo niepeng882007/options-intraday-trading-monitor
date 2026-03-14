@@ -79,6 +79,7 @@ class OptionRecommendation:
     spread_metrics: SpreadMetrics | None = None
     dte: int = 0
     structural_veto: bool = False   # structural veto (trend/VA width etc.) — L2 should reject push
+    wait_category: str = "market"   # "market" = regime/direction-based wait; "data" = option chain/expiry data issue
 
 
 @dataclass

@@ -482,6 +482,14 @@ def recommend(
         )
 
     if direction == "neutral":
+        # FADE_CHOP neutral — VA edge semantics (no momentum conflict)
+        if regime.regime == USRegimeType.FADE_CHOP and momentum == 0:
+            return OptionRecommendation(
+                action="wait", direction="neutral",
+                rationale="震荡日方向不明, 等待 VA 边缘机会",
+                risk_note="价格在 VA 中部, 无明确方向",
+                wait_conditions=["等待价格接近 VA 边缘(VAH/VAL)再入场"],
+            )
         # Momentum conflict explanation for FADE_CHOP
         if regime.regime == USRegimeType.FADE_CHOP and momentum != 0:
             momentum_label = "上涨" if momentum == 1 else "下跌"
@@ -596,7 +604,7 @@ def recommend(
         except (ValueError, TypeError):
             pass
 
-    # No expiry or no chain → wait with direction hint
+    # No expiry or no chain → wait with direction hint (data issue, not market-based)
     if not expiry or not has_chain:
         wait_reasons = []
         wait_conds = []
@@ -614,6 +622,7 @@ def recommend(
             risk_note="; ".join(wait_reasons),
             wait_conditions=wait_conds,
             liquidity_warning="该标的期权链不可用或流动性不足",
+            wait_category="data",
         )
 
     # Liquidity check
