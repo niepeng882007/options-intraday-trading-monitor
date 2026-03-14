@@ -288,6 +288,7 @@ def assess_chase_risk(
     va_high_pct: float = 4.0,
     afternoon_tighten_pct: float = 0.5,
     minutes_to_close: int | None = None,
+    regime: str | None = None,
 ) -> ChaseRiskResult:
     """Assess chase risk based on VWAP deviation and VA boundary distance.
 
@@ -302,6 +303,13 @@ def assess_chase_risk(
     """
     if direction == "neutral" or vwap <= 0 or price <= 0:
         return ChaseRiskResult()
+
+    # Trend regimes: VA distance is expected (price breaks away from VA), don't flag as chase
+    if regime in ("GAP_AND_GO", "TREND_DAY"):
+        va_moderate_pct = 99.0  # effectively disabled
+        va_high_pct = 99.0
+        # GAP_AND_GO early session VWAP ≈ open price, allow more deviation
+        vwap_high_pct += 1.0
 
     # Tighten thresholds based on time remaining
     if minutes_to_close is not None and minutes_to_close < 240:

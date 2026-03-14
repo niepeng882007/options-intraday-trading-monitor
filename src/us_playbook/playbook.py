@@ -1699,6 +1699,13 @@ def format_us_playbook_message(
     vp_suffix = f" ({vp.trading_days}d)" if vp.trading_days > 0 else ""
     lines.append(f"VAH {vp.vah:,.2f} | POC {vp.poc:,.2f} | VAL {vp.val:,.2f}{vp_suffix}")
 
+    # VP staleness warning — price far from VA
+    _vp_price = price_display if price_display > 0 else r.price
+    if _vp_price > 0 and vp.vah > 0 and vp.val > 0:
+        _va_dist_pct = min(abs(_vp_price - vp.vah), abs(_vp_price - vp.val)) / _vp_price * 100
+        if _va_dist_pct > 3.0:
+            lines.append(f"  ⚠️ VP 水位偏远 ({_va_dist_pct:.1f}%)，优先参考 VWAP/PM/当日高低")
+
     # PDH/PDL
     pd_parts = []
     if kl.pdh > 0:

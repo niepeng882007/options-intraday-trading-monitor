@@ -558,6 +558,7 @@ def recommend(
             va_high_pct=cr_cfg.get("va_high_pct", 3.0),
             afternoon_tighten_pct=cr_cfg.get("afternoon_tighten_pct", 0.3),
             minutes_to_close=minutes_to_close,
+            regime=regime.regime.value,
         )
         if chase_risk.level == "high":
             dir_hint = "看多" if direction == "bullish" else "看空"

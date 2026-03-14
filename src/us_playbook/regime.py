@@ -336,6 +336,15 @@ def classify_us_regime(
     else:
         small_gap = abs(gap_pct) < 0.5  # fallback static
 
+    # VWAP-confirmed gap relaxation for TREND_DAY
+    _vwap_confirms = (price < vp.val and vwap > 0 and price < vwap) or \
+                     (price > vp.vah and vwap > 0 and price > vwap)
+    if rvol_profile and rvol_profile.avg_daily_range_pct > 0:
+        _relaxed_gap = normalized_gap < 0.5
+    else:
+        _relaxed_gap = abs(gap_pct) < 0.8
+    _gap_ok = small_gap or (_vwap_confirms and _relaxed_gap)
+
     # Position relative to VP value area
     inside_va = vp.val <= price <= vp.vah
     outside_va = not inside_va
@@ -355,10 +364,21 @@ def classify_us_regime(
 
     result: USRegimeResult | None = None
 
+    # Large gap signal: gap occupies >= 80% of ADR → treat as gap-driven even if PM absorbed
+    large_gap_signal = False
+    if rvol_profile and rvol_profile.avg_daily_range_pct > 0:
+        large_gap_signal = normalized_gap >= 0.8
+
     # ── GAP_AND_GO ──
-    if rvol >= gap_and_go_rvol and pm_breakout:
-        direction = "above PMH" if above_pm else "below PML"
+    if rvol >= gap_and_go_rvol and (pm_breakout or large_gap_signal):
+        if pm_breakout:
+            direction = "above PMH" if above_pm else "below PML"
+        else:
+            direction = "gap up" if gap_pct > 0 else "gap down"
         confidence = min(1.0, (rvol - gap_and_go_rvol) / 0.5 * 0.3 + 0.6)
+        # Gap-driven (not PM breakout) → penalty -0.10
+        if not pm_breakout:
+            confidence = max(0.1, confidence - 0.10)
         # SPY context adjustment (P1-3: asymmetric — boost stronger, penalty milder)
         if spy_regime == USRegimeType.FADE_CHOP:
             confidence = max(0.1, confidence - 0.15)
@@ -369,14 +389,14 @@ def classify_us_regime(
             rvol=rvol, price=price, gap_pct=gap_pct,
             spy_regime=spy_regime,
             adaptive_thresholds=adaptive_info,
-            details=f"RVOL {rvol:.2f} >= {gap_and_go_rvol:.2f} ({threshold_label}), price {direction}, gap {gap_pct:+.2f}%",
+            details=f"RVOL {rvol:.2f} >= {gap_and_go_rvol:.2f} ({threshold_label}), {direction}, gap {gap_pct:+.2f}%",
         )
 
     # Elapsed ratio for exhaustion check (US session = 390 1m bars)
     _elapsed_ratio = min(1.0, len(today_bars) / 390) if today_bars is not None and not today_bars.empty else 0.0
 
     # ── TREND_DAY ──
-    if result is None and rvol >= trend_day_rvol and small_gap and outside_va:
+    if result is None and rvol >= trend_day_rvol and _gap_ok and outside_va:
         direction = "above VAH" if price > vp.vah else "below VAL"
         confidence = min(1.0, (rvol - trend_day_rvol) / 0.5 * 0.3 + 0.5)
         # P1-3: SPY context — milder penalty + new boost branch
@@ -397,12 +417,16 @@ def classify_us_regime(
                 lean=_trend_dir,
             )
         else:
+            # Relaxed gap penalty: VWAP-confirmed but gap not truly small
+            if not small_gap:
+                confidence = max(0.1, confidence - 0.10)
+            _gap_note = ", VWAP-confirmed gap relaxation" if not small_gap else ""
             result = USRegimeResult(
                 regime=USRegimeType.TREND_DAY, confidence=confidence,
                 rvol=rvol, price=price, gap_pct=gap_pct,
                 spy_regime=spy_regime,
                 adaptive_thresholds=adaptive_info,
-                details=f"RVOL {rvol:.2f} >= {trend_day_rvol:.2f} ({threshold_label}), small gap {gap_pct:+.2f}%, price {direction}",
+                details=f"RVOL {rvol:.2f} >= {trend_day_rvol:.2f} ({threshold_label}), small gap {gap_pct:+.2f}%, price {direction}{_gap_note}",
             )
 
     # ── TREND_DAY (Structure-based) ──
@@ -570,6 +594,12 @@ def classify_us_regime(
             confidence = 0.30
         else:
             parts.append("Mixed signals")
+            # Derive lean from price position when no sub-type matched
+            if outside_va and vwap > 0:
+                if price < vp.val and price < vwap:
+                    lean = "bearish"
+                elif price > vp.vah and price > vwap:
+                    lean = "bullish"
 
         # VWAP + intraday return double-confirmation override
         _enough_bars_uc = today_bars is not None and len(today_bars) >= 30
@@ -588,6 +618,14 @@ def classify_us_regime(
             details="; ".join(parts) if parts else "Mixed signals",
             lean=lean,
         )
+
+    # ── VP staleness: FADE_CHOP VA unreachable penalty ──
+    if result.regime == USRegimeType.FADE_CHOP and price > 0 and vp.vah > 0 and vp.val > 0:
+        _va_dist_pct = min(abs(price - vp.vah), abs(price - vp.val)) / price * 100
+        if _va_dist_pct > 5.0:
+            result.confidence = max(0.1, result.confidence - 0.15)
+            _stale_note = f"VA unreachable ({_va_dist_pct:.1f}%)"
+            result.details = f"{result.details}; {_stale_note}" if result.details else _stale_note
 
     # ── VP thin data penalty ──
     if 0 < vp_trading_days < min_vp_trading_days:

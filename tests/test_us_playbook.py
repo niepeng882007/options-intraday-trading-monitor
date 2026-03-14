@@ -5713,3 +5713,394 @@ class TestWaitCategoryData:
         rec = recommend(regime=regime, vp=vp, filters=filters)
         assert rec.action == "wait"
         assert rec.wait_category == "market"
+
+
+# ── Fix 1 & 2: Gap dead zone + UNCLEAR lean from position ──
+
+
+class TestGapDeadZoneVwapRelaxation:
+    """Test VWAP-confirmed gap relaxation for TREND_DAY classification."""
+
+    def _vp(self, poc=550, vah=555, val=545):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    def test_gap_dead_zone_with_vwap_confirms_trend_day(self):
+        """normalized_gap 0.32 (> 0.3 threshold) but VWAP confirms → TREND_DAY with penalty."""
+        profile = RvolProfile(
+            gap_and_go_rvol=2.0,
+            trend_day_rvol=1.2,
+            fade_chop_rvol=0.8,
+            avg_daily_range_pct=1.5,  # gap 0.48% → normalized = 0.48/1.5 ≈ 0.32
+            percentile_rank=65.0,
+            sample_size=10,
+        )
+        # price=542 < val=545 (outside VA, below VAL) and price < vwap=548 → _vwap_confirms
+        # normalized ≈ 0.32 < 0.5 → _relaxed_gap=True → _gap_ok=True
+        result = classify_us_regime(
+            price=542, prev_close=544.6, rvol=1.3,
+            pmh=546, pml=543, vp=self._vp(),
+            rvol_profile=profile,
+            gap_significance_threshold=0.3,
+            vwap=548.0,
+        )
+        assert result.regime == USRegimeType.TREND_DAY
+        assert "VWAP-confirmed gap relaxation" in result.details
+        # Confidence should have -0.10 penalty vs base
+        base_confidence = min(1.0, (1.3 - 1.2) / 0.5 * 0.3 + 0.5)
+        assert result.confidence <= base_confidence - 0.09  # approx -0.10
+
+    def test_gap_dead_zone_no_vwap_confirm_stays_unclear(self):
+        """normalized_gap 0.32, price > VWAP → VWAP doesn't confirm → not TREND_DAY."""
+        profile = RvolProfile(
+            gap_and_go_rvol=2.0,
+            trend_day_rvol=1.2,
+            fade_chop_rvol=0.8,
+            avg_daily_range_pct=1.5,
+            percentile_rank=65.0,
+            sample_size=10,
+        )
+        # price=542 < val=545 (outside VA, below VAL) but price > vwap=540 → no _vwap_confirms
+        result = classify_us_regime(
+            price=542, prev_close=544.6, rvol=1.3,
+            pmh=546, pml=543, vp=self._vp(),
+            rvol_profile=profile,
+            gap_significance_threshold=0.3,
+            vwap=540.0,
+        )
+        assert result.regime != USRegimeType.TREND_DAY
+
+    def test_large_normalized_gap_still_blocked(self):
+        """normalized_gap 0.9 (> 0.5 relaxed threshold) → still blocked even with VWAP."""
+        profile = RvolProfile(
+            gap_and_go_rvol=2.0,
+            trend_day_rvol=1.2,
+            fade_chop_rvol=0.8,
+            avg_daily_range_pct=0.5,  # tiny range → gap 0.45% → normalized=0.9
+            percentile_rank=65.0,
+            sample_size=10,
+        )
+        # price=557 > vah=555, vwap=553 → _vwap_confirms=True
+        # but normalized=0.9 > 0.5 → _relaxed_gap=False → _gap_ok=False
+        result = classify_us_regime(
+            price=557, prev_close=554.5, rvol=1.3,
+            pmh=556, pml=554, vp=self._vp(),
+            rvol_profile=profile,
+            gap_significance_threshold=0.3,
+            vwap=553.0,
+        )
+        assert result.regime != USRegimeType.TREND_DAY
+
+
+class TestUnclearDefaultLeanFromPosition:
+    """Test UNCLEAR lean derived from price position when no sub-type matched."""
+
+    def _vp(self, poc=550, vah=555, val=545):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    def test_unclear_default_lean_bearish_from_position(self):
+        """Outside VA + below VWAP → lean='bearish' in else (Mixed signals) branch."""
+        # RVOL in gap between trend_day and gap_and_go (not matching any sub-type exactly)
+        # Need: rvol < fade_chop OR rvol in range but inside_va=False + rvol < trend_day
+        # The 'else' branch triggers when none of sub-type 1/2/3 match
+        # Sub-type 2: inside_va + rvol >= trend_day → no (outside_va)
+        # Sub-type 3: outside_va + rvol < fade_chop → no (rvol=1.1 >= fade_chop=1.0)
+        # Sub-type 1: trend_day > rvol >= fade_chop → yes (1.2 > 1.1 >= 1.0) → this matches sub-type 1!
+        # We need to avoid all sub-types: set rvol=1.25 with outside_va, rvol >= trend_day_rvol
+        # Actually: sub-type 1 is trend_day > rvol >= fade_chop. To hit 'else', need rvol < fade_chop + outside_va
+        # But sub-type 3 is outside_va + rvol < fade_chop. So the only way to hit else:
+        # inside_va=True + rvol < trend_day → but that's also not sub-type 2 (needs rvol >= trend_day)
+        # Let me re-read: the branches are:
+        # if inside_va and rvol >= trend_day → sub-type 2
+        # elif outside_va and rvol < fade_chop → sub-type 3
+        # elif trend_day > rvol >= fade_chop → sub-type 1
+        # else → Mixed signals
+        # So else = (inside_va and rvol < trend_day and NOT (trend_day > rvol >= fade_chop))
+        #         = inside_va and rvol < fade_chop
+        # OR: outside_va and rvol >= fade_chop and rvol < trend_day → wait, that's sub-type 1
+        # Actually else triggers when:
+        # NOT (inside_va and rvol >= trend_day) AND NOT (outside_va and rvol < fade_chop) AND NOT (trend_day > rvol >= fade_chop)
+        # = outside_va and rvol >= fade_chop and rvol >= trend_day (since sub-type 1 needs rvol < trend_day)
+        # But rvol >= trend_day + outside_va + not small_gap → wouldn't trigger TREND_DAY above?
+        # Actually _gap_ok is false → TREND_DAY block skipped → falls to UNCLEAR → else branch
+        # Perfect: outside_va, rvol >= trend_day, big gap (not _gap_ok), no VWAP confirm for gap
+        # Need: price < val, price > vwap (so _vwap_confirms=False for gap relaxation)
+        # But for lean: price < val, price < vwap → bearish
+
+        # Simpler approach: make sure we hit the else branch by having:
+        # rvol >= trend_day (so sub-type 1 skipped), outside_va (so sub-type 2 skipped),
+        # rvol >= fade_chop (so sub-type 3 skipped)
+        # This means else branch. And price < val + price < vwap → lean=bearish
+        # But wait: if rvol >= trend_day + outside_va → TREND_DAY block should catch it first
+        # unless gap is too big. So we need big gap + no VWAP confirm for gap.
+
+        # Let's use: big gap (not small, not relaxable), outside_va, price < val
+        # gap too big for _gap_ok, rvol >= trend_day, outside_va
+        # No pm_breakout → not GAP_AND_GO
+        # Structure not enabled → skip
+        # Persistence needs inside_va → skip
+        # FADE_CHOP needs rvol < fade_chop → skip (rvol=1.3 >= 1.0)
+        # → UNCLEAR, else branch (rvol >= trend_day, outside_va, not sub-type 1/2/3)
+        profile = RvolProfile(
+            gap_and_go_rvol=2.0,
+            trend_day_rvol=1.2,
+            fade_chop_rvol=1.0,
+            avg_daily_range_pct=0.5,  # tiny range → normalized gap huge → _gap_ok=False
+            percentile_rank=65.0,
+            sample_size=10,
+        )
+        # price=540 < val=545, vwap=543 → price < vwap → lean should be bearish
+        # gap = (540-550)/550 = -1.8% → normalized = 1.8/0.5 = 3.6 >> 0.5
+        # _vwap_confirms: price < val and price < vwap → True, but _relaxed_gap = 3.6 > 0.5 → False
+        # → _gap_ok = False → TREND_DAY skipped → UNCLEAR
+        result = classify_us_regime(
+            price=540, prev_close=550, rvol=1.3,
+            pmh=538, pml=536, vp=self._vp(),  # pmh < price → no pm_breakout
+            rvol_profile=profile,
+            gap_significance_threshold=0.3,
+            vwap=543.0,
+        )
+        assert result.regime == USRegimeType.UNCLEAR
+        assert result.lean == "bearish"
+
+    def test_unclear_default_lean_bullish_from_position(self):
+        """Above VAH + above VWAP → lean='bullish' in else branch."""
+        profile = RvolProfile(
+            gap_and_go_rvol=2.0,
+            trend_day_rvol=1.2,
+            fade_chop_rvol=1.0,
+            avg_daily_range_pct=0.5,
+            percentile_rank=65.0,
+            sample_size=10,
+        )
+        # price=560 > vah=555, vwap=557 → price > vwap → lean should be bullish
+        # gap = (560-550)/550 = 1.82% → normalized = 1.82/0.5 = 3.64 >> 0.5
+        # pm_breakout: pmh=558, price=560 > pmh → above_pm=True
+        # But rvol=1.3 < gap_and_go=2.0 → GAP_AND_GO skipped
+        # _gap_ok = False → TREND_DAY skipped → UNCLEAR
+        # Actually pmh=558 → above_pm but not GAP_AND_GO (rvol too low)
+        # Set pmh > price to avoid pm_breakout triggering GAP_AND_GO later
+        result = classify_us_regime(
+            price=560, prev_close=550, rvol=1.3,
+            pmh=562, pml=558, vp=self._vp(),  # pmh > price → no pm_breakout
+            rvol_profile=profile,
+            gap_significance_threshold=0.3,
+            vwap=557.0,
+        )
+        assert result.regime == USRegimeType.UNCLEAR
+        assert result.lean == "bullish"
+
+
+# ── P0-1: Large gap signal → GAP_AND_GO even when PM absorbed ──
+
+class TestLargeGapSignal:
+    """Test that large gaps (normalized >= 0.8) trigger GAP_AND_GO without PM breakout."""
+
+    def _vp(self, poc=640, vah=645, val=635):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    def test_large_gap_down_gap_and_go(self):
+        """META 3/13 scenario: gap=-2.11%, RVOL=2.68, PM absorbed → GAP_AND_GO via large gap."""
+        profile = RvolProfile(
+            gap_and_go_rvol=1.5, trend_day_rvol=1.2, fade_chop_rvol=1.0,
+            avg_daily_range_pct=2.0,  # normalized_gap = 2.11/2.0 ≈ 1.05 >= 0.8
+            percentile_rank=90, sample_size=10,
+        )
+        result = classify_us_regime(
+            price=624.73, prev_close=637.18, rvol=2.68,
+            pmh=635.68, pml=623.22,  # price=624.73 > pml=623.22 → no pm_breakout
+            vp=self._vp(),
+            rvol_profile=profile,
+        )
+        assert result.regime == USRegimeType.GAP_AND_GO
+        assert "gap down" in result.details
+        assert result.gap_pct < 0
+
+    def test_large_gap_up_gap_and_go(self):
+        """Large gap up (normalized >= 0.8) → GAP_AND_GO gap-driven."""
+        profile = RvolProfile(
+            gap_and_go_rvol=1.5, trend_day_rvol=1.2, fade_chop_rvol=1.0,
+            avg_daily_range_pct=2.0,
+            percentile_rank=85, sample_size=10,
+        )
+        result = classify_us_regime(
+            price=655, prev_close=640, rvol=2.0,
+            pmh=660, pml=650,  # price=655, inside PM range → no pm_breakout
+            vp=self._vp(),
+            rvol_profile=profile,
+        )
+        assert result.regime == USRegimeType.GAP_AND_GO
+        assert "gap up" in result.details
+
+    def test_gap_driven_confidence_penalty(self):
+        """Gap-driven (not PM breakout) should have -0.10 confidence penalty."""
+        profile = RvolProfile(
+            gap_and_go_rvol=1.5, trend_day_rvol=1.2, fade_chop_rvol=1.0,
+            avg_daily_range_pct=2.0,
+            percentile_rank=85, sample_size=10,
+        )
+        # With PM breakout
+        result_pm = classify_us_regime(
+            price=624, prev_close=637, rvol=2.5,
+            pmh=630, pml=625,  # price=624 < pml=625 → pm_breakout
+            vp=self._vp(),
+            rvol_profile=profile,
+        )
+        # Without PM breakout (gap-driven)
+        result_gap = classify_us_regime(
+            price=624, prev_close=637, rvol=2.5,
+            pmh=630, pml=620,  # price=624 > pml=620 → no pm_breakout
+            vp=self._vp(),
+            rvol_profile=profile,
+        )
+        assert result_pm.regime == USRegimeType.GAP_AND_GO
+        assert result_gap.regime == USRegimeType.GAP_AND_GO
+        # Gap-driven should be ~0.10 lower
+        assert result_gap.confidence < result_pm.confidence
+
+    def test_small_gap_no_large_gap_signal(self):
+        """Small gap (normalized < 0.8) + no PM breakout → NOT GAP_AND_GO."""
+        profile = RvolProfile(
+            gap_and_go_rvol=1.5, trend_day_rvol=1.2, fade_chop_rvol=1.0,
+            avg_daily_range_pct=2.0,  # normalized_gap = 0.5/2.0 = 0.25 < 0.8
+            percentile_rank=85, sample_size=10,
+        )
+        result = classify_us_regime(
+            price=641, prev_close=640, rvol=2.0,
+            pmh=645, pml=638,  # price inside PM range
+            vp=self._vp(),
+            rvol_profile=profile,
+        )
+        assert result.regime != USRegimeType.GAP_AND_GO
+
+
+# ── P0-2: Chase risk VA distance disabled for trend regimes ──
+
+class TestChaseRiskTrendRegime:
+    """Test that GAP_AND_GO/TREND_DAY regimes disable VA distance chase risk."""
+
+    def test_gap_and_go_no_high_chase_from_va(self):
+        """GAP_AND_GO: VA distance 4.5% should NOT trigger high chase risk."""
+        vp = VolumeProfileResult(poc=640, vah=645, val=635)
+        result = assess_chase_risk(
+            price=615.80, vwap=620, vp=vp, direction="bearish",
+            va_moderate_pct=2.0, va_high_pct=3.0,
+            regime="GAP_AND_GO",
+        )
+        # VA distance = (635-615.80)/635 = 3.02% → would be "high" without regime override
+        assert result.level != "high"
+
+    def test_trend_day_no_high_chase_from_va(self):
+        """TREND_DAY: VA distance should NOT trigger high chase risk."""
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        result = assess_chase_risk(
+            price=530, vwap=535, vp=vp, direction="bearish",
+            va_moderate_pct=2.0, va_high_pct=3.0,
+            regime="TREND_DAY",
+        )
+        assert result.level != "high"
+
+    def test_fade_chop_still_checks_va(self):
+        """FADE_CHOP: VA distance should still trigger chase risk as before."""
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        result = assess_chase_risk(
+            price=530, vwap=535, vp=vp, direction="bearish",
+            va_moderate_pct=2.0, va_high_pct=3.0,
+            regime="FADE_CHOP",
+        )
+        # VA distance = (545-530)/545 = 2.75% → moderate or high
+        assert result.level in ("moderate", "high")
+
+    def test_no_regime_still_checks_va(self):
+        """No regime param (default None): VA distance check active."""
+        vp = VolumeProfileResult(poc=550, vah=555, val=545)
+        result = assess_chase_risk(
+            price=530, vwap=535, vp=vp, direction="bearish",
+            va_moderate_pct=2.0, va_high_pct=3.0,
+        )
+        assert result.level in ("moderate", "high")
+
+
+# ── P1-2: Rapid-fire same signal cooldown ──
+
+class TestRapidFireCooldown:
+    """Test that 3 identical signals within 120s → 2nd and 3rd blocked."""
+
+    def _make_predictor(self):
+        cfg = {
+            "watchlist": [{"symbol": "SPY", "name": "S&P 500 ETF"}],
+            "auto_scan": {
+                "cooldown": {"same_signal_minutes": 30, "max_per_session": 2, "max_per_day": 3},
+                "override": {"confidence_increase": 0.10, "price_extension_pct": 0.50, "regime_upgrade": True},
+            },
+        }
+        return USPredictor(cfg, collector=None)
+
+    def _make_signal(self, ts=1000.0):
+        return USScanSignal(
+            signal_type="BREAKOUT_BEARISH",
+            direction="bearish",
+            symbol="META",
+            regime=USRegimeResult(
+                regime=USRegimeType.GAP_AND_GO, confidence=0.85,
+                rvol=2.0, price=615, gap_pct=-2.0,
+            ),
+            price=615,
+            timestamp=ts,
+        )
+
+    def test_rapid_fire_blocked(self):
+        """3 identical signals within 120s — 2nd and 3rd should be blocked."""
+        pred = self._make_predictor()
+        pred._scan_history_date = "2026-03-13"
+
+        # First signal at t=1000 → allowed
+        sig1 = self._make_signal(ts=1000.0)
+        allowed1, _ = pred._check_frequency("META", sig1, "morning", pred._cfg["auto_scan"])
+        assert allowed1
+        pred._record_alert("META", sig1, "morning")
+
+        # Second signal at t=1060 (60s later) → blocked
+        sig2 = self._make_signal(ts=1060.0)
+        allowed2, _ = pred._check_frequency("META", sig2, "morning", pred._cfg["auto_scan"])
+        assert not allowed2
+
+        # Third signal at t=1120 (120s after first) → still blocked (within 30min)
+        sig3 = self._make_signal(ts=1120.0)
+        allowed3, _ = pred._check_frequency("META", sig3, "morning", pred._cfg["auto_scan"])
+        assert not allowed3
+
+
+# ── P2-1: VP staleness — FADE_CHOP VA unreachable confidence penalty ──
+
+class TestVPStaleness:
+    """Test VP staleness detection: FADE_CHOP confidence penalty when VA is far away."""
+
+    def test_fade_chop_va_unreachable_penalty(self):
+        """FADE_CHOP (via near_gamma) with VA distance > 5% → confidence penalty."""
+        # Price=610, VA=645-661 → outside VA but near gamma wall → triggers FADE_CHOP
+        # va_distance = min(|610-661|, |610-645|) / 610 * 100 = 35/610*100 = 5.74% > 5%
+        vp = VolumeProfileResult(poc=650, vah=661, val=645)
+        gamma = GammaWallResult(call_wall_strike=609, put_wall_strike=0, max_pain=0)
+        result = classify_us_regime(
+            price=610, prev_close=611, rvol=0.7,
+            pmh=620, pml=608,
+            vp=vp, gamma_wall=gamma,
+            fade_chop_rvol=1.0,
+        )
+        assert result.regime == USRegimeType.FADE_CHOP
+        assert "VA unreachable" in result.details
+        # Confidence should be lower than base
+        base_conf = min(1.0, (1.0 - 0.7) / 0.3 * 0.3 + 0.5)
+        assert result.confidence < base_conf
+
+    def test_fade_chop_va_reachable_no_penalty(self):
+        """FADE_CHOP with price inside VA (distance < 5%) → no penalty."""
+        vp = VolumeProfileResult(poc=610, vah=620, val=600)
+        result = classify_us_regime(
+            price=610, prev_close=611, rvol=0.7,
+            pmh=615, pml=608,
+            vp=vp,
+            fade_chop_rvol=1.0,
+        )
+        assert result.regime == USRegimeType.FADE_CHOP
+        assert "VA unreachable" not in result.details
