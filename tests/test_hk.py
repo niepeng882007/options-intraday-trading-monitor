@@ -4032,3 +4032,195 @@ class TestFadeMidZone:
         vp = self._vp()
         text = _core_conclusion_text(regime, "neutral", vp, 132.0, None, fade_mid_zone_pct=0.35)
         assert "做空" in text or "VAH" in text
+
+
+# ── Whipsaw Escape Tests ──
+
+
+def _make_rising_bars_double_sweep(ibh: float, ibl: float, final_price: float):
+    """Build bars: sweep IBL early, sweep IBH, then rise well above IBH.
+
+    Produces 20 bars with clear rising trend ending at final_price.
+    IBH/IBL are swept in the first few bars.
+    """
+    bars = []
+    # Phase 1 (bars 0-4): sweep both sides — open near IBH, dip below IBL, recover
+    base = (ibh + ibl) / 2
+    bars.append(("2026-03-13 09:30:00", base, ibh + 0.1, ibl - 0.5, ibl + 0.5, 5000))
+    bars.append(("2026-03-13 09:31:00", ibl + 0.5, ibh + 0.5, ibl - 0.3, ibh - 1, 5000))
+    bars.append(("2026-03-13 09:32:00", ibh - 1, ibh + 0.2, ibh - 2, ibh, 4000))
+    bars.append(("2026-03-13 09:33:00", ibh, ibh + 0.5, ibh - 0.5, ibh + 0.3, 4000))
+    bars.append(("2026-03-13 09:34:00", ibh + 0.3, ibh + 1, ibh, ibh + 0.8, 4000))
+    # Phase 2 (bars 5-19): steady rise from ibh+1 to final_price
+    step = (final_price - (ibh + 1)) / 15
+    for i in range(15):
+        t = f"2026-03-13 09:{35+i:02d}:00"
+        o = ibh + 1 + step * i
+        c = o + step
+        h = c + 0.2
+        l = o - 0.1
+        bars.append((t, round(o, 2), round(h, 2), round(l, 2), round(c, 2), 3000))
+    return _make_bars(bars)
+
+
+def _make_falling_bars_double_sweep(ibh: float, ibl: float, final_price: float):
+    """Build bars: sweep IBH early, sweep IBL, then fall well below IBL."""
+    bars = []
+    base = (ibh + ibl) / 2
+    bars.append(("2026-03-13 09:30:00", base, ibh + 0.5, ibl - 0.1, ibh - 0.5, 5000))
+    bars.append(("2026-03-13 09:31:00", ibh - 0.5, ibh + 0.3, ibl - 0.5, ibl + 0.5, 5000))
+    bars.append(("2026-03-13 09:32:00", ibl + 0.5, ibl + 1, ibl - 0.2, ibl, 4000))
+    bars.append(("2026-03-13 09:33:00", ibl, ibl + 0.5, ibl - 0.5, ibl - 0.3, 4000))
+    bars.append(("2026-03-13 09:34:00", ibl - 0.3, ibl, ibl - 1, ibl - 0.8, 4000))
+    # Steady fall
+    step = ((ibl - 1) - final_price) / 15
+    for i in range(15):
+        t = f"2026-03-13 09:{35+i:02d}:00"
+        o = ibl - 1 - step * i
+        c = o - step
+        h = o + 0.1
+        l = c - 0.2
+        bars.append((t, round(o, 2), round(h, 2), round(l, 2), round(c, 2), 3000))
+    return _make_bars(bars)
+
+
+def _make_flat_bars_double_sweep(ibh: float, ibl: float, final_price: float):
+    """Build bars: sweep both IB sides via wicks, but close near final_price throughout.
+
+    Creates tight oscillation so _intraday_trend returns flat.
+    """
+    bars = []
+    # First 2 bars: sweep IBH/IBL via wicks but open/close near final_price
+    bars.append(("2026-03-13 09:30:00", final_price, ibh + 0.5, ibl - 0.5, final_price, 5000))
+    bars.append(("2026-03-13 09:31:00", final_price + 0.1, ibh + 0.3, ibl - 0.3, final_price - 0.1, 5000))
+    # Remaining bars: tight oscillation around final_price (alternating +/- 0.1)
+    for i in range(18):
+        t = f"2026-03-13 09:{32+i:02d}:00"
+        offset = 0.1 if i % 2 == 0 else -0.1
+        o = final_price + offset
+        c = final_price - offset
+        h = final_price + 0.15
+        l = final_price - 0.15
+        bars.append((t, round(o, 2), round(h, 2), round(l, 2), round(c, 2), 3000))
+    return _make_bars(bars)
+
+
+class TestWhipsawEscape:
+    """Whipsaw Trend Escape — double IB sweep + post-sweep directional trend."""
+
+    def _vp(self, poc=120, vah=122, val=118):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    # ── 正例 ──
+
+    def test_whipsaw_escape_bullish(self):
+        """Double sweep + price 1.5% above IBH + rising trend + above VWAP → TREND_DAY."""
+        ibh, ibl = 121.0, 119.0
+        final_price = 122.8  # ~1.5% above IBH
+        bars = _make_rising_bars_double_sweep(ibh, ibl, final_price)
+        result = classify_regime(
+            price=final_price, rvol=1.2, vp=self._vp(),
+            ibh=ibh, ibl=ibl, vwap=122.0, today_bars=bars,
+        )
+        assert result.regime == RegimeType.TREND_DAY
+        assert result.direction == "bullish"
+        assert "Whipsaw escape" in result.details
+        assert result.confidence == pytest.approx(0.45, abs=0.01)
+
+    def test_whipsaw_escape_bearish(self):
+        """Double sweep + price 1% below IBL + falling trend + below VWAP → TREND_DAY bearish."""
+        ibh, ibl = 121.0, 119.0
+        final_price = 117.8  # ~1.0% below IBL
+        bars = _make_falling_bars_double_sweep(ibh, ibl, final_price)
+        result = classify_regime(
+            price=final_price, rvol=1.0, vp=self._vp(),
+            ibh=ibh, ibl=ibl, vwap=119.5, today_bars=bars,
+        )
+        assert result.regime == RegimeType.TREND_DAY
+        assert result.direction == "bearish"
+        assert "Whipsaw escape" in result.details
+
+    # ── 反例 ──
+
+    def test_whipsaw_no_escape_near_ib(self):
+        """Double sweep + price only 0.3% above IBH → WHIPSAW (below escape threshold)."""
+        ibh, ibl = 121.0, 119.0
+        final_price = 121.36  # ~0.3% above IBH, < 0.5% threshold
+        bars = _make_rising_bars_double_sweep(ibh, ibl, final_price)
+        result = classify_regime(
+            price=final_price, rvol=1.0, vp=self._vp(),
+            ibh=ibh, ibl=ibl, vwap=121.0, today_bars=bars,
+        )
+        assert result.regime == RegimeType.WHIPSAW
+
+    def test_whipsaw_no_escape_flat_trend(self):
+        """Double sweep + price above IBH but trend flat → WHIPSAW."""
+        ibh, ibl = 121.0, 119.0
+        final_price = 122.0  # above IBH
+        bars = _make_flat_bars_double_sweep(ibh, ibl, final_price)
+        result = classify_regime(
+            price=final_price, rvol=1.0, vp=self._vp(),
+            ibh=ibh, ibl=ibl, vwap=121.0, today_bars=bars,
+        )
+        assert result.regime == RegimeType.WHIPSAW
+
+    def test_whipsaw_no_escape_vwap_contradiction(self):
+        """Double sweep + price above IBH + rising trend but below VWAP → WHIPSAW."""
+        ibh, ibl = 121.0, 119.0
+        final_price = 122.8
+        bars = _make_rising_bars_double_sweep(ibh, ibl, final_price)
+        result = classify_regime(
+            price=final_price, rvol=1.0, vp=self._vp(),
+            ibh=ibh, ibl=ibl, vwap=125.0,  # VWAP above price → contradiction
+            today_bars=bars,
+        )
+        assert result.regime == RegimeType.WHIPSAW
+
+    # ── 独立路径 ──
+
+    def test_whipsaw_iv_spike_unaffected(self):
+        """IV-spike + gamma wall WHIPSAW path is not affected by escape logic."""
+        gw = GammaWallResult(call_wall_strike=122, put_wall_strike=118, max_pain=120)
+        # No IB → double_swept=False, but IV spike + near gamma wall → WHIPSAW
+        result = classify_regime(
+            price=121.5, rvol=1.0, vp=self._vp(),
+            gamma_wall=gw, atm_iv=40, avg_iv=20, iv_spike_ratio=1.3,
+            ibh=0, ibl=0,  # No IB data
+        )
+        assert result.regime == RegimeType.WHIPSAW
+        assert "IV spike" in result.details
+
+    # ── 边界测试 ──
+
+    def test_whipsaw_escape_low_rvol(self):
+        """Escape triggers even with low RVOL (direct return, no RVOL gate)."""
+        ibh, ibl = 121.0, 119.0
+        final_price = 122.8
+        bars = _make_rising_bars_double_sweep(ibh, ibl, final_price)
+        result = classify_regime(
+            price=final_price, rvol=0.8, vp=self._vp(),
+            ibh=ibh, ibl=ibl, vwap=122.0, today_bars=bars,
+        )
+        assert result.regime == RegimeType.TREND_DAY
+        assert "Whipsaw escape" in result.details
+
+    def test_whipsaw_escape_confidence_discount(self):
+        """Escape confidence = 0.55 - discount (default 0.10 → 0.45)."""
+        ibh, ibl = 121.0, 119.0
+        final_price = 122.8
+        bars = _make_rising_bars_double_sweep(ibh, ibl, final_price)
+        result = classify_regime(
+            price=final_price, rvol=1.0, vp=self._vp(),
+            ibh=ibh, ibl=ibl, vwap=122.0, today_bars=bars,
+        )
+        assert result.regime == RegimeType.TREND_DAY
+        assert result.confidence == pytest.approx(0.45, abs=0.01)
+
+        # Custom discount
+        result2 = classify_regime(
+            price=final_price, rvol=1.0, vp=self._vp(),
+            ibh=ibh, ibl=ibl, vwap=122.0, today_bars=bars,
+            whipsaw_escape_discount=0.20,
+        )
+        assert result2.regime == RegimeType.TREND_DAY
+        assert result2.confidence == pytest.approx(0.35, abs=0.01)

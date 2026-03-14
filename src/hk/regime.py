@@ -197,6 +197,9 @@ def classify_regime(
     ib_trend_min_strength: float = 0.5,
     # Wide VA discount
     wide_va_threshold_pct: float = 2.5,
+    # Whipsaw escape params
+    whipsaw_escape_min_pct: float = 0.5,
+    whipsaw_escape_discount: float = 0.10,
 ) -> RegimeResult:
     """Classify current market regime into 5 classes.
 
@@ -342,7 +345,33 @@ def classify_regime(
     double_swept = _check_double_sweep(_bars, ibh, ibl) if ib_valid else False
 
     if double_swept:
-        # Price swept both sides of IB → classic whipsaw
+        # Post-whipsaw trend escape check
+        trend_dir, trend_strength = _intraday_trend(_bars)
+        above_ibh_pct = (price - ibh) / price * 100 if price > ibh else 0
+        below_ibl_pct = (ibl - price) / price * 100 if price < ibl else 0
+        escape_pct = max(above_ibh_pct, below_ibl_pct)
+
+        escaped = False
+        if escape_pct >= whipsaw_escape_min_pct:
+            if above_ibh_pct > 0 and trend_dir == "rising" and trend_strength >= 0.5:
+                if not (vwap > 0 and price < vwap):
+                    escaped = True
+            elif below_ibl_pct > 0 and trend_dir == "falling" and trend_strength >= 0.5:
+                if not (vwap > 0 and price > vwap):
+                    escaped = True
+
+        if escaped:
+            td_dir = "bullish" if above_ibh_pct > 0 else "bearish"
+            conf = 0.55 - whipsaw_escape_discount
+            details = (f"Whipsaw escape: double IB sweep (IBH {ibh:.2f}, IBL {ibl:.2f}) "
+                       f"then {td_dir} trend ({escape_pct:.1f}% beyond IB), RVOL {rvol:.2f}")
+            return RegimeResult(
+                regime=RegimeType.TREND_DAY, confidence=max(0.0, conf),
+                rvol=rvol, price=price, vah=vp.vah, val=vp.val, poc=vp.poc,
+                details=details, gap_pct=gap_pct, direction=td_dir,
+            )
+
+        # Not escaped → classic whipsaw
         confidence = 0.65
         return RegimeResult(
             regime=RegimeType.WHIPSAW, confidence=confidence,

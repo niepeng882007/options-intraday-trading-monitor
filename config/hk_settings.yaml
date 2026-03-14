@@ -73,6 +73,8 @@ regime:
   directional_trap_pct: 1.5    # 低 RVOL + 价格偏移 open > 1.5% → Directional Trap
   ib_trend_min_strength: 0.5   # IB Breakout Trend 最小趋势强度
   wide_va_threshold_pct: 2.5   # VA 范围 > 2.5% of price → FADE_CHOP 置信度折扣
+  whipsaw_escape_min_pct: 0.5  # 双向扫 IB 后价格超出 IB 边界 >= 0.5% 才触发 escape
+  whipsaw_escape_discount: 0.10  # Escape 后 TREND_DAY 置信度折扣 (0.55 - 0.10 = 0.45)
 
 trend_downgrade_confidence: 0.70  # wait + confidence < 此值 + TREND/GAP → 降级为 UNCLEAR plans
 

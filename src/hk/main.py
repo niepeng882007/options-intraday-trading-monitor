@@ -382,6 +382,8 @@ class HKPredictor:
             pulse_min_displacement_pct=regime_cfg.get("pulse_min_displacement_pct", 1.0),
             ib_trend_min_strength=regime_cfg.get("ib_trend_min_strength", 0.5),
             wide_va_threshold_pct=regime_cfg.get("wide_va_threshold_pct", 2.5),
+            whipsaw_escape_min_pct=regime_cfg.get("whipsaw_escape_min_pct", 0.5),
+            whipsaw_escape_discount=regime_cfg.get("whipsaw_escape_discount", 0.10),
         )
 
         # 8c. Build HKKeyLevels
@@ -520,6 +522,8 @@ class HKPredictor:
                 pulse_min_displacement_pct=regime_cfg.get("pulse_min_displacement_pct", 1.0),
                 ib_trend_min_strength=regime_cfg.get("ib_trend_min_strength", 0.5),
                 wide_va_threshold_pct=regime_cfg.get("wide_va_threshold_pct", 2.5),
+                whipsaw_escape_min_pct=regime_cfg.get("whipsaw_escape_min_pct", 0.5),
+                whipsaw_escape_discount=regime_cfg.get("whipsaw_escape_discount", 0.10),
             )
 
             self._market_context_cache[symbol] = (result, time.time())
@@ -699,6 +703,8 @@ class HKPredictor:
             pulse_min_displacement_pct=regime_cfg.get("pulse_min_displacement_pct", 1.0),
             ib_trend_min_strength=regime_cfg.get("ib_trend_min_strength", 0.5),
             wide_va_threshold_pct=regime_cfg.get("wide_va_threshold_pct", 2.5),
+            whipsaw_escape_min_pct=regime_cfg.get("whipsaw_escape_min_pct", 0.5),
+            whipsaw_escape_discount=regime_cfg.get("whipsaw_escape_discount", 0.10),
         )
 
         # ── TREND / GAP_AND_GO L1 check (both sessions) ──
