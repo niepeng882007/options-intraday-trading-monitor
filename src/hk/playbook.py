@@ -412,6 +412,70 @@ def _plans_fade_bullish(
     return [plan_a, plan_b, plan_c]
 
 
+def _plans_fade_midrange(
+    price: float, vp: VolumeProfileResult, levels: dict[str, float],
+    vwap: float, option_line: str | None,
+    ibh: float = 0.0, ibl: float = 0.0,
+) -> list[ActionPlan]:
+    """FADE_CHOP mid-zone — price equidistant from VAH/VAL, wait for edge."""
+    plan_a = ActionPlan(
+        label="A", name="等待边沿入场", emoji="⏳", is_primary=True,
+        logic="价格处于 VA 中间区域, 等待靠近 VAH 做空或 VAL 做多",
+        direction="neutral",
+        trigger=f"价格靠近 VAH {vp.vah:,.2f} 或 VAL {vp.val:,.2f}",
+        entry=None, entry_action="",
+        stop_loss=None, stop_loss_reason="",
+        tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+        option_line=option_line,
+    )
+
+    # Plan B: IB range trade if IB narrower than VA, otherwise VWAP regression
+    ib_usable = ibh > 0 and ibl > 0 and ibh < vp.vah and ibl > vp.val
+    if ib_usable:
+        plan_b = ActionPlan(
+            label="B", name="IB 区间交易", emoji="📦", is_primary=False,
+            logic=f"IB 范围 ({ibl:,.2f}-{ibh:,.2f}) 窄于 VA, 在 IB 边沿博回归",
+            direction="neutral",
+            trigger=f"价格靠近 IBH {ibh:,.2f} 或 IBL {ibl:,.2f}",
+            entry=None, entry_action="",
+            stop_loss=None, stop_loss_reason="IBH/IBL 外侧",
+            tp1=vp.poc, tp1_label="POC",
+            tp2=None, tp2_label="", rr_ratio=0.0,
+        )
+    elif vwap > 0:
+        plan_b = ActionPlan(
+            label="B", name="VWAP 回归", emoji="📦", is_primary=False,
+            logic="偏离 VWAP 时博回归",
+            direction="neutral",
+            trigger=f"价格偏离 VWAP {vwap:,.2f} > 0.5%",
+            entry=None, entry_action="",
+            stop_loss=None, stop_loss_reason="",
+            tp1=vp.poc, tp1_label="POC",
+            tp2=None, tp2_label="", rr_ratio=0.0,
+        )
+    else:
+        plan_b = ActionPlan(
+            label="B", name="观察关键位", emoji="👀", is_primary=False,
+            logic="观察 VA 边界反应后决策",
+            direction="neutral",
+            trigger=f"价格触及 VAH {vp.vah:,.2f} 或 VAL {vp.val:,.2f}",
+            entry=None, entry_action="",
+            stop_loss=None, stop_loss_reason="",
+            tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+        )
+
+    plan_c = ActionPlan(
+        label="C", name="失效转化", emoji="⚡", is_primary=False,
+        logic="放量突破 VAH 或 VAL → 转趋势日",
+        direction="neutral",
+        trigger=f"放量突破 VAH {vp.vah:,.2f} 或跌破 VAL {vp.val:,.2f}",
+        entry=None, entry_action="",
+        stop_loss=None, stop_loss_reason="",
+        tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+    )
+    return [plan_a, plan_b, plan_c]
+
+
 def _plans_whipsaw(
     price: float, vp: VolumeProfileResult, levels: dict[str, float],
     vwap: float, regime: RegimeResult, option_line: str | None,
@@ -534,6 +598,7 @@ def _generate_action_plans(
     ibl: float = 0.0,
     gamma_wall: GammaWallResult | None = None,
     trend_downgrade_confidence: float = 0.0,
+    fade_mid_zone_pct: float = 0.35,
 ) -> list[ActionPlan]:
     """Generate A/B/C action plans based on regime and direction."""
     price = regime.price
@@ -568,8 +633,13 @@ def _generate_action_plans(
         else:
             plans = _plans_trend_bearish(price, vp, levels, vwap, option_line)
     elif regime.regime == RegimeType.FADE_CHOP:
-        edge, _ = _closest_value_area_edge(price, vp)
-        if edge == "VAH":
+        edge, dist = _closest_value_area_edge(price, vp)
+        va_range = vp.vah - vp.val
+        edge_proximity = dist / va_range if va_range > 0 else 1.0
+
+        if edge_proximity > fade_mid_zone_pct:
+            plans = _plans_fade_midrange(price, vp, levels, vwap, option_line, ibh, ibl)
+        elif edge == "VAH":
             plans = _plans_fade_bearish(price, vp, levels, vwap, option_line)
         else:
             plans = _plans_fade_bullish(price, vp, levels, vwap, option_line)
@@ -701,12 +771,13 @@ def _core_conclusion_text(
     vp: VolumeProfileResult,
     vwap: float,
     option_rec: OptionRecommendation | None,
+    fade_mid_zone_pct: float = 0.35,
 ) -> str:
     """One-line action directive."""
     if option_rec and option_rec.action == "wait":
         # P1-1: data-wait (no chain/expiry) should not mask regime conclusion
         if getattr(option_rec, "wait_category", "market") == "data":
-            regime_conclusion = _regime_based_conclusion_hk(regime, direction, vp, vwap)
+            regime_conclusion = _regime_based_conclusion_hk(regime, direction, vp, vwap, fade_mid_zone_pct)
             data_note = option_rec.risk_note or "期权数据不可用"
             return f"{regime_conclusion} (⚠️ {data_note})"
         if option_rec.wait_conditions:
@@ -716,7 +787,7 @@ def _core_conclusion_text(
             return f"观望 — {cond}"
         return "观望, 等待方向明确"
 
-    return _regime_based_conclusion_hk(regime, direction, vp, vwap)
+    return _regime_based_conclusion_hk(regime, direction, vp, vwap, fade_mid_zone_pct)
 
 
 def _regime_based_conclusion_hk(
@@ -724,6 +795,7 @@ def _regime_based_conclusion_hk(
     direction: str,
     vp: VolumeProfileResult,
     vwap: float,
+    fade_mid_zone_pct: float = 0.35,
 ) -> str:
     """Regime-driven one-line conclusion (no option_rec dependency)."""
     price = regime.price
@@ -735,7 +807,7 @@ def _regime_based_conclusion_hk(
     if regime.regime == RegimeType.FADE_CHOP:
         edge, dist = _closest_value_area_edge(price, vp)
         va_width = vp.vah - vp.val
-        if va_width > 0 and dist / va_width > 0.5:
+        if va_width > 0 and dist / va_width > fade_mid_zone_pct:
             return "观望, 等待价格靠近 VA 边沿再入场"
         if edge == "VAH":
             return f"VAH {vp.vah:,.2f} 附近做空, 目标 POC {vp.poc:,.2f}"
@@ -769,7 +841,7 @@ def _regime_conclusion(
     vwap: float,
 ) -> str:
     # DEPRECATED — use _core_conclusion_text instead
-    return _core_conclusion_text(regime, regime.direction or "neutral", vp, vwap, None)
+    return _core_conclusion_text(regime, regime.direction or "neutral", vp, vwap, None, 0.35)
 
 
 def _regime_reason_lines(
@@ -801,6 +873,7 @@ def format_playbook_message(
     hsi_regime: RegimeResult | None = None,
     hstech_regime: RegimeResult | None = None,
     trend_downgrade_confidence: float = 0.70,
+    fade_mid_zone_pct: float = 0.35,
 ) -> str:
     """Format playbook as Telegram HTML message — 5-section institutional-grade output."""
     regime = playbook.regime
@@ -856,7 +929,7 @@ def format_playbook_message(
     lines.append("")
 
     # ── Section 2: 核心结论 ──
-    conclusion = _core_conclusion_text(regime, _direction, vp, vwap, recommendation)
+    conclusion = _core_conclusion_text(regime, _direction, vp, vwap, recommendation, fade_mid_zone_pct)
     lines.append(f"🎯 <b>核心结论: {_esc(conclusion)}</b>")
     lines.append(f"▸ 当前状态: {_esc(_price_position(regime.price, vp, vwap))}")
 
@@ -888,6 +961,7 @@ def format_playbook_message(
         ibl=kl.ibl if kl else 0.0,
         gamma_wall=gamma_wall,
         trend_downgrade_confidence=trend_downgrade_confidence,
+        fade_mid_zone_pct=fade_mid_zone_pct,
     )
     for plan in plans:
         for plan_line in _format_action_plan(plan):

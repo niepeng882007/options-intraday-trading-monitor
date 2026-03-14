@@ -380,6 +380,8 @@ class HKPredictor:
             directional_trap_pct=regime_cfg.get("directional_trap_pct", 1.5),
             pulse_min_ratio=regime_cfg.get("pulse_min_ratio", 2.5),
             pulse_min_displacement_pct=regime_cfg.get("pulse_min_displacement_pct", 1.0),
+            ib_trend_min_strength=regime_cfg.get("ib_trend_min_strength", 0.5),
+            wide_va_threshold_pct=regime_cfg.get("wide_va_threshold_pct", 2.5),
         )
 
         # 8c. Build HKKeyLevels
@@ -516,6 +518,8 @@ class HKPredictor:
                 directional_trap_pct=regime_cfg.get("directional_trap_pct", 1.5),
                 pulse_min_ratio=regime_cfg.get("pulse_min_ratio", 2.5),
                 pulse_min_displacement_pct=regime_cfg.get("pulse_min_displacement_pct", 1.0),
+                ib_trend_min_strength=regime_cfg.get("ib_trend_min_strength", 0.5),
+                wide_va_threshold_pct=regime_cfg.get("wide_va_threshold_pct", 2.5),
             )
 
             self._market_context_cache[symbol] = (result, time.time())
@@ -542,9 +546,11 @@ class HKPredictor:
         hsi_regime = await self._get_market_context_regime(ctx_cfg.get("hsi_symbol", "HK.800000"))
         hstech_regime = await self._get_market_context_regime(ctx_cfg.get("hstech_symbol", "HK.800700"))
 
+        playbook_cfg = self._cfg.get("playbook", {})
         html_text = format_playbook_message(
             playbook, symbol=display,
             hsi_regime=hsi_regime, hstech_regime=hstech_regime,
+            fade_mid_zone_pct=playbook_cfg.get("fade_mid_zone_pct", 0.35),
         )
 
         # Generate chart (best-effort — failure degrades to text-only)
@@ -691,6 +697,8 @@ class HKPredictor:
             directional_trap_pct=regime_cfg.get("directional_trap_pct", 1.5),
             pulse_min_ratio=regime_cfg.get("pulse_min_ratio", 2.5),
             pulse_min_displacement_pct=regime_cfg.get("pulse_min_displacement_pct", 1.0),
+            ib_trend_min_strength=regime_cfg.get("ib_trend_min_strength", 0.5),
+            wide_va_threshold_pct=regime_cfg.get("wide_va_threshold_pct", 2.5),
         )
 
         # ── TREND / GAP_AND_GO L1 check (both sessions) ──
@@ -875,7 +883,11 @@ class HKPredictor:
         # Format playbook HTML
         name = self.watchlist.get_name(symbol)
         display = f"{name} ({symbol})" if name != symbol else symbol
-        playbook_html = format_playbook_message(playbook, symbol=display)
+        _pb_cfg = self._cfg.get("playbook", {})
+        playbook_html = format_playbook_message(
+            playbook, symbol=display,
+            fade_mid_zone_pct=_pb_cfg.get("fade_mid_zone_pct", 0.35),
+        )
 
         return signal, playbook_html, option_rec, filters
 

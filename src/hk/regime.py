@@ -102,7 +102,11 @@ def _check_double_sweep(
         return False
     day_high = float(today_bars["High"].max())
     day_low = float(today_bars["Low"].min())
-    return day_high > ibh and day_low < ibl
+    # Both sides reached/touched, at least one strictly breached.
+    # Avoids trivial match when all bars are within IB formation window.
+    touched = day_high >= ibh and day_low <= ibl
+    breached = day_high > ibh or day_low < ibl
+    return touched and breached
 
 
 def _check_vwap_divergence(
@@ -189,6 +193,10 @@ def classify_regime(
     directional_trap_pct: float = 1.5,
     pulse_min_ratio: float = 2.5,
     pulse_min_displacement_pct: float = 1.0,
+    # IB Breakout Trend params
+    ib_trend_min_strength: float = 0.5,
+    # Wide VA discount
+    wide_va_threshold_pct: float = 2.5,
 ) -> RegimeResult:
     """Classify current market regime into 5 classes.
 
@@ -550,11 +558,48 @@ def classify_regime(
             gap_pct=gap_pct, direction=pulse_dir,
         )
 
+    # ── 4e. IB Breakout Trend — IB breakout + intraday trend despite low RVOL ──
+    if (
+        _effective_rvol < _trend_rvol
+        and ib_breakout
+        and not (pulse_peak_ratio >= pulse_min_ratio
+                 and pulse_displacement_pct >= pulse_min_displacement_pct)
+    ):
+        trend_dir, trend_strength = _intraday_trend(_bars)
+        breakout_bullish = price > ibh
+        ib_dir_matches = (
+            (breakout_bullish and trend_dir == "rising")
+            or (not breakout_bullish and trend_dir == "falling")
+        )
+        if ib_dir_matches and trend_strength >= ib_trend_min_strength:
+            ibt_direction = "bullish" if breakout_bullish else "bearish"
+            base = 0.40
+            if vwap > 0:
+                vwap_confirms = (
+                    (ibt_direction == "bullish" and price > vwap)
+                    or (ibt_direction == "bearish" and price < vwap)
+                )
+                base += 0.05 if vwap_confirms else -0.15
+            if has_volume_surge:
+                base += 0.05
+            confidence = min(0.55, max(0.30, base))
+            return RegimeResult(
+                regime=RegimeType.TREND_DAY, confidence=confidence,
+                rvol=rvol, price=price, vah=vp.vah, val=vp.val, poc=vp.poc,
+                details=f"IB Trend: price {'above IBH' if breakout_bullish else 'below IBL'}, "
+                        f"trend {trend_dir} ({trend_strength:.2f}), RVOL {rvol:.2f}",
+                gap_pct=gap_pct, direction=ibt_direction,
+            )
+
     # ── 4d. Directional Trap — low RVOL but large price displacement from open ──
+    _IB_TRAP_MULTIPLIER = 1.67  # IB breakout naturally has larger displacement
+    _trap_threshold = directional_trap_pct
+    if ib_breakout:
+        _trap_threshold = directional_trap_pct * _IB_TRAP_MULTIPLIER
     if (
         _effective_rvol < _fade_rvol
         and _open > 0
-        and abs(price - _open) / _open * 100 > directional_trap_pct
+        and abs(price - _open) / _open * 100 > _trap_threshold
     ):
         trap_dir = "bullish" if price > _open else "bearish"
         return RegimeResult(
@@ -605,6 +650,13 @@ def classify_regime(
                 discount = min(0.3, (range_ratio - range_discount_threshold) * range_discount_slope)
                 confidence = max(0.0, confidence - discount)
                 details += f" (振幅占VA {range_ratio:.0%}, 置信度折扣)"
+
+        # Wide VA discount — VA range too wide for actionable fade entries
+        va_range_pct = va_range / price * 100 if price > 0 and va_range > 0 else 0.0
+        if va_range_pct > wide_va_threshold_pct:
+            wide_discount = min(0.15, (va_range_pct - wide_va_threshold_pct) / 3.0 * 0.15)
+            confidence = max(0.0, confidence - wide_discount)
+            details += f", wide VA ({va_range_pct:.1f}%)"
 
         # Volume surge near VA edge
         if has_volume_surge and va_range > 0:

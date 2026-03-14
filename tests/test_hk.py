@@ -3716,3 +3716,319 @@ class TestHKCoreConclusion:
         rec = hk_recommend(regime=regime, vp=vp, filters=filters, chain_df=None, expiry_dates=[])
         assert rec.action == "wait"
         assert rec.wait_category == "data"
+
+
+# ── IB Breakout Trend Tests (Fix 2) ──
+
+
+def _make_rising_bars(n: int = 30, start_price: float = 130.0, step: float = 0.1) -> pd.DataFrame:
+    """Create bars with a rising trend (for _intraday_trend detection)."""
+    rows = []
+    for i in range(n):
+        o = start_price + i * step
+        c = o + step * 0.8
+        h = max(o, c) + 0.05
+        l = min(o, c) - 0.05
+        ts = f"2026-03-13 {9 + (30 + i) // 60:02d}:{(30 + i) % 60:02d}:00"
+        rows.append((ts, o, h, l, c, 1000))
+    return _make_bars(rows)
+
+
+def _make_falling_bars(n: int = 30, start_price: float = 135.0, step: float = 0.1) -> pd.DataFrame:
+    """Create bars with a falling trend."""
+    rows = []
+    for i in range(n):
+        o = start_price - i * step
+        c = o - step * 0.8
+        h = max(o, c) + 0.05
+        l = min(o, c) - 0.05
+        ts = f"2026-03-13 {9 + (30 + i) // 60:02d}:{(30 + i) % 60:02d}:00"
+        rows.append((ts, o, h, l, c, 1000))
+    return _make_bars(rows)
+
+
+def _make_flat_bars(n: int = 30, price: float = 132.0) -> pd.DataFrame:
+    """Create bars with flat/choppy movement."""
+    rows = []
+    for i in range(n):
+        o = price + (0.1 if i % 2 == 0 else -0.1)
+        c = price - (0.1 if i % 2 == 0 else -0.1)
+        h = price + 0.2
+        l = price - 0.2
+        ts = f"2026-03-13 {9 + (30 + i) // 60:02d}:{(30 + i) % 60:02d}:00"
+        rows.append((ts, o, h, l, c, 1000))
+    return _make_bars(rows)
+
+
+class TestIBBreakoutTrend:
+    """Fix 2: IB Breakout Trend — IB breakout + intraday trend despite low RVOL."""
+
+    def _vp(self, poc=132.0, vah=135.0, val=130.0):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    def test_ib_trend_bullish(self):
+        """price > IBH, rising trend, low RVOL → TREND_DAY (bullish, 0.40-0.55)."""
+        bars = _make_rising_bars(n=30, start_price=131.0, step=0.1)
+        result = classify_regime(
+            price=133.0, rvol=0.6, vp=self._vp(),
+            ibh=132.6, ibl=130.4, vwap=132.5,
+            today_bars=bars, trend_day_rvol=1.05, fade_chop_rvol=0.85,
+        )
+        assert result.regime == RegimeType.TREND_DAY
+        assert result.direction == "bullish"
+        assert 0.30 <= result.confidence <= 0.55
+        assert "IB Trend" in result.details
+
+    def test_ib_trend_bearish(self):
+        """price < IBL, falling trend → TREND_DAY (bearish)."""
+        bars = _make_falling_bars(n=30, start_price=131.0, step=0.1)
+        result = classify_regime(
+            price=129.5, rvol=0.6, vp=self._vp(),
+            ibh=132.6, ibl=130.4, vwap=130.0,
+            today_bars=bars, trend_day_rvol=1.05, fade_chop_rvol=0.85,
+        )
+        assert result.regime == RegimeType.TREND_DAY
+        assert result.direction == "bearish"
+        assert "IB Trend" in result.details
+
+    def test_ib_trend_vwap_confirms(self):
+        """VWAP confirming direction → +0.05 boost."""
+        bars = _make_rising_bars(n=30, start_price=131.0, step=0.1)
+        # VWAP below price (confirms bullish)
+        result_confirm = classify_regime(
+            price=133.0, rvol=0.6, vp=self._vp(),
+            ibh=132.6, ibl=130.4, vwap=132.0,
+            today_bars=bars, trend_day_rvol=1.05, fade_chop_rvol=0.85,
+        )
+        # VWAP above price (contradicts bullish)
+        result_contradict = classify_regime(
+            price=133.0, rvol=0.6, vp=self._vp(),
+            ibh=132.6, ibl=130.4, vwap=134.0,
+            today_bars=bars, trend_day_rvol=1.05, fade_chop_rvol=0.85,
+        )
+        # Both should be TREND_DAY
+        assert result_confirm.regime == RegimeType.TREND_DAY
+        assert result_contradict.regime == RegimeType.TREND_DAY
+        # Confirm should have higher confidence
+        assert result_confirm.confidence > result_contradict.confidence
+
+    def test_ib_trend_vwap_contradicts(self):
+        """VWAP contradicting → -0.15 penalty (consistent with Pulse Trend)."""
+        bars = _make_rising_bars(n=30, start_price=131.0, step=0.1)
+        result = classify_regime(
+            price=133.0, rvol=0.6, vp=self._vp(),
+            ibh=132.6, ibl=130.4, vwap=134.0,
+            today_bars=bars, trend_day_rvol=1.05, fade_chop_rvol=0.85,
+        )
+        assert result.regime == RegimeType.TREND_DAY
+        # base=0.40 - 0.15 = 0.25, clamped to [0.30, 0.55]
+        assert result.confidence >= 0.30
+
+    def test_ib_trend_no_agreement(self):
+        """price > IBH but flat trend → NOT IB trend → falls through."""
+        bars = _make_flat_bars(n=30, price=133.0)
+        result = classify_regime(
+            price=133.0, rvol=0.6, vp=self._vp(),
+            ibh=132.6, ibl=130.4, vwap=132.5,
+            today_bars=bars, trend_day_rvol=1.05, fade_chop_rvol=0.85,
+        )
+        # Should NOT be IB Trend since trend is flat
+        assert "IB Trend" not in (result.details or "")
+
+    def test_ib_trend_before_trap(self):
+        """IB breakout + 1.75% displacement → IB trend, NOT directional trap."""
+        bars = _make_rising_bars(n=30, start_price=131.0, step=0.1)
+        # open_price=131.3, price=133.6 → displacement = 1.75%
+        result = classify_regime(
+            price=133.6, rvol=0.6, vp=self._vp(),
+            ibh=132.6, ibl=130.4, vwap=132.5,
+            open_price=131.3,
+            today_bars=bars, trend_day_rvol=1.05, fade_chop_rvol=0.85,
+        )
+        assert result.regime == RegimeType.TREND_DAY
+        assert "IB Trend" in result.details
+        # Should NOT be directional trap
+        assert "Directional trap" not in result.details
+
+
+# ── WHIPSAW Boundary Tests (Fix 1) ──
+
+
+class TestWhipsawBoundary:
+    """Fix 1: WHIPSAW boundary comparison — touching + one strict breach."""
+
+    def _vp(self, poc=500, vah=510, val=490):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    def test_whipsaw_exact_ibl(self):
+        """day_low == IBL, day_high > IBH → WHIPSAW (one side strictly breached)."""
+        bars = _make_bars([
+            ("2026-03-13 09:30:00", 500, 506, 495, 502, 1000),  # IBH=506, IBL=495
+            ("2026-03-13 10:05:00", 503, 508, 495, 500, 1000),  # day_high=508>IBH, day_low==IBL
+        ])
+        from src.hk.regime import _check_double_sweep
+        assert _check_double_sweep(bars, ibh=506.0, ibl=495.0) is True
+
+    def test_whipsaw_exact_ibh(self):
+        """day_high == IBH, day_low < IBL → WHIPSAW (symmetric)."""
+        bars = _make_bars([
+            ("2026-03-13 09:30:00", 500, 506, 495, 502, 1000),
+            ("2026-03-13 10:05:00", 497, 506, 493, 500, 1000),  # day_high==IBH, day_low<IBL
+        ])
+        from src.hk.regime import _check_double_sweep
+        assert _check_double_sweep(bars, ibh=506.0, ibl=495.0) is True
+
+    def test_no_whipsaw_both_exact(self):
+        """day_high == IBH AND day_low == IBL → NOT whipsaw (trivial IB match)."""
+        bars = _make_bars([
+            ("2026-03-13 09:30:00", 500, 506, 495, 502, 1000),
+        ])
+        from src.hk.regime import _check_double_sweep
+        assert _check_double_sweep(bars, ibh=506.0, ibl=495.0) is False
+
+
+# ── Directional Trap Guard Tests (Fix 3) ──
+
+
+class TestDirectionalTrapGuard:
+    """Fix 3: Directional Trap threshold raised when IB breakout."""
+
+    def _vp(self, poc=132.0, vah=135.0, val=130.0):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    def test_trap_threshold_raised(self):
+        """IB breakout + 1.8% displacement → NOT trap (threshold raised to 2.5%)."""
+        bars = _make_flat_bars(n=15, price=133.7)
+        result = classify_regime(
+            price=133.7, rvol=0.6, vp=self._vp(),
+            ibh=132.6, ibl=130.4, vwap=132.5,
+            open_price=131.3,  # displacement = (133.7-131.3)/131.3 = 1.83%
+            today_bars=bars,
+            trend_day_rvol=1.05, fade_chop_rvol=0.85,
+            directional_trap_pct=1.5,
+        )
+        # 1.83% < 1.5 * 1.67 = 2.505% → should NOT trigger trap
+        assert "Directional trap" not in (result.details or "")
+
+    def test_trap_still_fires_no_ib(self):
+        """No IB data + 1.8% displacement → still fires trap (threshold stays 1.5%)."""
+        bars = _make_flat_bars(n=15, price=133.7)
+        result = classify_regime(
+            price=133.7, rvol=0.6, vp=self._vp(),
+            ibh=0.0, ibl=0.0, vwap=132.5,
+            open_price=131.3,
+            today_bars=bars,
+            trend_day_rvol=1.05, fade_chop_rvol=0.85,
+            directional_trap_pct=1.5,
+        )
+        # 1.83% > 1.5% → should trigger trap
+        assert result.regime == RegimeType.UNCLEAR
+        assert "Directional trap" in result.details
+
+
+# ── Wide VA Discount Tests (Fix 4) ──
+
+
+class TestWideVA:
+    """Fix 4: Wide VA range → FADE_CHOP confidence discount."""
+
+    def test_wide_va_discount(self):
+        """VA range 3.5% of price → lower FADE_CHOP confidence."""
+        # price=100, vah=103.5, val=100 → VA range = 3.5, 3.5% of price
+        vp = VolumeProfileResult(poc=101.5, vah=103.5, val=100.0)
+        result_wide = classify_regime(
+            price=101.5, rvol=0.6, vp=vp,
+            trend_day_rvol=1.05, fade_chop_rvol=0.85,
+            wide_va_threshold_pct=2.5,
+        )
+        # Normal VA: 1.5% of price
+        vp_normal = VolumeProfileResult(poc=100.75, vah=101.5, val=100.0)
+        result_normal = classify_regime(
+            price=100.75, rvol=0.6, vp=vp_normal,
+            trend_day_rvol=1.05, fade_chop_rvol=0.85,
+            wide_va_threshold_pct=2.5,
+        )
+        assert result_wide.regime == RegimeType.FADE_CHOP
+        assert result_normal.regime == RegimeType.FADE_CHOP
+        assert result_wide.confidence < result_normal.confidence
+        assert "wide VA" in result_wide.details
+
+    def test_normal_va_no_discount(self):
+        """VA range 1.5% of price → no discount."""
+        vp = VolumeProfileResult(poc=100.75, vah=101.5, val=100.0)
+        result = classify_regime(
+            price=100.75, rvol=0.6, vp=vp,
+            trend_day_rvol=1.05, fade_chop_rvol=0.85,
+            wide_va_threshold_pct=2.5,
+        )
+        assert result.regime == RegimeType.FADE_CHOP
+        assert "wide VA" not in result.details
+
+
+# ── FADE_CHOP Mid-Zone Tests (Fix 5) ──
+
+
+class TestFadeMidZone:
+    """Fix 5: FADE_CHOP mid-zone → neutral wait plans."""
+
+    def _vp(self, poc=132.5, vah=135.0, val=130.0):
+        return VolumeProfileResult(poc=poc, vah=vah, val=val)
+
+    def test_midrange_neutral_plans(self):
+        """Price equidistant from VAH/VAL → neutral plans with '等待边沿入场'."""
+        from src.hk.playbook import _generate_action_plans
+        regime = RegimeResult(
+            regime=RegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.6, price=132.5, vah=135.0, val=130.0, poc=132.5,
+        )
+        vp = self._vp()
+        levels = {"VAH": 135.0, "VAL": 130.0, "POC": 132.5, "VWAP": 132.0}
+        plans = _generate_action_plans(
+            regime, "neutral", vp, levels, vwap=132.0, option_rec=None,
+            ibh=132.6, ibl=130.4, fade_mid_zone_pct=0.35,
+        )
+        assert len(plans) == 3
+        # Plan A should be neutral "等待边沿入场"
+        assert plans[0].direction == "neutral"
+        assert "等待" in plans[0].name or "等待" in plans[0].logic
+        # Plan C should be "失效转化"
+        assert "失效" in plans[2].name
+
+    def test_near_vah_still_bearish(self):
+        """Price near VAH (within 35% zone) → bearish fade plans, not midrange."""
+        from src.hk.playbook import _generate_action_plans
+        regime = RegimeResult(
+            regime=RegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.6, price=134.5, vah=135.0, val=130.0, poc=132.5,
+        )
+        vp = self._vp()
+        levels = {"VAH": 135.0, "VAL": 130.0, "POC": 132.5, "VWAP": 132.0}
+        plans = _generate_action_plans(
+            regime, "bearish", vp, levels, vwap=132.0, option_rec=None,
+            ibh=132.6, ibl=130.4, fade_mid_zone_pct=0.35,
+        )
+        # Near VAH → bearish fade plans
+        assert plans[0].direction == "bearish"
+
+    def test_core_conclusion_midrange(self):
+        """Core conclusion for mid-zone → '观望, 等待价格靠近 VA 边沿再入场'."""
+        from src.hk.playbook import _core_conclusion_text
+        regime = RegimeResult(
+            regime=RegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.6, price=132.5, vah=135.0, val=130.0, poc=132.5,
+        )
+        vp = self._vp()
+        text = _core_conclusion_text(regime, "neutral", vp, 132.0, None, fade_mid_zone_pct=0.35)
+        assert "观望" in text
+        assert "边沿" in text
+
+    def test_core_conclusion_near_edge(self):
+        """Core conclusion for near-edge → directed action (not 观望)."""
+        from src.hk.playbook import _core_conclusion_text
+        regime = RegimeResult(
+            regime=RegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.6, price=134.5, vah=135.0, val=130.0, poc=132.5,
+        )
+        vp = self._vp()
+        text = _core_conclusion_text(regime, "neutral", vp, 132.0, None, fade_mid_zone_pct=0.35)
+        assert "做空" in text or "VAH" in text

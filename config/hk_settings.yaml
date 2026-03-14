@@ -71,6 +71,8 @@ regime:
   pulse_min_ratio: 2.5         # 脉冲量比阈值 (bar volume / expanding median)
   pulse_min_displacement_pct: 1.0  # 脉冲价格位移 >= 1.0% 才触发 Pulse Trend
   directional_trap_pct: 1.5    # 低 RVOL + 价格偏移 open > 1.5% → Directional Trap
+  ib_trend_min_strength: 0.5   # IB Breakout Trend 最小趋势强度
+  wide_va_threshold_pct: 2.5   # VA 范围 > 2.5% of price → FADE_CHOP 置信度折扣
 
 trend_downgrade_confidence: 0.70  # wait + confidence < 此值 + TREND/GAP → 降级为 UNCLEAR plans
 
@@ -140,6 +142,7 @@ auto_scan:
 playbook:
   push_times: ["09:35", "10:05", "13:05"]
   timezone: "Asia/Hong_Kong"
+  fade_mid_zone_pct: 0.35        # 价格距 VA 两端均 > 35% VA 宽度 → 中间观望区
 
 telegram:
   bot_token: "${TELEGRAM_BOT_TOKEN}"
