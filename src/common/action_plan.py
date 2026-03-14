@@ -52,6 +52,7 @@ class PlanContext:
     intraday_range_pct: float = 0.0
     option_action: str = ""             # "wait" / "call" / "put" / ...
     min_rr: float = 0.8
+    market_direction: str = ""          # "bullish" / "bearish" / "" (unknown)
 
 
 def calculate_rr(
@@ -321,11 +322,28 @@ def apply_wait_coherence(
 def apply_min_rr_gate(
     plans: list[ActionPlan], ctx: PlanContext,
 ) -> list[ActionPlan]:
-    """Demote plans with R:R below threshold."""
+    """Demote plans with R:R below threshold.
+
+    Three-layer check for rr_ratio == 0:
+    - tp1 set but no stop_loss → "无止损位, 风险不可控"
+    - tp1 set and stop_loss set → "TP1 过近入场位, 无操作空间"
+    - tp1 is None → skip (UNCLEAR Plan B "轻仓试探" semantics)
+    """
     for plan in plans:
         if plan.label == "C" or plan.entry is None:
             continue
-        if 0 < plan.rr_ratio < ctx.min_rr:
+        if plan.rr_ratio == 0.0:
+            if plan.tp1 is None:
+                continue  # UNCLEAR 轻仓试探, no TP → skip
+            if plan.stop_loss is None:
+                plan.demoted = True
+                if not plan.demote_reason:
+                    plan.demote_reason = "无止损位, 风险不可控"
+            else:
+                plan.demoted = True
+                if not plan.demote_reason:
+                    plan.demote_reason = "TP1 过近入场位, 无操作空间"
+        elif plan.rr_ratio < ctx.min_rr:
             plan.demoted = True
             if not plan.demote_reason:
                 plan.demote_reason = f"R:R 仅 1:{plan.rr_ratio:.1f}, 低于阈值 1:{ctx.min_rr:.1f}"
@@ -481,12 +499,12 @@ def apply_gamma_wall_warning(
             if max_pain > 0:
                 mp_dev = (price - max_pain) / price * 100
                 if mp_dev > warn_thr:
-                    warnings.append(f"MaxPain({max_pain:,.1f})低于现价 {mp_dev:.1f}%, 期权引力偏空")
+                    warnings.append(f"MaxPain({_format_strike(max_pain)})低于现价 {mp_dev:.1f}%, 期权引力偏空")
             # Call wall close above → resistance cap
             if call_wall > 0:
                 cw_dist = (call_wall - price) / price * 100
                 if 0 < cw_dist < prox_thr:
-                    warnings.append(f"Call Wall({call_wall:,.1f})近在 {cw_dist:.1f}%, 上方压制")
+                    warnings.append(f"Call Wall({_format_strike(call_wall)})近在 {cw_dist:.1f}%, 上方压制")
             # Put wall above price → structure hostile
             if put_wall > 0 and put_wall > price:
                 plan.demoted = True
@@ -497,12 +515,12 @@ def apply_gamma_wall_warning(
             if max_pain > 0:
                 mp_dev = (max_pain - price) / price * 100
                 if mp_dev > warn_thr:
-                    warnings.append(f"MaxPain({max_pain:,.1f})高于现价 {mp_dev:.1f}%, 期权引力偏多")
+                    warnings.append(f"MaxPain({_format_strike(max_pain)})高于现价 {mp_dev:.1f}%, 期权引力偏多")
             # Put wall close below → support cushion
             if put_wall > 0:
                 pw_dist = (price - put_wall) / price * 100
                 if 0 < pw_dist < prox_thr:
-                    warnings.append(f"Put Wall({put_wall:,.1f})近在 {pw_dist:.1f}%, 下方承接")
+                    warnings.append(f"Put Wall({_format_strike(put_wall)})近在 {pw_dist:.1f}%, 下方承接")
             # Call wall below price → structure hostile
             if call_wall > 0 and call_wall < price:
                 plan.demoted = True
@@ -541,4 +559,25 @@ def apply_vwap_deviation_warning(
         # Price above VWAP + bullish plan → chasing strength
         elif dev_pct > threshold and plan.direction == "bullish":
             plan.warning = f"价格已高于 VWAP {abs(dev_pct):.1f}%, 做多需等回调"
+    return plans
+
+
+def apply_market_direction_warning(
+    plans: list[ActionPlan], ctx: PlanContext,
+) -> list[ActionPlan]:
+    """Warn when plan direction conflicts with market (SPY) direction.
+
+    Only warns — does not demote.  Skips when market_direction is empty or neutral.
+    """
+    mkt = ctx.market_direction
+    if not mkt or mkt == "neutral":
+        return plans
+    for plan in plans:
+        if plan.label == "C" or plan.entry is None:
+            continue
+        if plan.direction in ("bullish", "bearish") and plan.direction != mkt:
+            mkt_cn = "偏多" if mkt == "bullish" else "偏空"
+            dir_cn = "做多" if plan.direction == "bullish" else "做空"
+            w = f"大盘 {mkt_cn}, 个股 {dir_cn} 逆势, 注意风险"
+            plan.warning = f"{plan.warning}; {w}" if plan.warning else w
     return plans

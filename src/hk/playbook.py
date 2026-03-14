@@ -32,6 +32,7 @@ from src.common.formatting import (
     confidence_bar as _confidence_bar,
     format_leg_line as _format_leg_line,  # noqa: F401 — re-export for tests
     format_percent as _format_percent,
+    format_strike as _format_strike,
     pct_change as _pct_change,
 )
 from src.common.types import (
@@ -153,7 +154,10 @@ def _plans_trend_bullish(
     vwap: float, option_line: str | None,
 ) -> list[ActionPlan]:
     """GAP_AND_GO / TREND_DAY bullish plans."""
-    above = _nearest_levels(price, "above", levels, n=3)
+    # Anchor TP search from VWAP (entry), fallback to price if no results
+    above = _nearest_levels(vwap, "above", levels, n=3) if vwap > 0 else []
+    if not above:
+        above = _nearest_levels(price, "above", levels, n=3)
     below_vwap = _nearest_levels(vwap, "below", levels, n=1) if vwap > 0 else []
     sl_a = below_vwap[0] if below_vwap else None
     tp1_a = above[0] if above else None
@@ -216,7 +220,10 @@ def _plans_trend_bearish(
     vwap: float, option_line: str | None,
 ) -> list[ActionPlan]:
     """GAP_AND_GO / TREND_DAY bearish plans."""
-    below = _nearest_levels(price, "below", levels, n=3)
+    # Anchor TP search from VWAP (entry), fallback to price if no results
+    below = _nearest_levels(vwap, "below", levels, n=3) if vwap > 0 else []
+    if not below:
+        below = _nearest_levels(price, "below", levels, n=3)
     above_vwap = _nearest_levels(vwap, "above", levels, n=1) if vwap > 0 else []
     sl_a = above_vwap[0] if above_vwap else None
     tp1_a = below[0] if below else None
@@ -526,10 +533,34 @@ def _generate_action_plans(
     ibh: float = 0.0,
     ibl: float = 0.0,
     gamma_wall: GammaWallResult | None = None,
+    trend_downgrade_confidence: float = 0.0,
 ) -> list[ActionPlan]:
     """Generate A/B/C action plans based on regime and direction."""
     price = regime.price
     option_line = _compact_option_line(option_rec) if option_rec else None
+
+    # Issue 4: wait + low confidence trend → downgrade to UNCLEAR plans
+    if (
+        trend_downgrade_confidence > 0
+        and option_rec is not None
+        and option_rec.action == "wait"
+        and regime.confidence < trend_downgrade_confidence
+        and regime.regime in (RegimeType.GAP_AND_GO, RegimeType.TREND_DAY)
+    ):
+        plans = _plans_unclear(price, vp, levels, vwap, regime, option_line)
+        if ctx:
+            plans = _check_regime_consistency(
+                plans, regime.regime.name, price, regime.price, ibh, ibl, vwap,
+            )
+            plans = [_cap_tp1(p, ctx, levels) for p in plans]
+            plans = [_cap_tp2(p, ctx, levels) for p in plans]
+            plans = [_check_entry_reachability(p, price, ctx) for p in plans]
+            plans = [_check_entry_proximity(p, price) for p in plans]
+            plans = _apply_wait_coherence(plans, ctx)
+            plans = _apply_min_rr_gate(plans, ctx)
+            plans = _apply_gamma_wall_warning(plans, price, gamma_wall, ctx)
+            plans = _apply_vwap_deviation_warning(plans, price, vwap)
+        return plans
 
     if regime.regime in (RegimeType.GAP_AND_GO, RegimeType.TREND_DAY):
         if direction == "bullish":
@@ -751,6 +782,7 @@ def format_playbook_message(
     update_type: str = "manual",
     hsi_regime: RegimeResult | None = None,
     hstech_regime: RegimeResult | None = None,
+    trend_downgrade_confidence: float = 0.70,
 ) -> str:
     """Format playbook as Telegram HTML message — 5-section institutional-grade output."""
     regime = playbook.regime
@@ -837,6 +869,7 @@ def format_playbook_message(
         ibh=kl.ibh if kl else 0.0,
         ibl=kl.ibl if kl else 0.0,
         gamma_wall=gamma_wall,
+        trend_downgrade_confidence=trend_downgrade_confidence,
     )
     for plan in plans:
         for plan_line in _format_action_plan(plan):
@@ -914,11 +947,11 @@ def format_playbook_message(
     if gamma_wall:
         gw_parts = []
         if gamma_wall.call_wall_strike > 0:
-            gw_parts.append(f"Call Wall {gamma_wall.call_wall_strike:,.0f}")
+            gw_parts.append(f"Call Wall {_format_strike(gamma_wall.call_wall_strike)}")
         if gamma_wall.put_wall_strike > 0:
-            gw_parts.append(f"Put Wall {gamma_wall.put_wall_strike:,.0f}")
+            gw_parts.append(f"Put Wall {_format_strike(gamma_wall.put_wall_strike)}")
         if gamma_wall.max_pain > 0:
-            gw_parts.append(f"MaxPain {gamma_wall.max_pain:,.0f}")
+            gw_parts.append(f"MaxPain {_format_strike(gamma_wall.max_pain)}")
         if gw_parts:
             lines.append(" | ".join(gw_parts))
 

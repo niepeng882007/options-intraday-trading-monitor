@@ -173,6 +173,8 @@ market_tone:
       fomc_trend_unlock_time: "14:00"
       data_scan_start_time: "10:00"
 
+trend_downgrade_confidence: 0.70  # wait + confidence < 此值 + TREND/GAP → 降级为 UNCLEAR plans
+
 hist_cache_ttl: 120  # VP/历史 K 线缓存 TTL（秒）
 
 simulation:

@@ -72,6 +72,8 @@ regime:
   pulse_min_displacement_pct: 1.0  # 脉冲价格位移 >= 1.0% 才触发 Pulse Trend
   directional_trap_pct: 1.5    # 低 RVOL + 价格偏移 open > 1.5% → Directional Trap
 
+trend_downgrade_confidence: 0.70  # wait + confidence < 此值 + TREND/GAP → 降级为 UNCLEAR plans
+
 market_context:
   hsi_symbol: "HK.800000"
   hstech_symbol: "HK.800700"

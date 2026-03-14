@@ -15,6 +15,7 @@ from src.common.action_plan import (
     check_entry_reachability,
     apply_wait_coherence,
     apply_min_rr_gate,
+    apply_market_direction_warning,
 )
 from src.common.types import OptionRecommendation, OptionLeg, SpreadMetrics
 
@@ -167,6 +168,89 @@ class TestApplyMinRRGate:
         ctx = PlanContext(min_rr=0.8)
         result = apply_min_rr_gate(plans, ctx)
         assert result[0].demoted is False
+
+    def test_rr_zero_no_stop_loss(self):
+        """rr=0, tp1 set, no stop_loss → demoted as uncontrollable risk."""
+        plan = ActionPlan(
+            label="A", name="test", emoji="📈", is_primary=True,
+            logic="test", direction="bullish", trigger="test",
+            entry=100.0, entry_action="做多",
+            stop_loss=None, stop_loss_reason="",
+            tp1=105.0, tp1_label="TP1", tp2=None, tp2_label="",
+            rr_ratio=0.0,
+        )
+        plans = [plan]
+        ctx = PlanContext(min_rr=0.8)
+        result = apply_min_rr_gate(plans, ctx)
+        assert result[0].demoted is True
+        assert "无止损位" in result[0].demote_reason
+
+    def test_rr_zero_tp_equals_entry(self):
+        """rr=0, tp1 set, stop_loss set → demoted as no room."""
+        plan = ActionPlan(
+            label="A", name="test", emoji="📈", is_primary=True,
+            logic="test", direction="bullish", trigger="test",
+            entry=100.0, entry_action="做多",
+            stop_loss=95.0, stop_loss_reason="test",
+            tp1=100.0, tp1_label="TP1", tp2=None, tp2_label="",
+            rr_ratio=0.0,
+        )
+        plans = [plan]
+        ctx = PlanContext(min_rr=0.8)
+        result = apply_min_rr_gate(plans, ctx)
+        assert result[0].demoted is True
+        assert "TP1 过近" in result[0].demote_reason
+
+    def test_rr_zero_no_tp_skipped(self):
+        """rr=0, tp1=None → skip (UNCLEAR Plan B semantics)."""
+        plan = ActionPlan(
+            label="B", name="轻仓做多", emoji="📈", is_primary=False,
+            logic="test", direction="bullish", trigger="test",
+            entry=100.0, entry_action="做多",
+            stop_loss=None, stop_loss_reason="严格止损",
+            tp1=None, tp1_label="", tp2=None, tp2_label="",
+            rr_ratio=0.0,
+        )
+        plans = [plan]
+        ctx = PlanContext(min_rr=0.8)
+        result = apply_min_rr_gate(plans, ctx)
+        assert result[0].demoted is False
+
+
+class TestApplyMarketDirectionWarning:
+    def _plan(self, label, direction="bullish", entry=100.0):
+        return ActionPlan(
+            label=label, name="test", emoji="📈", is_primary=(label == "A"),
+            logic="test", direction=direction, trigger="test",
+            entry=entry, entry_action="做多",
+            stop_loss=95.0, stop_loss_reason="test",
+            tp1=105.0, tp1_label="TP1", tp2=110.0, tp2_label="TP2",
+            rr_ratio=2.0,
+        )
+
+    def test_conflict_adds_warning(self):
+        plans = [self._plan("A", direction="bullish")]
+        ctx = PlanContext(market_direction="bearish")
+        result = apply_market_direction_warning(plans, ctx)
+        assert "逆势" in result[0].warning
+
+    def test_same_direction_no_warning(self):
+        plans = [self._plan("A", direction="bullish")]
+        ctx = PlanContext(market_direction="bullish")
+        result = apply_market_direction_warning(plans, ctx)
+        assert result[0].warning == ""
+
+    def test_empty_market_direction_no_warning(self):
+        plans = [self._plan("A", direction="bullish")]
+        ctx = PlanContext(market_direction="")
+        result = apply_market_direction_warning(plans, ctx)
+        assert result[0].warning == ""
+
+    def test_plan_c_skipped(self):
+        plans = [self._plan("C", direction="bullish")]
+        ctx = PlanContext(market_direction="bearish")
+        result = apply_market_direction_warning(plans, ctx)
+        assert result[0].warning == ""
 
 
 class TestNearestLevels:

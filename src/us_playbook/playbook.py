@@ -10,6 +10,7 @@ from src.common.action_plan import (  # noqa: F401 — re-export for backward co
     ActionPlan,
     PlanContext,
     apply_gamma_wall_warning as _apply_gamma_wall_warning_common,
+    apply_market_direction_warning as _apply_market_direction_warning,
     apply_min_rr_gate as _apply_min_rr_gate,
     apply_vwap_deviation_warning as _apply_vwap_deviation_warning_common,
     apply_wait_coherence as _apply_wait_coherence,
@@ -142,6 +143,26 @@ def get_regime_strategy(regime: USRegimeType, direction: str) -> str:
     return REGIME_STRATEGY.get(regime, "")
 
 SECTION_SEP = "─ ─ ─ ─ ─ ─ ─ ─ ─ ─"
+
+
+def _infer_market_direction(result: USPlaybookResult | None) -> str:
+    """Infer market direction from a USPlaybookResult (typically SPY).
+
+    Uses _decide_direction first; falls back to price-vs-VWAP comparison.
+    Returns "" if result is None.
+    """
+    if result is None:
+        return ""
+    r = result.regime
+    vp = result.volume_profile
+    kl = result.key_levels
+    direction = _decide_direction(
+        r, vp, vwap=kl.vwap, pdl=kl.pdl, pdh=kl.pdh, pml=kl.pml, pmh=kl.pmh,
+    )
+    if direction == "neutral" and kl.vwap > 0:
+        direction = "bullish" if r.price > kl.vwap else "bearish"
+    return direction
+
 
 # ── Grade bar helper ──
 
@@ -888,10 +909,31 @@ def _generate_action_plans(
     gamma_wall: GammaWallResult | None,
     option_rec: OptionRecommendation | None,
     ctx: PlanContext | None = None,
+    trend_downgrade_confidence: float = 0.0,
 ) -> list[ActionPlan]:
     """Generate A/B/C action plans based on regime and direction."""
     price = regime.price
     option_line = _compact_option_line(option_rec) if option_rec else None
+
+    # Issue 4: wait + low confidence trend → downgrade to UNCLEAR plans
+    if (
+        trend_downgrade_confidence > 0
+        and option_rec is not None
+        and option_rec.action == "wait"
+        and regime.confidence < trend_downgrade_confidence
+        and regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY)
+    ):
+        plans = _plans_unclear(price, vp, kl, gamma_wall, regime, option_line)
+        if ctx:
+            plans = [_cap_tp1(p, ctx, vp, kl, gamma_wall, current_price=price) for p in plans]
+            plans = [_cap_tp2(p, ctx, vp, kl, gamma_wall, current_price=price) for p in plans]
+            plans = [_check_entry_reachability(p, price, ctx) for p in plans]
+            plans = _apply_vwap_deviation_warning_common(plans, price, kl.vwap)
+            plans = _apply_gamma_wall_warning_common(plans, price, gamma_wall, ctx)
+            plans = _apply_wait_coherence(plans, ctx)
+            plans = _apply_min_rr_gate(plans, ctx)
+            plans = _apply_market_direction_warning(plans, ctx)
+        return plans
 
     if regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
         if direction == "bullish":
@@ -927,6 +969,7 @@ def _generate_action_plans(
         plans = _apply_gamma_wall_warning_common(plans, price, gamma_wall, ctx)
         plans = _apply_wait_coherence(plans, ctx)
         plans = _apply_min_rr_gate(plans, ctx)
+        plans = _apply_market_direction_warning(plans, ctx)
     return plans
 
 
@@ -934,7 +977,10 @@ def _plans_trend_bullish(
     price: float, vp: VolumeProfileResult, kl: KeyLevels,
     gamma_wall: GammaWallResult | None, option_line: str | None,
 ) -> list[ActionPlan]:
-    above = _nearest_levels(price, "above", vp, kl, gamma_wall, n=3)
+    # Anchor TP search from VWAP (entry), fallback to price if no results
+    above = _nearest_levels(kl.vwap, "above", vp, kl, gamma_wall, n=3) if kl.vwap > 0 else []
+    if not above:
+        above = _nearest_levels(price, "above", vp, kl, gamma_wall, n=3)
     below_vwap = _nearest_levels(kl.vwap, "below", vp, kl, gamma_wall, n=1)
     sl_a = below_vwap[0] if below_vwap else None
     tp1_a = above[0] if above else None
@@ -992,7 +1038,10 @@ def _plans_trend_bearish(
     price: float, vp: VolumeProfileResult, kl: KeyLevels,
     gamma_wall: GammaWallResult | None, option_line: str | None,
 ) -> list[ActionPlan]:
-    below = _nearest_levels(price, "below", vp, kl, gamma_wall, n=3)
+    # Anchor TP search from VWAP (entry), fallback to price if no results
+    below = _nearest_levels(kl.vwap, "below", vp, kl, gamma_wall, n=3) if kl.vwap > 0 else []
+    if not below:
+        below = _nearest_levels(price, "below", vp, kl, gamma_wall, n=3)
     above_vwap = _nearest_levels(kl.vwap, "above", vp, kl, gamma_wall, n=1)
     sl_a = above_vwap[0] if above_vwap else None
     tp1_a = below[0] if below else None
@@ -1471,6 +1520,7 @@ def format_us_playbook_message(
     result: USPlaybookResult,
     spy_result: USPlaybookResult | None = None,
     qqq_result: USPlaybookResult | None = None,
+    trend_downgrade_confidence: float = 0.70,
 ) -> str:
     """Format US Playbook as Telegram HTML message — institutional-grade intraday playbook."""
     r = result.regime
@@ -1516,11 +1566,13 @@ def format_us_playbook_message(
     # Market context
     ctx_parts = []
     if spy_result:
-        se = get_regime_emoji(spy_result.regime.regime, "bullish")
+        spy_dir = _infer_market_direction(spy_result)
+        se = get_regime_emoji(spy_result.regime.regime, spy_dir or "neutral")
         sn = REGIME_NAME_CN.get(spy_result.regime.regime, "未知")
         ctx_parts.append(f"SPY {se}{sn}")
     if qqq_result:
-        qe = get_regime_emoji(qqq_result.regime.regime, "bullish")
+        qqq_dir = _infer_market_direction(qqq_result)
+        qe = get_regime_emoji(qqq_result.regime.regime, qqq_dir or "neutral")
         qn = REGIME_NAME_CN.get(qqq_result.regime.regime, "未知")
         ctx_parts.append(f"QQQ {qe}{qn}")
     if ctx_parts:
@@ -1553,15 +1605,20 @@ def format_us_playbook_message(
     _intraday_range = 0.0
     if quote and quote.high_price > 0 and quote.low_price > 0:
         _intraday_range = (quote.high_price - quote.low_price) / quote.low_price * 100
+    _spy_direction = _infer_market_direction(spy_result)
     _plan_ctx = PlanContext(
         minutes_to_close=_min_left,
         rvol=r.rvol,
         avg_daily_range_pct=getattr(result, "avg_daily_range_pct", 0.0),
         intraday_range_pct=_intraday_range,
         option_action=recommendation.action if recommendation else "",
+        market_direction=_spy_direction,
     )
 
-    plans = _generate_action_plans(r, _direction, vp, kl, gamma_wall, recommendation, ctx=_plan_ctx)
+    plans = _generate_action_plans(
+        r, _direction, vp, kl, gamma_wall, recommendation,
+        ctx=_plan_ctx, trend_downgrade_confidence=trend_downgrade_confidence,
+    )
     for plan in plans:
         for plan_line in _format_action_plan(plan):
             lines.append(plan_line)
@@ -1650,11 +1707,11 @@ def format_us_playbook_message(
     if gamma_wall:
         gw_parts = []
         if gamma_wall.call_wall_strike > 0:
-            gw_parts.append(f"Call Wall {gamma_wall.call_wall_strike:,.0f}")
+            gw_parts.append(f"Call Wall {_format_strike(gamma_wall.call_wall_strike)}")
         if gamma_wall.put_wall_strike > 0:
-            gw_parts.append(f"Put Wall {gamma_wall.put_wall_strike:,.0f}")
+            gw_parts.append(f"Put Wall {_format_strike(gamma_wall.put_wall_strike)}")
         if gamma_wall.max_pain > 0:
-            gw_parts.append(f"MaxPain {gamma_wall.max_pain:,.0f}")
+            gw_parts.append(f"MaxPain {_format_strike(gamma_wall.max_pain)}")
         if gw_parts:
             lines.append(" | ".join(gw_parts))
 
