@@ -1,26 +1,30 @@
-version: "3.8"
-
 services:
   playbook:
     build: .
     restart: always
     stop_grace_period: 20s
+    user: "${UID:-1000}:${GID:-1000}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - FUTU_HOST=host.docker.internal
       - TZ=America/New_York
     volumes:
-      - ./config:/app/config
+      - ./config:/app/config:ro
       - ./data:/app/data
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-          cpus: "1.0"
+    mem_limit: 1g
+    cpus: 1.0
     healthcheck:
-      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+      test: ["CMD", "python", "-c",
+        "import socket; s=socket.create_connection(('host.docker.internal', 11111), 5); s.close()"]
+      interval: 120s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

@@ -8,5 +8,6 @@ COPY src/ ./src/
 COPY config/ ./config/
 
 ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+ENV PYTHONUNBUFFERED=1
 
 CMD ["python", "-m", "src.main"]

@@ -1,0 +1,21 @@
+[Unit]
+Description=FutuOpenD API Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trading
+WorkingDirectory=/opt/futuopend
+ExecStart=/opt/futuopend/FutuOpenD
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=futuopend
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+.claude
+data/
+tests/
+venv/
+__pycache__
+*.pyc
+*.md
+!requirements.txt
+docker-compose.yaml
