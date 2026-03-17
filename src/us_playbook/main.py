@@ -31,7 +31,7 @@ from src.us_playbook import (
 )
 from src.us_playbook.market_tone import MarketToneEngine
 from src.us_playbook.filter import check_us_filters
-from src.us_playbook.indicators import calculate_rsi, calculate_vwap, compute_rvol_profile
+from src.us_playbook.indicators import calculate_rsi, calculate_us_rvol, calculate_vwap, compute_rvol_profile
 from src.us_playbook.levels import (
     build_key_levels,
     calc_fetch_calendar_days,
@@ -219,9 +219,20 @@ class USPredictor:
             volume_ratio=snap.get("volume_ratio", 0.0),
         )
 
-        # 5. VWAP + RVOL (Futu volume_ratio — authoritative source)
+        # 5. VWAP + RVOL (Futu volume_ratio primary, calc fallback)
         vwap = calculate_vwap(today)
-        rvol = quote_snapshot.volume_ratio
+        calc_rvol = calculate_us_rvol(
+            today, hist_bars,
+            skip_open_minutes=rvol_cfg.get("skip_open_minutes", 3),
+            lookback_days=rvol_cfg.get("lookback_days", 10),
+        )
+        futu_rvol = quote_snapshot.volume_ratio
+        rvol = futu_rvol if futu_rvol > 0 else calc_rvol
+        logger.debug(
+            "RVOL %s: futu=%.2f, calc=%.2f, used=%.2f (source=%s)",
+            symbol, futu_rvol, calc_rvol, rvol,
+            "futu" if futu_rvol > 0 else "calc",
+        )
 
         # 6. Option chain fetch (shared by Gamma Wall + option recommendation)
         gamma_wall: GammaWallResult | None = None
@@ -831,8 +842,18 @@ class USPredictor:
             logger.info("L1 skip %s: price=0", symbol)
             return None
 
-        # RVOL (Futu volume_ratio — authoritative source)
-        rvol = float(snap.get("volume_ratio", 0) or 0)
+        # RVOL (Futu primary, calc fallback)
+        calc_rvol = calculate_us_rvol(
+            today, hist_bars,
+            skip_open_minutes=rvol_cfg.get("skip_open_minutes", 3),
+            lookback_days=rvol_cfg.get("lookback_days", 10),
+        )
+        futu_rvol = float(snap.get("volume_ratio", 0) or 0)
+        rvol = futu_rvol if futu_rvol > 0 else calc_rvol
+        logger.debug(
+            "L1 RVOL %s: futu=%.2f, calc=%.2f, used=%.2f",
+            symbol, futu_rvol, calc_rvol, rvol,
+        )
 
         # Lightweight regime (no option chain / gamma wall)
         adaptive_cfg = regime_cfg.get("adaptive", {})
@@ -1052,7 +1073,13 @@ class USPredictor:
         if price <= 0:
             return None
 
-        rvol = float(snap.get("volume_ratio", 0) or 0)
+        calc_rvol = calculate_us_rvol(
+            today, hist_bars,
+            skip_open_minutes=rvol_cfg.get("skip_open_minutes", 3),
+            lookback_days=rvol_cfg.get("lookback_days", 10),
+        )
+        futu_rvol = float(snap.get("volume_ratio", 0) or 0)
+        rvol = futu_rvol if futu_rvol > 0 else calc_rvol
 
         # Adaptive RVOL profile
         adaptive_cfg = regime_cfg.get("adaptive", {})

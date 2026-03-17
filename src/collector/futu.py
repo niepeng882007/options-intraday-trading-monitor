@@ -279,7 +279,9 @@ class FutuCollector(BaseCollector):
     async def _retry(self, fn, *args, retries: int = MAX_RETRIES, reconnect_on_fail: bool = True):
         backoff = BACKOFF_BASE_SECONDS
         last_exc: Exception | None = None
+        attempts = 0
         for attempt in range(retries):
+            attempts = attempt + 1
             try:
                 result = await self._run_sync(fn, *args)
                 self._last_ok_ts = time.time()
@@ -292,12 +294,14 @@ class FutuCollector(BaseCollector):
                     retries,
                     exc,
                 )
+                if "无权限" in str(exc):
+                    break
                 if reconnect_on_fail:
                     self._safe_close_ctx()
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
         raise RuntimeError(
-            f"Futu request failed after {retries} retries"
+            f"Futu request failed after {attempts} attempt(s): {last_exc}"
         ) from last_exc
 
     # ── Quote cache ──

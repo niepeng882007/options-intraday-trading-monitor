@@ -750,7 +750,7 @@ def _regime_reason_lines(
         if regime.adaptive_thresholds:
             at = regime.adaptive_thresholds
             supports.append(
-                f"自适应阈值: P{at.get('sample', '?')}d GAP_AND_GO={at.get('gap_and_go', 0):.2f}"
+                f"自适应阈值: {at.get('sample', '?')}样本 GAP_AND_GO={at.get('gap_and_go', 0):.2f}"
                 f" (rank {at.get('pctl_rank', 0):.0f}%)"
             )
         if regime.spy_regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):

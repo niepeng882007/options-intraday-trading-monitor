@@ -49,14 +49,14 @@ def calculate_volume_profile(
         else:
             tick_size = 0.1
 
-    # Precompute per-day recency weights
+    # Precompute per-day recency weights (trading-day ordinal, not calendar days)
     day_weights: dict | None = None
     if recency_decay > 0 and hasattr(bars.index, "date"):
         trading_dates = sorted(set(bars.index.date))
-        latest = trading_dates[-1]
         day_weights = {}
-        for d in trading_dates:
-            days_ago = (latest - d).days
+        n = len(trading_dates)
+        for i, d in enumerate(trading_dates):
+            days_ago = n - 1 - i  # ordinal distance in trading days
             day_weights[d] = (1.0 - recency_decay) ** days_ago
 
     # Distribute each bar's volume across its price range

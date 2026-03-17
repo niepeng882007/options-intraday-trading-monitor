@@ -226,6 +226,41 @@ class TestVolumeProfile:
         assert vp_default.vah == vp_zero.vah
         assert vp_default.val == vp_zero.val
 
+    def test_recency_decay_uses_trading_day_ordinal(self):
+        """Recency decay should use trading-day ordinal, not calendar days.
+
+        Fri→Mon = 1 trading day apart (not 3 calendar days).
+        Weight for Friday should be (1-decay)^1 = 0.85, not (1-decay)^3 ≈ 0.61.
+        """
+        # Friday (2026-03-13) and Monday (2026-03-16) — 3 calendar days, 1 trading day
+        bars = _make_bars([
+            # Friday: heavy volume at 200-205
+            ("2026-03-13 09:30:00", 200, 205, 200, 203, 100000),
+            ("2026-03-13 10:00:00", 201, 205, 200, 204, 100000),
+            # Monday: heavy volume at 200-205 (same range)
+            ("2026-03-16 09:30:00", 200, 205, 200, 203, 100000),
+            ("2026-03-16 10:00:00", 201, 205, 200, 204, 100000),
+        ])
+        decay = 0.15
+
+        vp = calculate_volume_profile(bars, tick_size=1.0, recency_decay=decay)
+
+        # With ordinal: Fri weight = 0.85^1 = 0.85, Mon weight = 0.85^0 = 1.0
+        # Total effective volume ~ 0.85 * 200000 + 1.0 * 200000 = 370000
+        # Both days trade at same range, so VP should be very similar to no-decay
+        vp_no_decay = calculate_volume_profile(bars, tick_size=1.0, recency_decay=0)
+
+        # POC should be the same since both days trade at identical range
+        assert vp.poc == vp_no_decay.poc
+
+        # Verify Friday weight is (1-decay)^1 not (1-decay)^3
+        # by checking total_volume ratio is close to (1+0.85)/2 = 0.925 of raw
+        ratio = vp.total_volume / vp_no_decay.total_volume
+        expected = (1.0 + (1 - decay) ** 1) / 2  # 0.925
+        wrong = (1.0 + (1 - decay) ** 3) / 2     # 0.807
+        assert abs(ratio - expected) < 0.01, f"ratio={ratio:.4f}, expected={expected:.4f}"
+        assert abs(ratio - wrong) > 0.05, "Should NOT match calendar-day weighting"
+
 
 # ── VWAP Tests ──
 
