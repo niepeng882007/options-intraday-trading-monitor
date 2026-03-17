@@ -33,6 +33,7 @@ from src.us_playbook.market_tone import MarketToneEngine
 from src.us_playbook.filter import check_us_filters
 from src.us_playbook.indicators import calculate_rsi, calculate_us_rvol, calculate_vwap, compute_rvol_profile
 from src.us_playbook.levels import (
+    build_intraday_levels,
     build_key_levels,
     calc_fetch_calendar_days,
     compute_volume_profile,
@@ -48,7 +49,11 @@ from src.us_playbook.option_recommend import (
     select_expiry,
 )
 from src.us_playbook.playbook import format_us_playbook_message, get_regime_strategy
-from src.us_playbook.regime import classify_us_regime, detect_regime_transition, regime_to_signal_type
+from src.us_playbook.stabilizer import RegimeStabilizer
+from src.us_playbook.regime import (
+    classify_us_regime, check_index_consistency, detect_regime_transition,
+    downgrade_to_unclear, regime_to_signal_type,
+)
 from src.us_playbook.watchlist import USWatchlist
 from src.utils.logger import setup_logger
 
@@ -57,6 +62,9 @@ logger = setup_logger("us_predictor")
 ET = ZoneInfo("America/New_York")
 _executor = ThreadPoolExecutor(max_workers=1)
 _esc = html.escape
+
+# Regime family for hysteresis — TREND family gets lower thresholds to retain, higher to exit
+_TREND_FAMILY = {USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY}
 
 
 @dataclass
@@ -125,6 +133,9 @@ class USPredictor:
         # Market Tone engine
         self._tone_engine = MarketToneEngine(config, collector)
 
+        # Regime stabilizer (auto-scan L1 only)
+        self._regime_stabilizer = RegimeStabilizer(config.get("regime_stabilizer", {}))
+
         # Auto-scan state
         self._scan_history: dict[str, list[USScanAlertRecord]] = {}
         self._scan_history_date: str = ""
@@ -137,6 +148,7 @@ class USPredictor:
         """Release caches for graceful shutdown."""
         self._last_playbooks.clear()
         self._last_today_bars.clear()
+        self._regime_stabilizer.reset()
         logger.info("USPredictor closed")
 
     # ── Market Tone ──
@@ -361,6 +373,18 @@ class USPredictor:
                 except Exception:
                     logger.debug("FADE_CHOP exec chain fetch failed for %s, using analysis chain", symbol)
 
+        # 9b. Wide VA → intraday levels
+        intraday_levels = None
+        if regime.regime == USRegimeType.FADE_CHOP:
+            wide_va_cfg = cfg.get("wide_va", {})
+            if wide_va_cfg.get("enabled", True):
+                intraday_levels = build_intraday_levels(
+                    today, vp,
+                    rvol_profile.avg_daily_range_pct if rvol_profile else 0.0,
+                    vwap,
+                    wide_va_cfg,
+                )
+
         # 10. Option recommendation (exec chain for FADE_CHOP, analysis chain otherwise)
         chase_risk_cfg = self._cfg.get("chase_risk", {})
         option_rec: OptionRecommendation | None = None
@@ -390,6 +414,13 @@ class USPredictor:
             _dir = "bearish" if price < vp.poc else "bullish"
         strategy_text = get_regime_strategy(regime.regime, _dir)
 
+        # Regime volatility detection (on-demand only)
+        regime_volatile = False
+        if symbol in self._last_scan_regimes:
+            last_raw = self._last_scan_regimes[symbol]
+            if last_raw.regime != regime.regime:
+                regime_volatile = True
+
         name = self.watchlist.get_name(symbol)
         result = USPlaybookResult(
             symbol=symbol,
@@ -406,6 +437,8 @@ class USPredictor:
             option_market=option_market,
             market_tone=None,  # set by caller after pipeline
             avg_daily_range_pct=rvol_profile.avg_daily_range_pct if rvol_profile else 0.0,
+            regime_volatile=regime_volatile,
+            intraday_levels=intraday_levels,
         )
         self._last_playbooks[symbol] = result
         self._last_today_bars[symbol] = today
@@ -471,6 +504,64 @@ class USPredictor:
             return spy_result.regime.regime
         return self._spy_context[1].regime if self._spy_context[1] else None
 
+    # ── Index consistency ──
+
+    def _check_and_apply_index_consistency(self, *, skip_freshness: bool = False) -> bool:
+        """Check SPY/QQQ directional regime conflict and downgrade both if conflicting.
+
+        Args:
+            skip_freshness: If True, skip TTL freshness check (used by auto-scan
+                where Phase 1 just refreshed both).
+
+        Returns True if conflict was detected and applied.
+        """
+        if not self._cfg.get("regime", {}).get("index_consistency_enabled", False):
+            return False
+
+        spy_pb = self._last_playbooks.get("SPY")
+        qqq_pb = self._last_playbooks.get("QQQ")
+        if not spy_pb or not qqq_pb:
+            return False
+
+        # Freshness check — skip for auto-scan (Phase 1 guarantees fresh data)
+        if not skip_freshness:
+            now = time.time()
+            for pb in (spy_pb, qqq_pb):
+                if pb.generated_at is None:
+                    return False
+                age = now - pb.generated_at.timestamp()
+                if age > self._SPY_CONTEXT_TTL:
+                    return False
+
+        # Infer direction for each using _decide_direction + VWAP fallback
+        def _infer_dir(pb: USPlaybookResult) -> str:
+            d = _decide_direction(
+                pb.regime, pb.volume_profile,
+                vwap=pb.key_levels.vwap, pdl=pb.key_levels.pdl,
+                pdh=pb.key_levels.pdh, pml=pb.key_levels.pml,
+                pmh=pb.key_levels.pmh,
+            )
+            if d == "neutral" and pb.key_levels.vwap > 0:
+                d = "bullish" if pb.regime.price > pb.key_levels.vwap else "bearish"
+            return d
+
+        spy_dir = _infer_dir(spy_pb)
+        qqq_dir = _infer_dir(qqq_pb)
+
+        conflict, detail = check_index_consistency(
+            spy_pb.regime.regime, spy_dir,
+            qqq_pb.regime.regime, qqq_dir,
+        )
+        if not conflict:
+            return False
+
+        logger.warning("Index consistency conflict: %s", detail)
+        spy_pb.regime = downgrade_to_unclear(spy_pb.regime, detail)
+        qqq_pb.regime = downgrade_to_unclear(qqq_pb.regime, detail)
+        spy_pb.index_conflict = True
+        qqq_pb.index_conflict = True
+        return True
+
     # ── On-demand playbook for a single symbol ──
 
     async def generate_playbook_for_symbol(self, symbol: str) -> PlaybookResponse:
@@ -488,6 +579,10 @@ class USPredictor:
 
         if not result:
             return PlaybookResponse(html=f"Failed to generate playbook for {symbol}")
+
+        # Index consistency check — only relevant when querying SPY or QQQ
+        if symbol in ("SPY", "QQQ"):
+            self._check_and_apply_index_consistency()
 
         # Market Tone — compute after SPY pipeline so SPY bars are available
         tone = await self._ensure_market_tone()
@@ -567,6 +662,10 @@ class USPredictor:
                     logger.warning("Context symbol %s scan failed", ctx_sym, exc_info=True)
 
         spy_regime_type = self._spy_context[1].regime if self._spy_context[1] else None
+
+        # Phase 1a: Index consistency check (data just refreshed — skip freshness)
+        if self._check_and_apply_index_consistency(skip_freshness=True):
+            spy_regime_type = USRegimeType.UNCLEAR
 
         # Phase 1b: Market Tone gating
         tone = await self._ensure_market_tone()
@@ -874,6 +973,24 @@ class USPredictor:
             )
 
         l1_vwap = calculate_vwap(today)
+
+        # L1 RVOL threshold hysteresis — adjust based on last confirmed regime
+        stability_cfg = regime_cfg.get("stability", {})
+        rvol_hyst = stability_cfg.get("rvol_hysteresis", 0.10)
+        adj_gap_rvol = regime_cfg.get("gap_and_go_rvol", 1.5)
+        adj_trend_rvol = regime_cfg.get("trend_day_rvol", 1.2)
+
+        last_regime = self._last_scan_regimes.get(symbol)
+        if last_regime and rvol_hyst > 0:
+            if last_regime.regime in _TREND_FAMILY:
+                # Easier to stay in TREND: lower thresholds
+                adj_gap_rvol *= (1 - rvol_hyst)
+                adj_trend_rvol *= (1 - rvol_hyst)
+            elif last_regime.regime == USRegimeType.FADE_CHOP:
+                # Harder to leave FADE: raise thresholds
+                adj_gap_rvol *= (1 + rvol_hyst)
+                adj_trend_rvol *= (1 + rvol_hyst)
+
         regime = classify_us_regime(
             price=price,
             prev_close=prev_close,
@@ -882,8 +999,8 @@ class USPredictor:
             pml=cached_entry.pml,
             vp=vp,
             spy_regime=spy_regime,
-            gap_and_go_rvol=regime_cfg.get("gap_and_go_rvol", 1.5),
-            trend_day_rvol=regime_cfg.get("trend_day_rvol", 1.2),
+            gap_and_go_rvol=adj_gap_rvol,
+            trend_day_rvol=adj_trend_rvol,
             fade_chop_rvol=regime_cfg.get("fade_chop_rvol", 1.0),
             vp_trading_days=vp.trading_days,
             min_vp_trading_days=vp_cfg.get("min_trading_days", 3),
@@ -895,6 +1012,10 @@ class USPredictor:
             structure_trend_cfg=regime_cfg.get("structure_trend"),
             vwap=l1_vwap,
         )
+
+        # Stabilize regime for L1 screening (L2 uses raw re-classification)
+        raw_regime = regime
+        regime = self._regime_stabilizer.stabilize(symbol, raw_regime)
 
         # Build L1 result for reuse in L2
         l1_result = _L1Result(
@@ -976,6 +1097,7 @@ class USPredictor:
                 and regime.confidence >= rng_min_conf
                 and rng_rvol_min <= rvol <= rng_rvol_max
             ):
+                # TODO(wide_va): use intraday levels for proximity check
                 dist_vah = abs(price - vp.vah) / price * 100 if price > 0 else 999
                 dist_val = abs(price - vp.val) / price * 100 if price > 0 else 999
                 near_boundary = min(dist_vah, dist_val)
@@ -1461,6 +1583,7 @@ class USPredictor:
             self._last_fade_directions.clear()
             self._last_playbooks.clear()
             self._last_today_bars.clear()
+            self._regime_stabilizer.reset()
             self._scan_history_date = today
             logger.info("Daily reset: cleared scan history and playbook caches")
 
@@ -1510,6 +1633,23 @@ class USPredictor:
             if len(type_session_records) >= type_max_session:
                 logger.info("Frequency block %s: %s session max %d reached", symbol, signal_category, type_max_session)
                 return False, None
+
+        # Layer 2c: cross-family contradiction cooldown
+        stability_cfg = self._cfg.get("regime", {}).get("stability", {})
+        cross_cd_min = stability_cfg.get("cross_family_cooldown_minutes", 15)
+        if cross_cd_min > 0 and records:
+            current_family = "FADE" if signal.signal_type.startswith("RANGE_REVERSAL") else "TREND"
+            for rec in reversed(records):
+                rec_family = "FADE" if rec.signal_type.startswith("RANGE_REVERSAL") else "TREND"
+                if rec_family != current_family:
+                    if now - rec.timestamp < cross_cd_min * 60:
+                        logger.info(
+                            "Frequency block %s: cross-family cooldown (%s→%s, %ds < %dm)",
+                            symbol, rec.signal_type, signal.signal_type,
+                            int(now - rec.timestamp), cross_cd_min,
+                        )
+                        return False, None
+                    break  # only check the most recent different-family record
 
         # Layer 2: global max per session
         session_records = [r for r in records if r.session == session]

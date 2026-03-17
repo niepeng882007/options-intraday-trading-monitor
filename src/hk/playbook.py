@@ -23,6 +23,7 @@ from src.common.action_plan import (
     check_entry_reachability as _check_entry_reachability,
     check_regime_consistency as _check_regime_consistency,
     compact_option_line as _compact_option_line,
+    enforce_direction_consistency as _enforce_direction_consistency,
     find_fade_entry_zone as _find_fade_entry_zone_common,
     format_action_plan as _format_action_plan,
     nearest_levels as _nearest_levels_common,
@@ -534,9 +535,10 @@ def _plans_whipsaw(
 def _plans_unclear(
     price: float, vp: VolumeProfileResult, levels: dict[str, float],
     vwap: float, regime: RegimeResult, option_line: str | None,
+    direction_override: str | None = None,
 ) -> list[ActionPlan]:
     """UNCLEAR plans."""
-    lean = regime.lean or "neutral"
+    lean = direction_override if direction_override in ("bullish", "bearish") else (regime.lean or "neutral")
 
     plan_a = ActionPlan(
         label="A", name="等待确认", emoji="⏳", is_primary=True,
@@ -612,7 +614,7 @@ def _generate_action_plans(
         and regime.confidence < trend_downgrade_confidence
         and regime.regime in (RegimeType.GAP_AND_GO, RegimeType.TREND_DAY)
     ):
-        plans = _plans_unclear(price, vp, levels, vwap, regime, option_line)
+        plans = _plans_unclear(price, vp, levels, vwap, regime, option_line, direction_override=direction)
         if ctx:
             plans = _check_regime_consistency(
                 plans, regime.regime.name, price, regime.price, ibh, ibl, vwap,
@@ -623,6 +625,7 @@ def _generate_action_plans(
             plans = [_check_entry_proximity(p, price) for p in plans]
             plans = _apply_wait_coherence(plans, ctx)
             plans = _apply_min_rr_gate(plans, ctx)
+            plans = _enforce_direction_consistency(plans, regime.regime.name, direction)
             plans = _apply_gamma_wall_warning(plans, price, gamma_wall, ctx)
             plans = _apply_vwap_deviation_warning(plans, price, vwap)
         return plans
@@ -660,6 +663,7 @@ def _generate_action_plans(
         plans = [_check_entry_proximity(p, price) for p in plans]
         plans = _apply_wait_coherence(plans, ctx)
         plans = _apply_min_rr_gate(plans, ctx)
+        plans = _enforce_direction_consistency(plans, regime.regime.name, direction)
         plans = _apply_gamma_wall_warning(plans, price, gamma_wall, ctx)
         plans = _apply_vwap_deviation_warning(plans, price, vwap)
     return plans

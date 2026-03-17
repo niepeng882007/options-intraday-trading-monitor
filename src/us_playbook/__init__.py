@@ -52,6 +52,7 @@ class USRegimeResult:
     adaptive_thresholds: dict | None = None
     # e.g. {"gap_and_go": 1.73, "trend_day": 1.15, "fade_chop": 0.88, "pctl_rank": 72.3, "sample": 9}
     lean: str = "neutral"        # "bullish" / "bearish" / "neutral" — UNCLEAR sub-type hint
+    stabilized: bool = False     # True when regime held by stabilizer
 
 
 @dataclass
@@ -135,6 +136,9 @@ class USPlaybookResult:
     option_market: OptionMarketSnapshot | None = None
     market_tone: MarketTone | None = None
     avg_daily_range_pct: float = 0.0  # 来自 RvolProfile，0=无历史数据
+    regime_volatile: bool = False     # True when regime flipped vs last scan
+    index_conflict: bool = False      # SPY/QQQ directional regime conflict
+    intraday_levels: object | None = None  # IntradayLevels | None (avoid circular import)
 
 
 @dataclass

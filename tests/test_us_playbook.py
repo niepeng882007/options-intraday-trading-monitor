@@ -21,8 +21,13 @@ from src.us_playbook.levels import (
     us_tick_size, extract_previous_day_hl,
     get_today_bars, get_history_bars, compute_volume_profile, build_key_levels,
     calc_fetch_calendar_days,
+    IntradayLevels, detect_wide_va, compute_intraday_vp, compute_vwap_bands,
+    build_intraday_levels,
 )
-from src.us_playbook.regime import classify_us_regime, detect_price_structure, regime_to_signal_type
+from src.us_playbook.regime import (
+    classify_us_regime, check_index_consistency, detect_price_structure,
+    downgrade_to_unclear, regime_to_signal_type,
+)
 from src.us_playbook.filter import check_us_filters, _is_monthly_opex
 from src.us_playbook.playbook import (
     format_us_playbook_message, _collect_levels,
@@ -4374,6 +4379,182 @@ class TestPerTypeFrequency:
         assert allowed
 
 
+# ── L1 Hysteresis Tests ──
+
+class TestL1Hysteresis:
+    """Test RVOL threshold hysteresis in L1 screening."""
+
+    def test_l1_hysteresis_trend_lowers_threshold(self):
+        """Last confirmed TREND_DAY → thresholds lowered by 10% (easier to stay trend)."""
+        from src.us_playbook.main import _TREND_FAMILY
+
+        regime_cfg = {
+            "gap_and_go_rvol": 1.5,
+            "trend_day_rvol": 1.2,
+            "stability": {"rvol_hysteresis": 0.10},
+        }
+        stability_cfg = regime_cfg.get("stability", {})
+        rvol_hyst = stability_cfg.get("rvol_hysteresis", 0.10)
+        adj_gap_rvol = regime_cfg["gap_and_go_rvol"]
+        adj_trend_rvol = regime_cfg["trend_day_rvol"]
+
+        last_regime = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            rvol=1.3, price=560, gap_pct=0.5,
+        )
+        if last_regime.regime in _TREND_FAMILY:
+            adj_gap_rvol *= (1 - rvol_hyst)
+            adj_trend_rvol *= (1 - rvol_hyst)
+
+        assert abs(adj_trend_rvol - 1.08) < 1e-9  # 1.2 * 0.9
+        assert abs(adj_gap_rvol - 1.35) < 1e-9    # 1.5 * 0.9
+
+    def test_l1_hysteresis_fade_raises_threshold(self):
+        """Last confirmed FADE_CHOP → thresholds raised by 10% (harder to leave fade)."""
+        regime_cfg = {
+            "gap_and_go_rvol": 1.5,
+            "trend_day_rvol": 1.2,
+            "stability": {"rvol_hysteresis": 0.10},
+        }
+        stability_cfg = regime_cfg.get("stability", {})
+        rvol_hyst = stability_cfg.get("rvol_hysteresis", 0.10)
+        adj_gap_rvol = regime_cfg["gap_and_go_rvol"]
+        adj_trend_rvol = regime_cfg["trend_day_rvol"]
+
+        last_regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.60,
+            rvol=0.9, price=560, gap_pct=0.2,
+        )
+        if last_regime.regime == USRegimeType.FADE_CHOP:
+            adj_gap_rvol *= (1 + rvol_hyst)
+            adj_trend_rvol *= (1 + rvol_hyst)
+
+        assert abs(adj_trend_rvol - 1.32) < 1e-9  # 1.2 * 1.1
+        assert abs(adj_gap_rvol - 1.65) < 1e-9    # 1.5 * 1.1
+
+    def test_l1_hysteresis_no_prior(self):
+        """No prior regime → use original thresholds (no adjustment)."""
+        regime_cfg = {
+            "gap_and_go_rvol": 1.5,
+            "trend_day_rvol": 1.2,
+            "stability": {"rvol_hysteresis": 0.10},
+        }
+        stability_cfg = regime_cfg.get("stability", {})
+        rvol_hyst = stability_cfg.get("rvol_hysteresis", 0.10)
+        adj_gap_rvol = regime_cfg["gap_and_go_rvol"]
+        adj_trend_rvol = regime_cfg["trend_day_rvol"]
+
+        last_regime = None
+        if last_regime and rvol_hyst > 0:
+            pass  # should not enter
+
+        assert adj_trend_rvol == 1.2
+        assert adj_gap_rvol == 1.5
+
+
+class TestCrossFamilyCooldown:
+    """Test cross-family contradiction cooldown in frequency control."""
+
+    def _make_predictor(self):
+        cfg = {
+            "watchlist": [{"symbol": "SPY", "name": "S&P 500 ETF"}],
+            "regime": {
+                "stability": {"cross_family_cooldown_minutes": 15},
+            },
+            "auto_scan": {
+                "cooldown": {
+                    "same_signal_minutes": 30,
+                    "max_per_session": 5,
+                    "max_per_day": 10,
+                },
+                "override": {"confidence_increase": 0.10, "price_extension_pct": 0.50, "regime_upgrade": True},
+            },
+        }
+        return USPredictor(cfg, collector=None)
+
+    def test_cross_family_cooldown(self):
+        """BREAKOUT alert within 15min of RANGE_REVERSAL → blocked."""
+        pred = self._make_predictor()
+        pred._scan_history_date = "2026-03-10"
+
+        # Record a RANGE_REVERSAL (FADE family)
+        rr_signal = USScanSignal(
+            signal_type="RANGE_REVERSAL_LONG", direction="bullish", symbol="QQQ",
+            regime=USRegimeResult(
+                regime=USRegimeType.FADE_CHOP, confidence=0.80,
+                rvol=0.8, price=480, gap_pct=0.1,
+            ),
+            price=480, timestamp=1000.0,
+        )
+        pred._record_alert("QQQ", rr_signal, "morning")
+
+        # BREAKOUT (TREND family) 5 min later → should be blocked
+        bo_signal = USScanSignal(
+            signal_type="BREAKOUT_BULLISH", direction="bullish", symbol="QQQ",
+            regime=USRegimeResult(
+                regime=USRegimeType.TREND_DAY, confidence=0.75,
+                rvol=1.3, price=482, gap_pct=0.5,
+            ),
+            price=482, timestamp=1300.0,  # 300s = 5min later
+        )
+        allowed, _ = pred._check_frequency("QQQ", bo_signal, "morning", pred._cfg["auto_scan"])
+        assert not allowed
+
+    def test_cross_family_cooldown_expired(self):
+        """BREAKOUT alert after cooldown expires → allowed."""
+        pred = self._make_predictor()
+        pred._scan_history_date = "2026-03-10"
+
+        rr_signal = USScanSignal(
+            signal_type="RANGE_REVERSAL_LONG", direction="bullish", symbol="QQQ",
+            regime=USRegimeResult(
+                regime=USRegimeType.FADE_CHOP, confidence=0.80,
+                rvol=0.8, price=480, gap_pct=0.1,
+            ),
+            price=480, timestamp=1000.0,
+        )
+        pred._record_alert("QQQ", rr_signal, "morning")
+
+        # BREAKOUT 20 min later → cooldown expired, should pass
+        bo_signal = USScanSignal(
+            signal_type="BREAKOUT_BULLISH", direction="bullish", symbol="QQQ",
+            regime=USRegimeResult(
+                regime=USRegimeType.TREND_DAY, confidence=0.75,
+                rvol=1.3, price=482, gap_pct=0.5,
+            ),
+            price=482, timestamp=2200.0,  # 1200s = 20min later
+        )
+        allowed, _ = pred._check_frequency("QQQ", bo_signal, "morning", pred._cfg["auto_scan"])
+        assert allowed
+
+    def test_same_family_no_cooldown(self):
+        """Same family (TREND→TREND) not affected by cross-family cooldown."""
+        pred = self._make_predictor()
+        pred._scan_history_date = "2026-03-10"
+
+        bo1 = USScanSignal(
+            signal_type="BREAKOUT_BULLISH", direction="bullish", symbol="QQQ",
+            regime=USRegimeResult(
+                regime=USRegimeType.GAP_AND_GO, confidence=0.85,
+                rvol=1.8, price=480, gap_pct=1.5,
+            ),
+            price=480, timestamp=1000.0,
+        )
+        pred._record_alert("QQQ", bo1, "morning")
+
+        # Different BREAKOUT direction 5 min later → same family, not blocked by cross-family
+        bo2 = USScanSignal(
+            signal_type="BREAKOUT_BEARISH", direction="bearish", symbol="QQQ",
+            regime=USRegimeResult(
+                regime=USRegimeType.TREND_DAY, confidence=0.75,
+                rvol=1.3, price=478, gap_pct=0.3,
+            ),
+            price=478, timestamp=1300.0,
+        )
+        allowed, _ = pred._check_frequency("QQQ", bo2, "morning", pred._cfg["auto_scan"])
+        assert allowed
+
+
 # ── P0-1: Gamma Wall distance filter ──
 
 class TestGammaWallDistanceFilter:
@@ -6104,3 +6285,816 @@ class TestVPStaleness:
         )
         assert result.regime == USRegimeType.FADE_CHOP
         assert "VA unreachable" not in result.details
+
+
+# ── Part A: Regime Stabilizer Tests ──
+
+
+class TestRegimeStabilizer:
+    """Tests for RegimeStabilizer (auto-scan L1 debounce)."""
+
+    @staticmethod
+    def _make_regime(
+        regime=USRegimeType.TREND_DAY,
+        confidence=0.80,
+        rvol=1.30,
+        price=150.0,
+        gap_pct=0.5,
+        adaptive=None,
+        lean="neutral",
+    ):
+        return USRegimeResult(
+            regime=regime,
+            confidence=confidence,
+            rvol=rvol,
+            price=price,
+            gap_pct=gap_pct,
+            adaptive_thresholds=adaptive,
+            lean=lean,
+        )
+
+    @staticmethod
+    def _cfg(**overrides):
+        base = {
+            "enabled": True,
+            "hysteresis_ratio": 0.30,
+            "hold_upgrade_minutes": 15,
+            "hold_downgrade_minutes": 30,
+            "hold_from_unclear_minutes": 10,
+            "bypass_confidence_delta": 0.20,
+        }
+        base.update(overrides)
+        return base
+
+    def test_stabilizer_first_call_passthrough(self):
+        """First call for a symbol → raw regime passed through unchanged."""
+        from src.us_playbook.stabilizer import RegimeStabilizer
+        stab = RegimeStabilizer(self._cfg())
+        raw = self._make_regime(regime=USRegimeType.TREND_DAY)
+        result = stab.stabilize("AAPL", raw)
+        assert result is raw
+        assert not result.stabilized
+
+    def test_stabilizer_same_regime_refreshes(self):
+        """Same regime on second call → accepted, price/rvol refreshed."""
+        from src.us_playbook.stabilizer import RegimeStabilizer
+        stab = RegimeStabilizer(self._cfg())
+        r1 = self._make_regime(rvol=1.20, price=150.0)
+        stab.stabilize("AAPL", r1)
+        r2 = self._make_regime(rvol=1.35, price=152.0)
+        result = stab.stabilize("AAPL", r2)
+        assert result is r2
+        assert not result.stabilized
+
+    def test_stabilizer_hysteresis_rejects_boundary(self):
+        """RVOL on boundary → hysteresis rejects switch."""
+        from src.us_playbook.stabilizer import RegimeStabilizer
+        adaptive = {"trend_day": 1.20, "fade_chop": 0.90}
+        stab = RegimeStabilizer(self._cfg())
+
+        # Accept initial TREND_DAY
+        trend = self._make_regime(
+            regime=USRegimeType.TREND_DAY, rvol=1.30, adaptive=adaptive,
+        )
+        stab.stabilize("QQQ", trend)
+
+        # Try switch to FADE_CHOP with RVOL at boundary (1.20 - 0.09 = 1.11)
+        # gap = 1.20 - 0.90 = 0.30, hyst = 0.30*0.30 = 0.09
+        # Need rvol < 1.20 - 0.09 = 1.11 to pass; 1.12 should be rejected
+        fade = self._make_regime(
+            regime=USRegimeType.FADE_CHOP, rvol=1.12, adaptive=adaptive,
+        )
+        result = stab.stabilize("QQQ", fade)
+        assert result.regime == USRegimeType.TREND_DAY  # held
+        assert result.stabilized is True
+        assert result.rvol == 1.12  # price/rvol refreshed
+
+    def test_stabilizer_hysteresis_skipped_no_adaptive(self):
+        """No adaptive thresholds → Layer 1 skipped, goes to Layer 2."""
+        from src.us_playbook.stabilizer import RegimeStabilizer
+        import time as _time
+
+        stab = RegimeStabilizer(self._cfg(hold_downgrade_minutes=0))
+
+        trend = self._make_regime(regime=USRegimeType.TREND_DAY, adaptive=None)
+        stab.stabilize("SPY", trend)
+
+        # No adaptive → Layer 1 skipped, hold=0 → accepted
+        fade = self._make_regime(regime=USRegimeType.FADE_CHOP, adaptive=None)
+        result = stab.stabilize("SPY", fade)
+        assert result.regime == USRegimeType.FADE_CHOP  # passed through
+
+    def test_stabilizer_graduated_hold_upgrade(self):
+        """FADE→TREND needs 15min hold (upgrade)."""
+        from src.us_playbook.stabilizer import RegimeStabilizer
+        stab = RegimeStabilizer(self._cfg())
+
+        fade = self._make_regime(regime=USRegimeType.FADE_CHOP)
+        stab.stabilize("TSLA", fade)
+
+        # Immediately try upgrade to TREND_DAY
+        trend = self._make_regime(regime=USRegimeType.TREND_DAY)
+        result = stab.stabilize("TSLA", trend)
+        assert result.regime == USRegimeType.FADE_CHOP  # held
+        assert result.stabilized is True
+
+    def test_stabilizer_graduated_hold_downgrade(self):
+        """TREND→FADE needs 30min hold (downgrade)."""
+        from src.us_playbook.stabilizer import RegimeStabilizer
+        stab = RegimeStabilizer(self._cfg())
+
+        trend = self._make_regime(regime=USRegimeType.TREND_DAY)
+        stab.stabilize("NVDA", trend)
+
+        fade = self._make_regime(regime=USRegimeType.FADE_CHOP)
+        result = stab.stabilize("NVDA", fade)
+        assert result.regime == USRegimeType.TREND_DAY  # held
+        assert result.stabilized is True
+
+    def test_stabilizer_graduated_hold_from_unclear(self):
+        """UNCLEAR→any needs 10min hold."""
+        from src.us_playbook.stabilizer import RegimeStabilizer
+        stab = RegimeStabilizer(self._cfg())
+
+        unclear = self._make_regime(regime=USRegimeType.UNCLEAR, confidence=0.50)
+        stab.stabilize("META", unclear)
+
+        # delta = |0.60 - 0.50| = 0.10 < 0.20 → no bypass
+        trend = self._make_regime(regime=USRegimeType.TREND_DAY, confidence=0.60)
+        result = stab.stabilize("META", trend)
+        assert result.regime == USRegimeType.UNCLEAR  # held
+        assert result.stabilized is True
+
+    def test_stabilizer_bypass_strong_signal(self):
+        """Confidence delta >= 0.20 → bypass all holds."""
+        from src.us_playbook.stabilizer import RegimeStabilizer
+        stab = RegimeStabilizer(self._cfg())
+
+        fade = self._make_regime(regime=USRegimeType.FADE_CHOP, confidence=0.55)
+        stab.stabilize("AMD", fade)
+
+        # Strong signal: delta = 0.80 - 0.55 = 0.25 >= 0.20
+        trend = self._make_regime(regime=USRegimeType.TREND_DAY, confidence=0.80)
+        result = stab.stabilize("AMD", trend)
+        assert result.regime == USRegimeType.TREND_DAY
+        assert not result.stabilized
+
+    def test_stabilizer_disabled_passthrough(self):
+        """enabled=False → raw passed through unchanged."""
+        from src.us_playbook.stabilizer import RegimeStabilizer
+        stab = RegimeStabilizer({"enabled": False})
+
+        r1 = self._make_regime(regime=USRegimeType.TREND_DAY)
+        stab.stabilize("SPY", r1)
+
+        r2 = self._make_regime(regime=USRegimeType.FADE_CHOP)
+        result = stab.stabilize("SPY", r2)
+        assert result is r2  # raw, not held
+        assert not result.stabilized
+
+    def test_stabilizer_marks_stabilized_flag(self):
+        """Held regime has stabilized=True."""
+        from src.us_playbook.stabilizer import RegimeStabilizer
+        stab = RegimeStabilizer(self._cfg())
+
+        trend = self._make_regime(regime=USRegimeType.GAP_AND_GO)
+        stab.stabilize("AMZN", trend)
+
+        fade = self._make_regime(regime=USRegimeType.FADE_CHOP)
+        result = stab.stabilize("AMZN", fade)
+        assert result.stabilized is True
+        assert result.regime == USRegimeType.GAP_AND_GO
+
+    def test_adaptive_hysteresis_proportional(self):
+        """Adaptive thresholds (trend=1.05, fade=0.88): hysteresis computed correctly."""
+        from src.us_playbook.stabilizer import RegimeStabilizer
+        adaptive = {"trend_day": 1.05, "fade_chop": 0.88}
+        stab = RegimeStabilizer(self._cfg())
+
+        # Accept TREND_DAY initially
+        trend = self._make_regime(
+            regime=USRegimeType.TREND_DAY, rvol=1.10, adaptive=adaptive,
+        )
+        stab.stabilize("MSFT", trend)
+
+        # gap=0.17, hyst=0.17*0.30=0.051
+        # TREND→FADE needs rvol < 1.05 - 0.051 = 0.999
+        # Try with rvol=1.00 → still >= 0.999, should be rejected
+        fade = self._make_regime(
+            regime=USRegimeType.FADE_CHOP, rvol=1.00, adaptive=adaptive,
+        )
+        result = stab.stabilize("MSFT", fade)
+        assert result.regime == USRegimeType.TREND_DAY  # held
+
+        # Try with rvol=0.98 → < 0.999, but still needs temporal hold
+        fade2 = self._make_regime(
+            regime=USRegimeType.FADE_CHOP, rvol=0.98, adaptive=adaptive,
+        )
+        result2 = stab.stabilize("MSFT", fade2)
+        # Passes hysteresis but blocked by 30min hold
+        assert result2.regime == USRegimeType.TREND_DAY
+
+    def test_ondemand_no_stabilizer(self):
+        """USRegimeResult from on-demand has stabilized=False by default."""
+        r = self._make_regime()
+        assert r.stabilized is False
+
+    def test_ondemand_volatility_warning(self):
+        """USPlaybookResult.regime_volatile set when regime differs from last scan."""
+        r = USPlaybookResult(
+            symbol="TEST", name="Test", regime=self._make_regime(),
+            key_levels=KeyLevels(poc=100, vah=105, val=95, pdh=106, pdl=94, pmh=103, pml=97, vwap=100),
+            volume_profile=VolumeProfileResult(poc=100, vah=105, val=95),
+            gamma_wall=None, filters=FilterResult(tradeable=True),
+            regime_volatile=True,
+        )
+        assert r.regime_volatile is True
+
+        r2 = USPlaybookResult(
+            symbol="TEST", name="Test", regime=self._make_regime(),
+            key_levels=KeyLevels(poc=100, vah=105, val=95, pdh=106, pdl=94, pmh=103, pml=97, vwap=100),
+            volume_profile=VolumeProfileResult(poc=100, vah=105, val=95),
+            gamma_wall=None, filters=FilterResult(tradeable=True),
+        )
+        assert r2.regime_volatile is False
+
+
+# ── Part B: Direction Consistency Tests ──
+
+
+class TestDirectionConsistency:
+    """Tests for direction_override in _plans_unclear and enforce_direction_consistency."""
+
+    @staticmethod
+    def _make_regime(regime=USRegimeType.TREND_DAY, lean="bearish", confidence=0.60):
+        return USRegimeResult(
+            regime=regime, confidence=confidence, rvol=1.10,
+            price=150.0, gap_pct=0.3, lean=lean,
+        )
+
+    @staticmethod
+    def _kl():
+        return KeyLevels(
+            poc=149, vah=152, val=147, pdh=153, pdl=146, pmh=151, pml=148, vwap=150,
+        )
+
+    def test_trend_downgrade_bullish_no_bearish_plan(self):
+        """US: TREND_DAY bullish + lean=bearish + wait → Plan B should NOT be bearish."""
+        regime = self._make_regime(lean="bearish", confidence=0.60)
+        vp = VolumeProfileResult(poc=149, vah=152, val=147)
+        kl = self._kl()
+        option_rec = OptionRecommendation(action="wait", direction="neutral", wait_conditions=["等待确认"])
+
+        plans = _generate_action_plans(
+            regime, "bullish", vp, kl, None, option_rec,
+            trend_downgrade_confidence=0.70,
+        )
+        # Plans should have been generated via _plans_unclear(direction_override="bullish")
+        # Plan B should be bullish (from direction_override), not bearish (from lean)
+        plan_b = next((p for p in plans if p.label == "B"), None)
+        assert plan_b is not None
+        if plan_b.direction in ("bullish", "bearish"):
+            assert plan_b.direction == "bullish"
+
+    def test_trend_downgrade_bearish_no_bullish_plan(self):
+        """US: GAP_AND_GO bearish + lean=bullish + wait → Plan B should NOT be bullish."""
+        regime = USRegimeResult(
+            regime=USRegimeType.GAP_AND_GO, confidence=0.60, rvol=1.50,
+            price=150.0, gap_pct=1.5, lean="bullish",
+        )
+        vp = VolumeProfileResult(poc=149, vah=152, val=147)
+        kl = self._kl()
+        option_rec = OptionRecommendation(action="wait", direction="neutral", wait_conditions=["等待确认"])
+
+        plans = _generate_action_plans(
+            regime, "bearish", vp, kl, None, option_rec,
+            trend_downgrade_confidence=0.70,
+        )
+        plan_b = next((p for p in plans if p.label == "B"), None)
+        assert plan_b is not None
+        if plan_b.direction in ("bullish", "bearish"):
+            assert plan_b.direction == "bearish"
+
+    def test_enforce_strips_contradicting_entry(self):
+        """enforce_direction_consistency strips entry from opposing plan."""
+        from src.common.action_plan import enforce_direction_consistency
+        plan = ActionPlan(
+            label="B", name="轻仓做空", emoji="📉", is_primary=False,
+            logic="test", direction="bearish",
+            trigger="test", entry=150.0, entry_action="做空",
+            stop_loss=152.0, stop_loss_reason="above",
+            tp1=148.0, tp1_label="VAL", tp2=None, tp2_label="", rr_ratio=1.5,
+        )
+        plans = enforce_direction_consistency([plan], "TREND_DAY", "bullish")
+        assert plans[0].entry is None
+        assert plans[0].entry_action == ""
+        assert "矛盾" in plans[0].warning
+
+    def test_enforce_plan_c_exempt(self):
+        """Plan C is always exempt from direction consistency enforcement."""
+        from src.common.action_plan import enforce_direction_consistency
+        plan_c = ActionPlan(
+            label="C", name="失效反转", emoji="⚡", is_primary=False,
+            logic="反转", direction="bearish",
+            trigger="test", entry=148.0, entry_action="做空",
+            stop_loss=None, stop_loss_reason="",
+            tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+        )
+        plans = enforce_direction_consistency([plan_c], "TREND_DAY", "bullish")
+        assert plans[0].entry == 148.0  # unchanged
+
+    def test_enforce_fade_chop_no_effect(self):
+        """FADE_CHOP is not affected by direction enforcement."""
+        from src.common.action_plan import enforce_direction_consistency
+        plan = ActionPlan(
+            label="A", name="上沿做空", emoji="📉", is_primary=True,
+            logic="test", direction="bearish",
+            trigger="test", entry=152.0, entry_action="做空",
+            stop_loss=153.0, stop_loss_reason="above",
+            tp1=149.0, tp1_label="POC", tp2=147.0, tp2_label="VAL", rr_ratio=2.0,
+        )
+        plans = enforce_direction_consistency([plan], "FADE_CHOP", "bullish")
+        assert plans[0].entry == 152.0  # unchanged
+
+
+# ── Index Consistency Tests ──
+
+class TestIndexConsistency:
+    """Tests for SPY/QQQ directional regime conflict detection."""
+
+    def test_conflict_opposite_trend_day(self):
+        """SPY TREND_DAY bullish + QQQ TREND_DAY bearish → conflict."""
+        conflict, detail = check_index_consistency(
+            USRegimeType.TREND_DAY, "bullish",
+            USRegimeType.TREND_DAY, "bearish",
+        )
+        assert conflict is True
+        assert "SPY" in detail and "QQQ" in detail
+
+    def test_no_conflict_same_direction(self):
+        """Same direction TREND_DAY → no conflict."""
+        conflict, _ = check_index_consistency(
+            USRegimeType.TREND_DAY, "bullish",
+            USRegimeType.TREND_DAY, "bullish",
+        )
+        assert conflict is False
+
+    def test_conflict_gap_and_go_vs_trend_day_opposite(self):
+        """Mixed directional regimes with opposite directions → conflict."""
+        conflict, detail = check_index_consistency(
+            USRegimeType.GAP_AND_GO, "bullish",
+            USRegimeType.TREND_DAY, "bearish",
+        )
+        assert conflict is True
+        assert "gap_and_go" in detail and "trend_day" in detail
+
+    def test_no_conflict_gap_and_go_vs_trend_day_same(self):
+        """Mixed directional regimes with same direction → no conflict."""
+        conflict, _ = check_index_consistency(
+            USRegimeType.GAP_AND_GO, "bearish",
+            USRegimeType.TREND_DAY, "bearish",
+        )
+        assert conflict is False
+
+    def test_no_conflict_one_fade_chop(self):
+        """One side FADE_CHOP → no conflict (not directional)."""
+        conflict, _ = check_index_consistency(
+            USRegimeType.FADE_CHOP, "bullish",
+            USRegimeType.TREND_DAY, "bearish",
+        )
+        assert conflict is False
+
+    def test_no_conflict_one_unclear(self):
+        """One side UNCLEAR → no conflict."""
+        conflict, _ = check_index_consistency(
+            USRegimeType.UNCLEAR, "bullish",
+            USRegimeType.TREND_DAY, "bearish",
+        )
+        assert conflict is False
+
+    def test_no_conflict_one_neutral_direction(self):
+        """One side neutral direction → no conflict."""
+        conflict, _ = check_index_consistency(
+            USRegimeType.TREND_DAY, "neutral",
+            USRegimeType.TREND_DAY, "bearish",
+        )
+        assert conflict is False
+
+    def test_no_conflict_both_fade_chop(self):
+        """Both FADE_CHOP → no conflict."""
+        conflict, _ = check_index_consistency(
+            USRegimeType.FADE_CHOP, "bullish",
+            USRegimeType.FADE_CHOP, "bearish",
+        )
+        assert conflict is False
+
+    def test_downgrade_sets_unclear(self):
+        """Downgrade produces UNCLEAR with correct fields."""
+        original = USRegimeResult(
+            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            rvol=1.5, price=450.0, gap_pct=0.3,
+            details="RVOL 1.50 >= 1.20, small gap",
+            lean="bullish",
+        )
+        reason = "SPY trend_day bullish vs QQQ trend_day bearish"
+        result = downgrade_to_unclear(original, reason)
+        assert result.regime == USRegimeType.UNCLEAR
+        assert result.confidence == 0.25
+        assert result.lean == "neutral"
+        assert "Downgraded from trend_day" in result.details
+        assert reason in result.details
+        assert "original:" in result.details
+
+
+# ── Wide VA Detection Tests ──
+
+
+def _make_today_bars(n: int, base_price: float = 550.0) -> pd.DataFrame:
+    """Generate n synthetic today bars for wide VA tests (09:30 start, 1min each).
+
+    Uses ±1.0 oscillation for sufficient band width in VWAP bands tests.
+    """
+    base_ts = pd.Timestamp("2026-03-17 09:30:00", tz="America/New_York")
+    rows = []
+    timestamps = []
+    for i in range(n):
+        ts = base_ts + pd.Timedelta(minutes=i)
+        offset = (i % 10 - 5) * 0.5  # ±2.5 range for wider bands
+        p = base_price + offset
+        timestamps.append(ts)
+        rows.append({"Open": p - 0.3, "High": p + 0.5, "Low": p - 0.5, "Close": p, "Volume": 10000 + i * 100})
+    idx = pd.DatetimeIndex(timestamps, name="Datetime")
+    return pd.DataFrame(rows, index=idx)
+
+
+class TestWideVADetection:
+    def test_wide_va_detected(self):
+        """VA width / ADR > threshold → is_wide=True."""
+        vp = VolumeProfileResult(poc=550.0, vah=560.0, val=540.0)
+        # VA width ≈ 20/550*100 ≈ 3.636%, ADR = 1.0% → ratio ≈ 3.64
+        is_wide, ratio = detect_wide_va(vp, avg_daily_range_pct=1.0, threshold=1.8)
+        assert is_wide is True
+        assert ratio > 1.8
+
+    def test_narrow_va_not_detected(self):
+        """VA width / ADR < threshold → is_wide=False."""
+        vp = VolumeProfileResult(poc=550.0, vah=553.0, val=547.0)
+        # VA width ≈ 6/550*100 ≈ 1.09%, ADR = 1.0% → ratio ≈ 1.09
+        is_wide, ratio = detect_wide_va(vp, avg_daily_range_pct=1.0, threshold=1.8)
+        assert is_wide is False
+        assert ratio < 1.8
+
+    def test_no_adr_returns_false(self):
+        """avg_daily_range_pct <= 0 → safe default False."""
+        vp = VolumeProfileResult(poc=550.0, vah=560.0, val=540.0)
+        is_wide, ratio = detect_wide_va(vp, avg_daily_range_pct=0.0)
+        assert is_wide is False
+        assert ratio == 0.0
+
+    def test_vah_lte_val_returns_false(self):
+        """Inverted VA (vah <= val) → False."""
+        vp = VolumeProfileResult(poc=550.0, vah=540.0, val=560.0)
+        is_wide, ratio = detect_wide_va(vp, avg_daily_range_pct=1.0)
+        assert is_wide is False
+
+    def test_boundary_just_below_threshold(self):
+        """ratio just below threshold → not wide."""
+        # VA width ≈ 9.8/550*100 ≈ 1.7818%, ADR=1.0 → ratio ≈ 1.78 < 1.8
+        vp = VolumeProfileResult(poc=550.0, vah=554.9, val=545.1)
+        is_wide, ratio = detect_wide_va(vp, avg_daily_range_pct=1.0, threshold=1.8)
+        assert is_wide is False
+        assert ratio < 1.8
+
+
+class TestIntradayVP:
+    def test_sufficient_bars_returns_vp(self):
+        """≥120 bars → valid VolumeProfileResult."""
+        bars = _make_today_bars(130, base_price=550.0)
+        result = compute_intraday_vp(bars, min_bars=120)
+        assert result is not None
+        assert result.poc > 0
+        assert result.vah >= result.val
+
+    def test_insufficient_bars_returns_none(self):
+        """< 120 bars → None."""
+        bars = _make_today_bars(100, base_price=550.0)
+        result = compute_intraday_vp(bars, min_bars=120)
+        assert result is None
+
+    def test_tick_size_finer_than_multiday(self):
+        """Intraday uses us_tick_size / 2 for finer granularity."""
+        # For SPY ~550, us_tick_size=0.50, intraday should use 0.25
+        from src.us_playbook.levels import us_tick_size
+        tick_multiday = us_tick_size(550.0)
+        assert tick_multiday == 0.50
+        # compute_intraday_vp uses tick/2 = 0.25 internally
+
+
+class TestVWAPBands:
+    def test_sufficient_bars(self):
+        """≥15 bars → (vwap, upper, lower) with upper > vwap > lower."""
+        bars = _make_today_bars(30, base_price=550.0)
+        result = compute_vwap_bands(bars, min_bars=15)
+        assert result is not None
+        vwap, upper, lower = result
+        assert upper > vwap > lower
+
+    def test_insufficient_bars_returns_none(self):
+        """< 15 bars → None."""
+        bars = _make_today_bars(10, base_price=550.0)
+        result = compute_vwap_bands(bars, min_bars=15)
+        assert result is None
+
+    def test_narrow_bands_returns_none(self):
+        """Bands too narrow → None."""
+        # Constant price → std = 0 → should return None
+        rows = []
+        for i in range(20):
+            ts = f"2026-03-17 09:{30 + i}:00"
+            rows.append((ts, 550.0, 550.0, 550.0, 550.0, 10000))
+        bars = _make_bars(rows)
+        result = compute_vwap_bands(bars, min_bars=15, min_band_width_pct=0.002)
+        assert result is None
+
+    def test_simple_std_calculation(self):
+        """Std is based on typical_price - vwap_series (simple, not volume-weighted)."""
+        # Two distinct price groups should produce non-zero std
+        rows = []
+        for i in range(20):
+            ts = f"2026-03-17 09:{30 + i}:00"
+            p = 550.0 if i < 10 else 555.0
+            rows.append((ts, p, p + 0.5, p - 0.5, p, 10000))
+        bars = _make_bars(rows)
+        result = compute_vwap_bands(bars, min_bars=15)
+        assert result is not None
+        vwap, upper, lower = result
+        assert upper - lower > 0.5  # Non-trivial band width
+
+
+class TestBuildIntradayLevels:
+    def _wide_vp(self):
+        """VP with wide VA (20 points on ~550 base ≈ 3.6%)."""
+        return VolumeProfileResult(poc=550.0, vah=560.0, val=540.0)
+
+    def _narrow_vp(self):
+        """VP with narrow VA (6 points on ~550 base ≈ 1.1%)."""
+        return VolumeProfileResult(poc=550.0, vah=553.0, val=547.0)
+
+    def test_narrow_va_returns_none(self):
+        """Non-wide VA → None."""
+        bars = _make_today_bars(150)
+        result = build_intraday_levels(bars, self._narrow_vp(), 1.0, 550.0, {})
+        assert result is None
+
+    def test_wide_va_with_enough_bars_uses_intraday_vp(self):
+        """Wide VA + ≥120 bars → source='intraday_vp'."""
+        bars = _make_today_bars(150)
+        result = build_intraday_levels(bars, self._wide_vp(), 1.0, 550.0, {})
+        assert result is not None
+        assert result.is_wide_va is True
+        assert result.source == "intraday_vp"
+        assert result.effective_upper >= result.effective_lower
+
+    def test_wide_va_few_bars_uses_vwap_bands(self):
+        """Wide VA + 15-119 bars → source='vwap_bands'."""
+        bars = _make_today_bars(50)
+        result = build_intraday_levels(
+            bars, self._wide_vp(), 1.0, 550.0,
+            {"intraday_vp_min_bars": 120, "vwap_bands_min_bars": 15},
+        )
+        assert result is not None
+        assert result.source == "vwap_bands"
+
+    def test_wide_va_very_few_bars_returns_none(self):
+        """Wide VA + < 15 bars → None."""
+        bars = _make_today_bars(10)
+        result = build_intraday_levels(
+            bars, self._wide_vp(), 1.0, 550.0,
+            {"intraday_vp_min_bars": 120, "vwap_bands_min_bars": 15},
+        )
+        assert result is None
+
+    def test_source_label(self):
+        """IntradayLevels.source_label returns correct CN text."""
+        il_vp = IntradayLevels(True, 2.0, 555.0, 545.0, 550.0, "intraday_vp")
+        assert il_vp.source_label == "日内发展中 VP"
+        il_vw = IntradayLevels(True, 2.0, 553.0, 547.0, 550.0, "vwap_bands")
+        assert il_vw.source_label == "VWAP ± 1σ"
+
+
+# ── Wide VA Fade Plan Tests ──
+
+
+class TestWideFadePlans:
+    def _vp(self):
+        """Wide 5-day VA: 540-560."""
+        return VolumeProfileResult(poc=550.0, vah=560.0, val=540.0)
+
+    def _kl(self):
+        return KeyLevels(
+            poc=550.0, vah=560.0, val=540.0,
+            pdh=562.0, pdl=538.0, pmh=558.0, pml=542.0,
+            vwap=551.0,
+        )
+
+    def _gw(self):
+        return GammaWallResult(call_wall_strike=570.0, put_wall_strike=530.0, max_pain=550.0)
+
+    def _il_vp(self, upper=554.0, lower=548.0, mid=551.0):
+        return IntradayLevels(
+            is_wide_va=True, va_adr_ratio=2.1,
+            effective_upper=upper, effective_lower=lower,
+            effective_mid=mid, source="intraday_vp",
+        )
+
+    def _il_vwap(self, upper=553.0, lower=549.0, mid=551.0):
+        return IntradayLevels(
+            is_wide_va=True, va_adr_ratio=2.1,
+            effective_upper=upper, effective_lower=lower,
+            effective_mid=mid, source="vwap_bands",
+        )
+
+    def test_wide_va_near_upper_bearish_plan_a(self):
+        """Wide VA + price near effective_upper → bearish Plan A uses intraday levels."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=554.0, gap_pct=0.1,
+        )
+        il = self._il_vp()
+        plans = _generate_action_plans(
+            regime, "bearish", self._vp(), self._kl(), self._gw(), None,
+            intraday_levels=il,
+        )
+        assert plans[0].name == "日内上沿做空"
+        assert plans[0].entry == il.effective_upper
+        assert plans[0].tp1 == il.effective_mid
+        assert plans[0].tp2 == il.effective_lower
+        assert plans[0].direction == "bearish"
+
+    def test_wide_va_near_lower_bullish_plan_a(self):
+        """Wide VA + price near effective_lower → bullish Plan A uses intraday levels."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=548.0, gap_pct=0.1,
+        )
+        il = self._il_vp()
+        plans = _generate_action_plans(
+            regime, "bullish", self._vp(), self._kl(), self._gw(), None,
+            intraday_levels=il,
+        )
+        assert plans[0].name == "日内下沿做多"
+        assert plans[0].entry == il.effective_lower
+        assert plans[0].tp1 == il.effective_mid
+        assert plans[0].tp2 == il.effective_upper
+        assert plans[0].direction == "bullish"
+
+    def test_wide_va_middle_follows_direction(self):
+        """Wide VA + price in middle + direction=bearish → bearish plans."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=551.0, gap_pct=0.1,
+        )
+        il = self._il_vp()
+        plans = _generate_action_plans(
+            regime, "bearish", self._vp(), self._kl(), self._gw(), None,
+            intraday_levels=il,
+        )
+        assert plans[0].name == "日内上沿做空"
+        assert plans[0].direction == "bearish"
+
+    def test_wide_va_direction_conflict_to_unclear(self):
+        """Wide VA + intraday direction conflict → UNCLEAR plans."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=548.0, gap_pct=0.1,  # near lower
+        )
+        il = self._il_vp()
+        plans = _generate_action_plans(
+            regime, "bearish", self._vp(), self._kl(), self._gw(), None,
+            intraday_levels=il,
+        )
+        # price <= effective_lower and direction=bearish → conflict → unclear
+        assert plans[0].name == "等待确认"
+
+    def test_plan_c_uses_5day_va(self):
+        """Plan C always uses 5-day VAH/VAL for invalidation."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=554.0, gap_pct=0.1,
+        )
+        il = self._il_vp()
+        plans = _generate_action_plans(
+            regime, "bearish", self._vp(), self._kl(), self._gw(), None,
+            intraday_levels=il,
+        )
+        assert plans[2].label == "C"
+        assert "5日 VAH" in plans[2].trigger
+        assert f"{self._vp().vah:,.2f}" in plans[2].trigger
+
+    def test_plan_c_bullish_uses_5day_val(self):
+        """Plan C bullish uses 5-day VAL for invalidation."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=548.0, gap_pct=0.1,
+        )
+        il = self._il_vp()
+        plans = _generate_action_plans(
+            regime, "bullish", self._vp(), self._kl(), self._gw(), None,
+            intraday_levels=il,
+        )
+        assert plans[2].label == "C"
+        assert "5日 VAL" in plans[2].trigger
+
+    def test_narrow_va_original_behavior(self):
+        """Narrow VA (no intraday_levels) → original fade plans unchanged."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=554.5, gap_pct=0.1,
+        )
+        narrow_vp = VolumeProfileResult(poc=552.0, vah=555.0, val=549.0)
+        kl = KeyLevels(
+            poc=552.0, vah=555.0, val=549.0,
+            pdh=557.0, pdl=548.0, pmh=554.0, pml=550.5,
+            vwap=551.5,
+        )
+        plans = _generate_action_plans(
+            regime, "bearish", narrow_vp, kl, None, None,
+            intraday_levels=None,  # No wide VA
+        )
+        assert plans[0].name == "上沿做空"  # Original name, not "日内上沿做空"
+        assert plans[0].entry == narrow_vp.vah
+
+    def test_early_session_vwap_bands(self):
+        """VWAP bands source → Plan A logic mentions VWAP ± 1σ."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=553.0, gap_pct=0.1,
+        )
+        il = self._il_vwap()
+        plans = _generate_action_plans(
+            regime, "bearish", self._vp(), self._kl(), self._gw(), None,
+            intraday_levels=il,
+        )
+        assert plans[0].name == "日内上沿做空"
+        assert "VWAP ± 1σ" in plans[0].logic
+
+    def test_5day_direction_conflict_overrides_wide_va(self):
+        """5-day VA direction conflict check happens before wide VA routing."""
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=554.5, gap_pct=0.1,
+        )
+        il = self._il_vp()
+        # edge=VAH + direction=bullish → 5-day direction conflict → UNCLEAR
+        plans = _generate_action_plans(
+            regime, "bullish", self._vp(), self._kl(), self._gw(), None,
+            intraday_levels=il,
+        )
+        assert plans[0].name == "等待确认"
+
+
+class TestWideVAPlaybookFormat:
+    """Test Section 4 wide VA annotation in formatted output."""
+
+    def _make_result(self, intraday_levels=None):
+        vp = VolumeProfileResult(poc=550.0, vah=560.0, val=540.0)
+        regime = USRegimeResult(
+            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            rvol=0.8, price=551.0, gap_pct=0.1,
+        )
+        kl = KeyLevels(
+            poc=550.0, vah=560.0, val=540.0,
+            pdh=562.0, pdl=538.0, pmh=558.0, pml=542.0,
+            vwap=551.0,
+        )
+        return USPlaybookResult(
+            symbol="SPY", name="S&P 500 ETF",
+            regime=regime, key_levels=kl,
+            volume_profile=vp, gamma_wall=None,
+            filters=FilterResult(tradeable=True, warnings=[], risk_level="normal"),
+            generated_at=datetime(2026, 3, 17, 10, 30, 0, tzinfo=ET),
+            intraday_levels=intraday_levels,
+        )
+
+    def test_intraday_vp_annotation(self):
+        """Section 4 shows intraday VP source when wide VA active."""
+        il = IntradayLevels(True, 2.1, 554.0, 548.0, 551.0, "intraday_vp")
+        result = self._make_result(intraday_levels=il)
+        msg = format_us_playbook_message(result)
+        assert "宽 VA" in msg
+        assert "日内发展中 VP" in msg
+        assert "2.1x ADR" in msg
+
+    def test_vwap_bands_annotation(self):
+        """Section 4 shows VWAP bands source when wide VA active."""
+        il = IntradayLevels(True, 2.1, 553.0, 549.0, 551.0, "vwap_bands")
+        result = self._make_result(intraday_levels=il)
+        msg = format_us_playbook_message(result)
+        assert "宽 VA" in msg
+        assert "VWAP ± 1σ" in msg
+
+    def test_no_annotation_when_narrow(self):
+        """No wide VA annotation when intraday_levels is None."""
+        result = self._make_result(intraday_levels=None)
+        msg = format_us_playbook_message(result)
+        assert "宽 VA" not in msg

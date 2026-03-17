@@ -640,3 +640,44 @@ def classify_us_regime(
         result.details = f"{result.details}; {pm_note}" if result.details else pm_note
 
     return result
+
+
+# ── Index Consistency ──
+
+_DIRECTIONAL_REGIMES = {USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY}
+
+
+def check_index_consistency(
+    spy_regime: USRegimeType, spy_direction: str,
+    qqq_regime: USRegimeType, qqq_direction: str,
+) -> tuple[bool, str]:
+    """Check if SPY and QQQ have conflicting directional regimes.
+
+    Returns (conflict, detail_msg).
+    Conflict only when both are in directional regimes with non-neutral
+    opposite directions.
+    """
+    if spy_regime not in _DIRECTIONAL_REGIMES or qqq_regime not in _DIRECTIONAL_REGIMES:
+        return False, ""
+    if spy_direction == "neutral" or qqq_direction == "neutral":
+        return False, ""
+    if spy_direction == qqq_direction:
+        return False, ""
+    return True, (
+        f"SPY {spy_regime.value} {spy_direction} vs QQQ {qqq_regime.value} {qqq_direction}"
+    )
+
+
+def downgrade_to_unclear(original: USRegimeResult, reason: str) -> USRegimeResult:
+    """Create a downgraded UNCLEAR copy of a regime result."""
+    return USRegimeResult(
+        regime=USRegimeType.UNCLEAR,
+        confidence=0.25,
+        rvol=original.rvol,
+        price=original.price,
+        gap_pct=original.gap_pct,
+        spy_regime=original.spy_regime,
+        adaptive_thresholds=original.adaptive_thresholds,
+        details=f"Downgraded from {original.regime.value}: {reason}; original: {original.details}",
+        lean="neutral",
+    )

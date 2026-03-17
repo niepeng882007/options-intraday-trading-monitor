@@ -19,6 +19,7 @@ from src.common.action_plan import (  # noqa: F401 — re-export for backward co
     cap_tp2 as _cap_tp2_common,
     check_entry_reachability as _check_entry_reachability,
     compact_option_line as _compact_option_line,
+    enforce_direction_consistency as _enforce_direction_consistency,
     find_fade_entry_zone as _find_fade_entry_zone_common,
     format_action_plan as _format_action_plan,
     nearest_levels as _nearest_levels_common,
@@ -47,6 +48,7 @@ from src.common.types import (
     VolumeProfileResult,
 )
 from src.us_playbook import KeyLevels, MarketTone, USPlaybookResult, USRegimeResult, USRegimeType
+from src.us_playbook.levels import IntradayLevels
 from src.us_playbook.option_recommend import _decide_direction
 from src.utils.logger import setup_logger
 
@@ -910,6 +912,7 @@ def _generate_action_plans(
     option_rec: OptionRecommendation | None,
     ctx: PlanContext | None = None,
     trend_downgrade_confidence: float = 0.0,
+    intraday_levels: IntradayLevels | None = None,
 ) -> list[ActionPlan]:
     """Generate A/B/C action plans based on regime and direction."""
     price = regime.price
@@ -923,7 +926,7 @@ def _generate_action_plans(
         and regime.confidence < trend_downgrade_confidence
         and regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY)
     ):
-        plans = _plans_unclear(price, vp, kl, gamma_wall, regime, option_line)
+        plans = _plans_unclear(price, vp, kl, gamma_wall, regime, option_line, direction_override=direction)
         if ctx:
             plans = [_cap_tp1(p, ctx, vp, kl, gamma_wall, current_price=price) for p in plans]
             plans = [_cap_tp2(p, ctx, vp, kl, gamma_wall, current_price=price) for p in plans]
@@ -932,6 +935,7 @@ def _generate_action_plans(
             plans = _apply_gamma_wall_warning_common(plans, price, gamma_wall, ctx)
             plans = _apply_wait_coherence(plans, ctx)
             plans = _apply_min_rr_gate(plans, ctx)
+            plans = _enforce_direction_consistency(plans, regime.regime.name, direction)
             plans = _apply_market_direction_warning(plans, ctx)
         return plans
 
@@ -952,6 +956,11 @@ def _generate_action_plans(
         )
         if direction_conflicts:
             plans = _plans_unclear(price, vp, kl, gamma_wall, regime, option_line)
+        elif intraday_levels and intraday_levels.is_wide_va:
+            # Wide VA → use intraday levels for fade triggers
+            plans = _plans_fade_wide_va(
+                price, vp, kl, gamma_wall, option_line, intraday_levels, regime, direction,
+            )
         elif edge == "VAH":
             plans = _plans_fade_bearish(price, vp, kl, gamma_wall, option_line)
         else:
@@ -969,6 +978,7 @@ def _generate_action_plans(
         plans = _apply_gamma_wall_warning_common(plans, price, gamma_wall, ctx)
         plans = _apply_wait_coherence(plans, ctx)
         plans = _apply_min_rr_gate(plans, ctx)
+        plans = _enforce_direction_consistency(plans, regime.regime.name, direction)
         plans = _apply_market_direction_warning(plans, ctx)
     return plans
 
@@ -1243,6 +1253,163 @@ def _plans_fade_bullish(
     return [plan_a, plan_b, plan_c]
 
 
+# ── Wide VA fade plans ──
+
+
+def _plans_fade_wide_va(
+    price: float,
+    vp: VolumeProfileResult,
+    kl: KeyLevels,
+    gamma_wall: GammaWallResult | None,
+    option_line: str | None,
+    il: IntradayLevels,
+    regime: USRegimeResult,
+    direction: str,
+) -> list[ActionPlan]:
+    """FADE_CHOP with wide 5-day VA — use intraday levels as trigger."""
+    # Determine fade direction from intraday levels position
+    if price >= il.effective_upper:
+        fade_dir = "bearish"
+    elif price <= il.effective_lower:
+        fade_dir = "bullish"
+    else:
+        fade_dir = "bearish" if direction == "bearish" else "bullish"
+
+    # Direction conflict check (analogous to 5-day VA logic)
+    intraday_conflicts = (
+        (price <= il.effective_lower and direction == "bearish")
+        or (price >= il.effective_upper and direction == "bullish")
+    )
+    if intraday_conflicts:
+        return _plans_unclear(price, vp, kl, gamma_wall, regime, option_line)
+
+    if fade_dir == "bearish":
+        return _build_wide_va_plans_bearish(price, vp, kl, gamma_wall, option_line, il)
+    return _build_wide_va_plans_bullish(price, vp, kl, gamma_wall, option_line, il)
+
+
+def _build_wide_va_plans_bearish(
+    price: float, vp: VolumeProfileResult, kl: KeyLevels,
+    gamma_wall: GammaWallResult | None, option_line: str | None,
+    il: IntradayLevels,
+) -> list[ActionPlan]:
+    """Wide VA bearish: short at intraday upper, TP to mid/lower."""
+    above = _nearest_levels(il.effective_upper, "above", vp, kl, gamma_wall, n=1)
+    raw_sl = above[0][1] if above else None
+    raw_sl_reason = above[0][0] if above else f"{il.source_label}上沿上方"
+    capped_sl, capped_sl_reason = _cap_fade_sl(il.effective_upper, raw_sl, raw_sl_reason, "bearish")
+
+    plan_a = ActionPlan(
+        label="A", name="日内上沿做空", emoji="📉", is_primary=True,
+        logic=f"宽 VA 日, 使用{il.source_label}作为震荡边界, 博日内均值回归",
+        direction="bearish",
+        trigger=f"价格触及{il.source_label}上沿 {il.effective_upper:,.2f} 附近",
+        entry=il.effective_upper, entry_action="做空",
+        stop_loss=capped_sl,
+        stop_loss_reason=capped_sl_reason,
+        tp1=il.effective_mid, tp1_label=f"{il.source_label}中值",
+        tp2=il.effective_lower, tp2_label=f"{il.source_label}下沿",
+        rr_ratio=_calculate_rr(il.effective_upper, capped_sl, il.effective_mid),
+        option_line=option_line,
+    )
+
+    # Plan B: VWAP regression
+    plan_b_entry = kl.vwap if kl.vwap > il.effective_mid else il.effective_mid
+    sl_b_candidates = _nearest_levels(plan_b_entry, "above", vp, kl, gamma_wall, n=1)
+    sl_b_price = sl_b_candidates[0][1] if sl_b_candidates else il.effective_upper
+    sl_b_label = sl_b_candidates[0][0] if sl_b_candidates else f"{il.source_label}上沿"
+    plan_b = ActionPlan(
+        label="B", name="VWAP 回归做空", emoji="📉", is_primary=False,
+        logic="VWAP 上方接空, 目标日内中值",
+        direction="bearish",
+        trigger=f"价格反弹至 VWAP {kl.vwap:,.2f}" if kl.vwap > il.effective_mid
+                else f"价格反弹至{il.source_label}中值 {il.effective_mid:,.2f}",
+        entry=plan_b_entry, entry_action="做空",
+        stop_loss=sl_b_price, stop_loss_reason=sl_b_label,
+        tp1=il.effective_mid if plan_b_entry != il.effective_mid else il.effective_lower,
+        tp1_label=f"{il.source_label}中值" if plan_b_entry != il.effective_mid else f"{il.source_label}下沿",
+        tp2=il.effective_lower if plan_b_entry != il.effective_mid else None,
+        tp2_label=f"{il.source_label}下沿" if plan_b_entry != il.effective_mid else "",
+        rr_ratio=_calculate_rr(
+            plan_b_entry, sl_b_price,
+            il.effective_mid if plan_b_entry != il.effective_mid else il.effective_lower,
+        ),
+    )
+
+    # Plan C: always 5-day VA for invalidation
+    plan_c = ActionPlan(
+        label="C", name="失效反转", emoji="⚡", is_primary=False,
+        logic="放量突破 5日 VAH → 转 TREND_DAY",
+        direction="bullish",
+        trigger=f"放量站稳 5日 VAH {vp.vah:,.2f} 上方",
+        entry=None, entry_action="",
+        stop_loss=None, stop_loss_reason="",
+        tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+    )
+    return [plan_a, plan_b, plan_c]
+
+
+def _build_wide_va_plans_bullish(
+    price: float, vp: VolumeProfileResult, kl: KeyLevels,
+    gamma_wall: GammaWallResult | None, option_line: str | None,
+    il: IntradayLevels,
+) -> list[ActionPlan]:
+    """Wide VA bullish: long at intraday lower, TP to mid/upper."""
+    below = _nearest_levels(il.effective_lower, "below", vp, kl, gamma_wall, n=1)
+    raw_sl = below[0][1] if below else None
+    raw_sl_reason = below[0][0] if below else f"{il.source_label}下沿下方"
+    capped_sl, capped_sl_reason = _cap_fade_sl(il.effective_lower, raw_sl, raw_sl_reason, "bullish")
+
+    plan_a = ActionPlan(
+        label="A", name="日内下沿做多", emoji="📈", is_primary=True,
+        logic=f"宽 VA 日, 使用{il.source_label}作为震荡边界, 博日内均值回归",
+        direction="bullish",
+        trigger=f"价格触及{il.source_label}下沿 {il.effective_lower:,.2f} 附近",
+        entry=il.effective_lower, entry_action="做多",
+        stop_loss=capped_sl,
+        stop_loss_reason=capped_sl_reason,
+        tp1=il.effective_mid, tp1_label=f"{il.source_label}中值",
+        tp2=il.effective_upper, tp2_label=f"{il.source_label}上沿",
+        rr_ratio=_calculate_rr(il.effective_lower, capped_sl, il.effective_mid),
+        option_line=option_line,
+    )
+
+    # Plan B: VWAP regression
+    plan_b_entry = kl.vwap if kl.vwap < il.effective_mid else il.effective_mid
+    sl_b_candidates = _nearest_levels(plan_b_entry, "below", vp, kl, gamma_wall, n=1)
+    sl_b_price = sl_b_candidates[0][1] if sl_b_candidates else il.effective_lower
+    sl_b_label = sl_b_candidates[0][0] if sl_b_candidates else f"{il.source_label}下沿"
+    plan_b = ActionPlan(
+        label="B", name="VWAP 回归做多", emoji="📈", is_primary=False,
+        logic="VWAP 下方接多, 目标日内中值",
+        direction="bullish",
+        trigger=f"价格回调至 VWAP {kl.vwap:,.2f}" if kl.vwap < il.effective_mid
+                else f"价格回调至{il.source_label}中值 {il.effective_mid:,.2f}",
+        entry=plan_b_entry, entry_action="做多",
+        stop_loss=sl_b_price, stop_loss_reason=sl_b_label,
+        tp1=il.effective_mid if plan_b_entry != il.effective_mid else il.effective_upper,
+        tp1_label=f"{il.source_label}中值" if plan_b_entry != il.effective_mid else f"{il.source_label}上沿",
+        tp2=il.effective_upper if plan_b_entry != il.effective_mid else None,
+        tp2_label=f"{il.source_label}上沿" if plan_b_entry != il.effective_mid else "",
+        rr_ratio=_calculate_rr(
+            plan_b_entry, sl_b_price,
+            il.effective_mid if plan_b_entry != il.effective_mid else il.effective_upper,
+        ),
+    )
+
+    # Plan C: always 5-day VA for invalidation
+    plan_c = ActionPlan(
+        label="C", name="失效反转", emoji="⚡", is_primary=False,
+        logic="放量跌破 5日 VAL → 转 TREND_DAY",
+        direction="bearish",
+        trigger=f"放量跌破 5日 VAL {vp.val:,.2f}",
+        entry=None, entry_action="",
+        stop_loss=None, stop_loss_reason="",
+        tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+    )
+    return [plan_a, plan_b, plan_c]
+
+
 def _make_unclear_fade_plan(
     lean: str, vp: VolumeProfileResult, kl: KeyLevels,
     gamma_wall: GammaWallResult | None, option_line: str | None,
@@ -1356,8 +1523,9 @@ def _plans_unclear(
     price: float, vp: VolumeProfileResult, kl: KeyLevels,
     gamma_wall: GammaWallResult | None, regime: USRegimeResult,
     option_line: str | None,
+    direction_override: str | None = None,
 ) -> list[ActionPlan]:
-    lean = getattr(regime, "lean", "neutral")
+    lean = direction_override if direction_override in ("bullish", "bearish") else getattr(regime, "lean", "neutral")
     # is_chop_likely: low RVOL + low confidence → mean-reversion fade opportunity
     # Note: when lean="neutral", fade plan is NOT generated (no directional edge)
     is_chop_likely = regime.rvol < 1.0 and regime.confidence <= 0.30
@@ -1597,10 +1765,23 @@ def format_us_playbook_message(
     if ctx_parts:
         lines.append(f"大盘: {' | '.join(ctx_parts)}")
 
+    _index_conflict = (
+        (spy_result and spy_result.index_conflict)
+        or (qqq_result and qqq_result.index_conflict)
+    )
+    if _index_conflict:
+        lines.append("⚠️ <b>SPY/QQQ 方向性冲突</b> — 指数 Regime 已降级为 UNCLEAR")
+
     # Primary/alternate regime expectation
     alt_name, alt_pct = _alternate_regime_info(r)
     conf_pct = int(r.confidence * 100)
     lines.append(f"预期: {emoji}{regime_cn} ({conf_pct}%) / {alt_name} ({alt_pct}%)")
+
+    if r.stabilized:
+        lines.append("⚠️ <i>[稳定判定] 当前 regime 由防抖锁定</i>")
+    if getattr(result, "regime_volatile", False):
+        lines.append("⚠️ <i>[regime 近期波动] 分类在 scan 间切换，信号强度降低</i>")
+
     lines.append("")
 
     # ── Section 2: 核心结论 ──
@@ -1634,9 +1815,11 @@ def format_us_playbook_message(
         market_direction=_spy_direction,
     )
 
+    _intraday_levels = getattr(result, "intraday_levels", None)
     plans = _generate_action_plans(
         r, _direction, vp, kl, gamma_wall, recommendation,
         ctx=_plan_ctx, trend_downgrade_confidence=trend_downgrade_confidence,
+        intraday_levels=_intraday_levels,
     )
     for plan in plans:
         for plan_line in _format_action_plan(plan):
@@ -1649,6 +1832,26 @@ def format_us_playbook_message(
     lines.append("📝 <b>盘面逻辑</b>")
     rvol_label = _rvol_assessment(r.rvol)
     lines.append(f"▸ 量能: RVOL {r.rvol:.2f} ({rvol_label})")
+
+    # Wide VA annotation
+    if _intraday_levels and _intraday_levels.is_wide_va:
+        _il = _intraday_levels
+        if _il.source == "intraday_vp":
+            lines.append(
+                f"▸ VA 模式: 宽 VA ({_il.va_adr_ratio:.1f}x ADR) — 使用日内发展中 VP 作为触发位"
+            )
+            lines.append(
+                f"   5日 VA: {vp.val:,.2f} - {vp.vah:,.2f}"
+                f" | 日内 VP: {_il.effective_lower:,.2f} - {_il.effective_upper:,.2f}"
+            )
+        else:
+            lines.append(
+                f"▸ VA 模式: 宽 VA ({_il.va_adr_ratio:.1f}x ADR) — 使用 VWAP ± 1σ 作为触发位"
+            )
+            lines.append(
+                f"   5日 VA: {vp.val:,.2f} - {vp.vah:,.2f}"
+                f" | VWAP bands: {_il.effective_lower:,.2f} - {_il.effective_upper:,.2f}"
+            )
 
     # Space analysis — upside/downside distances
     above = _nearest_levels(r.price, "above", vp, kl, gamma_wall, n=1)

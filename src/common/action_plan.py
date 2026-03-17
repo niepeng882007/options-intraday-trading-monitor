@@ -562,6 +562,36 @@ def apply_vwap_deviation_warning(
     return plans
 
 
+def enforce_direction_consistency(
+    plans: list[ActionPlan],
+    regime_type: str,
+    direction: str,
+    trend_regimes: set[str] | None = None,
+) -> list[ActionPlan]:
+    """Strip contradicting entries from trend-regime plans.
+
+    Only applies when ``regime_type`` is a trend regime (GAP_AND_GO / TREND_DAY).
+    Plan C is always exempt.  FADE_CHOP / UNCLEAR are unaffected.
+    """
+    if trend_regimes is None:
+        trend_regimes = {"GAP_AND_GO", "TREND_DAY"}
+    if regime_type not in trend_regimes:
+        return plans
+    if direction not in ("bullish", "bearish"):
+        return plans
+
+    opposite = "bearish" if direction == "bullish" else "bullish"
+    for plan in plans:
+        if plan.label == "C":
+            continue
+        if plan.direction == opposite and plan.entry is not None:
+            plan.entry = None
+            plan.entry_action = ""
+            w = f"方向与 {regime_type} {direction} 矛盾, 入场已移除"
+            plan.warning = f"{plan.warning}; {w}" if plan.warning else w
+    return plans
+
+
 def apply_market_direction_warning(
     plans: list[ActionPlan], ctx: PlanContext,
 ) -> list[ActionPlan]:

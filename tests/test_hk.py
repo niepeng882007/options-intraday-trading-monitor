@@ -4259,3 +4259,38 @@ class TestWhipsawEscape:
         )
         assert result2.regime == RegimeType.TREND_DAY
         assert result2.confidence == pytest.approx(0.35, abs=0.01)
+
+
+# ── HK Direction Consistency Test ──
+
+
+class TestHKDirectionConsistency:
+    """Test that HK trend downgrade preserves direction instead of using regime lean."""
+
+    def test_hk_trend_downgrade_direction(self):
+        """HK: TREND_DAY bullish + lean=bearish + wait → Plan B should be bullish."""
+        from src.hk.playbook import _generate_action_plans as hk_generate_plans
+        from src.common.action_plan import PlanContext
+
+        regime = RegimeResult(
+            regime=RegimeType.TREND_DAY,
+            confidence=0.60,
+            direction="bullish",
+            rvol=1.10,
+            price=120.0,
+            vah=122.0, val=117.0, poc=119.0,
+            lean="bearish",
+        )
+        vp = VolumeProfileResult(poc=119.0, vah=122.0, val=117.0)
+        levels = {"POC": 119.0, "VAH": 122.0, "VAL": 117.0, "VWAP": 120.0}
+        option_rec = OptionRecommendation(action="wait", direction="neutral", wait_conditions=["等待确认"])
+        ctx = PlanContext(minutes_to_close=200, total_session_minutes=330, rvol=1.10)
+
+        plans = hk_generate_plans(
+            regime, "bullish", vp, levels, 120.0, option_rec,
+            ctx=ctx, trend_downgrade_confidence=0.70,
+        )
+        plan_b = next((p for p in plans if p.label == "B"), None)
+        assert plan_b is not None
+        if plan_b.direction in ("bullish", "bearish"):
+            assert plan_b.direction == "bullish"

@@ -31,6 +31,9 @@ regime:
     min_sample_days: 5
     min_trend_day_floor: 1.0
     gap_significance_threshold: 0.3
+  stability:
+    rvol_hysteresis: 0.10               # L1 RVOL threshold 偏移比例
+    cross_family_cooldown_minutes: 15   # TREND↔FADE family alert 最小间隔
   structure_trend:
     enabled: true
     window: 15              # Layer 2 window size (bars = minutes with 1m)
@@ -40,6 +43,7 @@ regime:
     fast_side_pct: 0.80     # Layer 1 VWAP side cross-validation ratio
     fast_r2_min: 0.70       # Layer 1 close regression R² entry gate
     # flat_threshold: DEPRECATED — no longer used as L1 gate (kept for config compat)
+  index_consistency_enabled: true
 
 filters:
   calendar_file: "config/us_calendar.yaml"
@@ -172,6 +176,23 @@ market_tone:
     event_day:
       fomc_trend_unlock_time: "14:00"
       data_scan_start_time: "10:00"
+
+regime_stabilizer:
+  enabled: false                     # 灰度开关
+  hysteresis_ratio: 0.30             # Layer 1: (trend-fade gap) * ratio
+  hold_upgrade_minutes: 15           # FADE/UNCLEAR → TREND/GAP
+  hold_downgrade_minutes: 30         # TREND/GAP → FADE
+  hold_from_unclear_minutes: 10      # UNCLEAR → any
+  bypass_confidence_delta: 0.20      # delta >= 0.20 bypass all holds
+
+wide_va:
+  enabled: true
+  threshold: 1.8                    # VA width / ADR ratio threshold
+  vwap_band_std: 1.0               # VWAP ± N σ
+  intraday_vp_min_bars: 120         # intraday VP minimum bars (~2h)
+  intraday_vp_value_area_pct: 0.70  # intraday VP value area %
+  vwap_bands_min_bars: 15           # VWAP bands minimum bars (~15min)
+  min_band_width_pct: 0.002         # bands min width (0.2%), below → None
 
 trend_downgrade_confidence: 0.70  # wait + confidence < 此值 + TREND/GAP → 降级为 UNCLEAR plans
 
