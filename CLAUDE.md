@@ -25,6 +25,11 @@ python -m src.us_playbook.backtest -d 30
 python -m src.us_playbook.backtest -y SPY,AAPL -d 20 --no-sim -v
 python -m src.us_playbook.backtest --exit-mode trailing --no-adaptive -o json
 
+# Run Daily Bias Signal Validation (Phase 0)
+python -m src.us_playbook.backtest.daily_bias_eval -d 180 --all-watchlist -v
+python -m src.us_playbook.backtest.daily_bias_eval -d 60 -y SPY,AAPL,TSLA -v
+python -m src.us_playbook.backtest.daily_bias_eval -d 180 --all-watchlist -o json
+
 docker compose up --build       # Docker
 ```
 
@@ -92,7 +97,10 @@ Validates VP levels (VAH/VAL/PDH/PDL bounce rates) and regime classification acc
 - **`simulator.py`** — `USTradeSimulator` with fixed/trailing/both exit modes. EOD exit 15:50 ET. Regime entry at 09:38 ET.
 - **`engine.py`** — `USBacktestEngine` chains level eval → regime eval → optional simulation.
 - **`report.py`** — 3-section report: Level Accuracy (VAH/VAL/PDH/PDL), Regime Accuracy (D3 scoring), Trade Simulation.
+- **`daily_bias_eval.py`** — Phase 0 daily bias signal validation. `DailyBiasEvaluator` tests 5 sub-signals (daily structure HH/HL, yesterday candle, volume modifier, hourly EMA crossover, ATR-normalized gap) against dual labels (Label A: raw direction close-vs-open/VWAP; Label B: regime-aligned P&L sign via `evaluate_regimes()` + `USTradeSimulator`). Parameter scanning per signal (structure windows [5,8,10,15], candle body_ratio [0.3-0.7], EMA pairs [8/21,13/34,20/50], gap ATR multipliers [0.2,0.3,0.5]). Analysis: per-param win rates with binomial p-value, Pearson/Spearman correlation matrix, 5 aggregation weight schemes, confidence sensitivity (±modifier on scan/observe thresholds), time-segment (AM1/AM2/PM exploratory), VIX stratification (low/mid/high via yfinance history). 6 Go/No-Go criteria (G1-G6) with PASS/FAIL/INCONCLUSIVE verdicts. CLI: `python -m src.us_playbook.backtest.daily_bias_eval`.
 - **Config:** `simulation` block in `config/us_playbook_settings.yaml` (tp 0.5%, sl 0.25%, slippage 0.03%/leg, trailing exit).
+
+**Futu `INTERVAL_MAP`:** Supports `1m`, `5m`, `15m`, `1d`. Unknown intervals raise `ValueError` (no silent fallback). `_fetch_history_bars` uses dynamic `max_count` (daily: `days+10`, intraday: `(days+3)*400`).
 
 ## HK Configuration
 

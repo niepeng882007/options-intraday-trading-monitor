@@ -61,6 +61,7 @@ INTERVAL_MAP = {
     "1m": KLType.K_1M,
     "5m": KLType.K_5M,
     "15m": KLType.K_15M,
+    "1d": KLType.K_DAY,
 }
 
 
@@ -483,7 +484,9 @@ class FutuCollector(BaseCollector):
     def _fetch_history(self, symbol: str, interval: str, period: str) -> pd.DataFrame:
         ctx = self._ensure_connected()
         futu_code = to_futu(symbol)
-        kl_type = INTERVAL_MAP.get(interval, KLType.K_1M)
+        if interval not in INTERVAL_MAP:
+            raise ValueError(f"Unsupported interval '{interval}'. Valid: {list(INTERVAL_MAP.keys())}")
+        kl_type = INTERVAL_MAP[interval]
         start, end = _period_to_dates(period)
 
         ret, data, _page_req_key = ctx.request_history_kline(
@@ -521,14 +524,18 @@ class FutuCollector(BaseCollector):
         """Fetch history K-lines by day count with sufficient max_count."""
         ctx = self._ensure_connected()
         futu_code = to_futu(symbol)
-        kl_type = INTERVAL_MAP.get(interval, KLType.K_1M)
+        if interval not in INTERVAL_MAP:
+            raise ValueError(f"Unsupported interval '{interval}'. Valid: {list(INTERVAL_MAP.keys())}")
+        kl_type = INTERVAL_MAP[interval]
 
         today = datetime.now(ET).date()
         start = (today - timedelta(days=days + 3)).strftime("%Y-%m-%d")  # buffer for weekends
         end = today.strftime("%Y-%m-%d")
-        # Futu returns OLDEST max_count bars when start+end given
-        # Use generous limit to ensure today's bars are included
-        max_count = (days + 3) * 400
+        # Dynamic max_count: daily bars need far fewer than 1m bars
+        if interval == "1d":
+            max_count = days + 10
+        else:
+            max_count = (days + 3) * 400
 
         ret, data, _ = ctx.request_history_kline(
             futu_code, start=start, end=end, ktype=kl_type, max_count=max_count,
