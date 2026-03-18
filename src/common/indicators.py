@@ -8,6 +8,44 @@ import pandas as pd
 from src.common.types import RelativeStrength
 
 
+def calculate_atr_5min(
+    today_bars: pd.DataFrame,
+    period: int = 14,
+) -> float:
+    """Calculate 5-minute ATR from 1-minute bars.
+
+    Resamples 1-min OHLCV to 5-min bars, computes True Range per bar,
+    returns average of last *period* True Ranges.
+    Returns absolute price value (not percentage).
+    """
+    if today_bars is None or today_bars.empty:
+        return 0.0
+
+    # Resample 1-min → 5-min
+    ohlcv = today_bars[["Open", "High", "Low", "Close"]].copy()
+    bars_5m = ohlcv.resample("5min").agg(
+        {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+    ).dropna()
+
+    if len(bars_5m) < 2:
+        return 0.0
+
+    # True Range = max(H-L, |H-prev_C|, |L-prev_C|)
+    prev_close = bars_5m["Close"].shift(1)
+    tr = pd.concat([
+        bars_5m["High"] - bars_5m["Low"],
+        (bars_5m["High"] - prev_close).abs(),
+        (bars_5m["Low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    tr = tr.dropna()
+    if len(tr) < 1:
+        return 0.0
+
+    tail = tr.iloc[-period:] if len(tr) >= period else tr
+    return float(tail.mean())
+
+
 def calculate_vwap(bars: pd.DataFrame) -> float:
     """Calculate VWAP for today's bars.
 

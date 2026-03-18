@@ -1,163 +1,176 @@
-# 方向判断与入场计算重构 — 交接文档
+# 止损与目标计算重构 — 交接文档
 
 > 日期: 2026-03-18
-> 前序: US 日型判断引擎重构 (4 → 7+1) — 已合入 main
+> 前序: 方向判断与入场计算重构 — 已合入 main
 
 ---
 
 ## 本次完成了什么
 
-### 7 个 Phase 全部落地
+### 止损/目标/R:R 校验体系重构
 
-9 个文件修改，519 测试通过（+34 新增），0 新回归。
+9 个文件修改，79 action_plan 测试通过（+29 新增），977 全量回归通过，0 新回归。
 
-#### Phase 1: 数据结构扩展
+**根本问题**: TSLA 止损仅 0.16%（远低于 5min ATR）、R:R 1:10（超出剩余波动）、SPY Plan A R:R 0.5 仍为首选。原因是止损/目标仅从结构位选取，未校验 ATR 噪音和目标可达性；R:R 是简单距离比，未考虑止损触发概率和目标达成概率。
 
-| 文件 | 新增 |
-|------|------|
-| `src/common/types.py` | `DirectionConfidence` dataclass（方向 + score + 6 信号 map）、`RelativeStrength` dataclass（rs_ratio, correlation, decoupled, label） |
-| `src/common/action_plan.py` | `ActionPlan` +`reachability_tag`/`is_near_entry`；`PlanContext` +`current_price`/`decoupled_from_benchmark` |
-| `src/us_playbook/__init__.py` | `USPlaybookResult` +`relative_strength`/`direction_confidence` |
+#### Step 0: Bug fix — warning 覆盖问题
 
-#### Phase 2: 相对强度 (R4)
+- **`cap_tp1()`** (action_plan.py:523): `plan.warning = ...` → 追加模式 `plan.warning = f"{plan.warning}; {w}" if plan.warning else w`
+- **`apply_vwap_deviation_warning()`** (action_plan.py:701/704): 同上，两处 warning 赋值改为追加
 
-- **`src/common/indicators.py`**: `compute_relative_strength(stock_bars, spy_bars)` — 日内回报对比、滚动 30-bar 相关性、脱钩判断（|corr| < 0.40）
-- **`src/us_playbook/main.py`**: pipeline 步骤 13 集成，跳过 SPY 自身
-- **`config/us_playbook_settings.yaml`**: `relative_strength` 配置块（enabled, correlation_window, decouple_threshold）
+#### Step 1: 5 分钟 ATR 计算
 
-#### Phase 3: 方向置信度 (R1)
+- **`src/common/indicators.py`**: +`calculate_atr_5min(today_bars, period=14)` — 1min→5min resample, True Range, 取最近 period 根均值，返回绝对值。数据不足返回 0.0
 
-- **`src/us_playbook/playbook.py`**: `_compute_direction_confidence()` — 聚合 6 个信号（regime, vwap_position, vwap_slope, structure, market_tone, relative_strength）
-- Section 2 核心结论区显示 `▸ 方向置信: 做多 83% (regime, vwap_position, structure, ...)`
+#### Step 2: 数据结构扩展
 
-#### Phase 4: 入场可达性 (R2)
-
-- **`check_entry_reachability()`**: 二元→三档（""=近端 / "远端" / "⛔不可达"=demote）
-  - 近端阈值: `reachable × 0.3`；远端: `≤ reachable`；不可达: `> reachable`
-- **`generate_near_entry_plan()`**: 在当前价 0.3% 内找结构位生成完整 Plan C（entry/SL/TP/RR）
-- **`ensure_near_entry_exists()`**: 无近端入场方案时自动注入，替换旧 Plan C
-- **`format_action_plan()`**: 支持 `reachability_tag` 渲染（📍远端）、近端 Plan C 完整渲染（非简化格式）
-- **`apply_min_rr_gate()`**: 有 entry 的 Plan C 参与 R:R 门控（F6）
-
-#### Phase 5a: Plan B 反向对冲
-
-所有 `_plans_*` 的 Plan B 从**同方向加仓**改为**反向对冲**:
-
-| 函数 | 旧 Plan B | 新 Plan B |
-|------|-----------|-----------|
-| `_plans_trend_bullish` | 突破加仓 (bullish) | 反向对冲做空 (bearish) |
-| `_plans_trend_bearish` | 破位加仓 (bearish) | 反向对冲做多 (bullish) |
-| `_plans_fade_bearish` | VWAP 回归做空 (bearish) | 反向对冲做多 (bullish) |
-| `_plans_fade_bullish` | VWAP 回归做多 (bullish) | 反向对冲做空 (bearish) |
-| `_build_wide_va_plans_bearish` | VWAP 回归做空 | 反向对冲做多 |
-| `_build_wide_va_plans_bullish` | VWAP 回归做多 | 反向对冲做空 |
-
-UNCLEAR plans 的 Plan B 保持不变（观察/均值回归/轻仓试探语义不变）。
-
-#### Phase 5b: 近端入场 + 失效 section
-
-- `_generate_action_plans()` 后处理链头部新增 `ensure_near_entry_exists`（在 cap/gate 之前，注入的 Plan C 经过完整检查）
-- 新增 `_invalidation_text()` + "🔄 失效与切换" section（从旧 Plan C 逻辑提取，按 regime family 生成失效条件文本）
-
-#### Phase 5c: 共享后处理适配
-
-- **`enforce_direction_consistency()`**: Plan B 豁免——反向对冲 Plan B 不再被 strip（F1）
-- **`apply_wait_coherence()`**: 对冲 Plan B 不被 suppress——观望时对冲反而更重要（F5）
-- **`apply_market_direction_warning()`**: `decoupled_from_benchmark=True` 时警告降级为 "脱钩, 权重降低"
-
-#### Phase 6: 集成显示
-
-- `PlanContext` 构造传入 `current_price` + `decoupled_from_benchmark`
-- Section 4 新增 `▸ 相对强度: vs SPY: 强势 | 个股 +1.2% / SPY +0.3% | 相关性 0.72`
-- Section 4 新增 `▸ 预估剩余波动: 1.2% (还剩 180min)`
-
-#### Phase 7: 测试 (34 新增)
-
-| 测试文件 | 新增类/用例数 | 覆盖内容 |
-|----------|---------------|----------|
-| `test_common_action_plan.py` | +15 | Plan C 完整渲染、reachability_tag、三档可达性、近端生成、近端注入/不注入、enforce 豁免、wait coherence 豁免、脱钩降级 |
-| `test_us_playbook.py` | +19 | 方向置信度、相对强度、Plan B 对冲结构（4 regime）、失效 section（trend/unclear）、端到端三方案结构 |
-
-### 关键文件清单
-
-| 文件 | 改动性质 |
+| 文件 | 新增字段 |
 |------|----------|
-| `src/common/types.py` | +2 dataclass |
-| `src/common/indicators.py` | +`compute_relative_strength()` |
-| `src/common/action_plan.py` | dataclass 扩展 + 5 函数修改 + 2 函数新增 + 格式化适配 |
-| `src/us_playbook/__init__.py` | re-export + USPlaybookResult +2 字段 |
-| `src/us_playbook/playbook.py` | `_compute_direction_confidence()` + 6 个 `_plans_*` 重构 + `_invalidation_text()` + 显示集成 |
-| `src/us_playbook/main.py` | pipeline +relative_strength 集成 |
-| `config/us_playbook_settings.yaml` | +`relative_strength` 配置块 |
-| `tests/test_common_action_plan.py` | +15 测试 |
-| `tests/test_us_playbook.py` | +19 测试 |
+| `src/common/action_plan.py` ActionPlan | `effective_rr: float`, `stop_atr_multiple: float`, `stop_floor_applied: bool` |
+| `src/common/action_plan.py` PlanContext | `atr_5min: float` |
+| `src/us_playbook/__init__.py` USPlaybookResult | `atr_5min: float` |
+| `src/hk/__init__.py` Playbook | `atr_5min: float` |
+
+概率常量（模块级，待回测校准）:
+```python
+_STOP_PROB_TIGHT = 0.80    # stop < 0.5x ATR
+_STOP_PROB_NARROW = 0.65   # stop < 1.0x ATR
+_STOP_PROB_DEFAULT = 0.40  # stop >= 1.0x ATR
+_TP_PROB_DEFAULT = 0.50    # tp <= remaining_vol
+_TP_PROB_STRETCH = 0.25    # tp > remaining_vol
+_TP_PROB_EXTREME = 0.10    # tp > 1.5x remaining_vol
+```
+
+#### Step 3: `enforce_stop_floor()`
+
+止损下限 = `max(1.5 × atr_5min, avg_daily_range_abs × 5%)`。过紧则自动扩大，设置 `stop_floor_applied=True`，计算 `stop_atr_multiple`。
+
+#### Step 4: `validate_target_reachability()`
+
+- Tier 1: TP1 > remaining_vol → 追加 warning
+- Tier 2: TP1 > remaining_vol × 1.5 → demote（不 force-adjust，因为 cap_tp1 已尝试过替换）
+
+#### Step 5: `compute_effective_rr()`
+
+概率加权 R:R = `(tp_reach_prob × tp_distance) / (stop_trigger_prob × stop_distance)`。基于 ATR 倍数选择止损触发概率，基于剩余波动选择目标达成概率。
+
+#### Step 6: `check_all_demoted()`
+
+所有有 entry 的方案均被 demote/suppress → 在第一个方案上追加 "所有方案有效R:R不足或被降级, 建议观望"。
+
+#### Step 7: `apply_min_rr_gate()` 增强
+
+在原有 rr_ratio 检查之后新增:
+- `effective_rr > 0 且 < 1.5` → demote
+- `effective_rr > 8.0` → 追加 "极端R:R" warning
+
+#### Step 8: `format_action_plan()` 增强
+
+- 止损行: `止损: 99.70 (test) | 2.5x ATR ✓` （< 1.5x 显示 ⚠️，`stop_floor_applied` 显示 `[已扩大]`）
+- R:R 行: `R:R ≈ 1:3.0 (有效 1:1.8)` （effective_rr 与 rr_ratio 差异 > 0.05 时显示）
+
+#### Step 9-10: US/HK 集成
+
+**Pipeline**: 两个市场的 `_run_analysis_pipeline()` 均调用 `calculate_atr_5min(today_bars)` 并存入 result。
+
+**后处理链** (US 和 HK 各两处 — 主链 + issue4 降级链):
+```
+ensure_near_entry_exists
+→ enforce_stop_floor (★)
+→ cap_tp1 → cap_tp2
+→ validate_target_reachability (★)
+→ compute_effective_rr (★)
+→ check_entry_reachability
+→ apply_vwap/gamma warnings
+→ apply_wait_coherence → apply_min_rr_gate
+→ enforce_direction → apply_market_direction
+→ check_all_demoted (★)
+```
+
+**数据雷达**: US 显示 `▸ 波动: 5min ATR $0.39`，HK 显示 `▸ 波动: 5min ATR HK$0.39`
+
+#### Step 11: 测试 (29 新增)
+
+| 测试类 | 用例数 | 覆盖 |
+|--------|--------|------|
+| TestCalculateAtr5min | 3 | 正常/空/不足 |
+| TestEnforceStopFloor | 5 | 扩大/不变/无ATR/bearish/倍数 |
+| TestValidateTargetReachability | 4 | 范围内/warn/demote/无ADR |
+| TestComputeEffectiveRR | 5 | 正常/紧止损/远目标/无ATR/无entry |
+| TestApplyMinRRGateEffectiveRR | 3 | <1.5→demote / >8→warn / OK |
+| TestCheckAllDemoted | 3 | 全demote/部分/无entry |
+| TestFormatActionPlanATR | 4 | ATR倍数/低倍数/有效RR/已扩大 |
+| TestWarningAppend | 2 | cap_tp1/vwap追加不覆盖 |
 
 ---
 
 ## 下次应该从哪里开始
 
-### 1. 回测验证（最高优先级）
+### 1. 概率常量校准（最高优先级）
+
+当前 `_STOP_PROB_*` 和 `_TP_PROB_*` 是经验初始值，需要通过回测校准:
 
 ```bash
-python -m src.us_playbook.backtest -d 20 -v
+python -m src.us_playbook.backtest -d 30 -v
+python -m src.hk.backtest -d 20 -v
 ```
 
-确认:
-- Plan B 对冲方案在回测 simulator 中的表现（当前 simulator 只跟 Plan A 入场，需要确认是否需要扩展 simulator 支持多 plan 评估）
-- 近端 Plan C 注入频率是否合理（过高说明 Plan A/B 入场位经常远离当前价）
-- 总体准确率 ≥ 旧系统
+校准方法: 在回测 simulator 中统计:
+- 不同 ATR 倍数下的实际止损触发率（对比 `_STOP_PROB_TIGHT/NARROW/DEFAULT`）
+- 不同 remaining_vol 比例下的 TP1 达成率（对比 `_TP_PROB_DEFAULT/STRETCH/EXTREME`）
 
-### 2. 实盘观察
+如果实际数据偏离较大，调整常量值。这些常量位于 `src/common/action_plan.py` 模块级。
+
+### 2. 实盘验证
 
 手动触发 playbook，确认:
-- `▸ 方向置信: 做多 67% (regime, vwap_position, structure)` 显示正常
-- `▸ 相对强度: vs SPY: 强势 | ...` 显示正常（SPY 自身不显示）
-- `🔄 失效与切换:` section 内容与 regime 一致
-- 📍远端 标签出现在合理位置
-- Plan B 名称显示"反向对冲做空/做多"
+- TSLA 止损不再出现 0.16%（应至少 1.5x ATR，如 ATR=0.39 则止损 ≥ $0.59）
+- R:R 极端值 (>8) 有 ⚠️ 标注
+- 有效 R:R < 1.5 的方案被标记为降级
+- 所有方案降级时显示观望提示
+- 止损行显示 `x.xx ATR ✓/⚠️` 标注
+- `[已扩大]` 标签出现在止损被 floor 调整的方案上
 
-### 3. HK 模块 Plan B 对齐（独立任务）
+### 3. effective_rr 阈值调优
 
-本次仅改 US，HK 的 Plan B 仍是同方向"突破加仓"。审查报告 F11 建议作为后续独立任务处理。需要评估 HK 模块是否也需要反向对冲语义。
+当前 effective_rr < 1.5 直接 demote，可能过于激进（特别是震荡日 Plan A 经常 R:R 在 1.0-1.5 之间）。观察实盘后决定是否:
+- 将 1.5 改为可配置参数（放入 `us_playbook_settings.yaml`）
+- 或按 regime family 分层（trend: 1.5, fade: 1.0, unclear: 0.8）
 
-### 4. Playbook 版本 diff
+### 4. 上一轮遗留任务
 
-审查报告提及的 "每次更新标注与上一版的变化"（模板 v2 要求）。`_regime_history` 已存储数据，但 playbook 格式化中尚未读取和展示 "vs 上一版" 字段。
-
-### 5. `direction_confidence` 回填到 USPlaybookResult
-
-当前 `_compute_direction_confidence()` 在格式化时计算并显示，但未回填到 `result.direction_confidence` 字段。如果 auto-scan 或其他下游需要用方向置信度做决策，需要在 `_run_analysis_pipeline()` 或 `format_us_playbook_message()` 中回填。
+参见上一轮交接中的遗留:
+- HK 模块 Plan B 语义对齐（F11）
+- Playbook 版本 diff（模板 v2 要求）
+- `direction_confidence` 回填到 USPlaybookResult
 
 ---
 
 ## 未解决的问题
 
-### 审查报告遗留
+### 设计层面
 
-1. **F11: HK 模块 Plan B 语义未同步**。HK 的 Plan B 仍是同方向加仓。模板 v2 是通用模板，两个市场 Plan B 含义不一致。声明为后续独立任务。
+1. **概率常量未校准**。`_STOP_PROB_*` 和 `_TP_PROB_*` 是经验值（0.80/0.65/0.40 和 0.50/0.25/0.10），未通过回测数据验证。实际触发/达成率可能偏离。应在回测框架中增加统计模块。
 
-2. **F12: 方向置信度 ≠ regime 置信度**。`regime.confidence = 0.65` 表示 regime 分类信心，`DirectionConfidence.score` 表示做多/做空信号对齐度。docstring 已区分，但 playbook 输出中两个百分比挨着显示，可能让用户混淆。考虑在 UI 中加注释或调整布局。
+2. **effective_rr demote 阈值 1.5 可能过严**。震荡日的 Plan A 经常 R:R 在 1.0-1.5 之间（VA 边沿到 POC 距离有限），可能被过度 demote。需要实盘观察后决定是否分层。
 
-3. **F13: HK `check_entry_proximity` 与近端 Plan C 潜在冲突**。HK 的 `check_entry_proximity` 会 demote entry < 0.5% 的方案。若 HK 未来采用近端 Plan C（entry 在 0.3% 以内），会冲突。当前无需操作。
+3. **enforce_stop_floor 不追加 stop_loss_reason**。计划设计决定由 format 层通过 `stop_atr_multiple + stop_floor_applied` 统一展示，但用户可能困惑为什么止损位和 reason 不匹配。可考虑在 reason 后追加 "(ATR floor)" 标注。
 
-4. **F1 底层问题: HK `enforce_direction_consistency` 实际无效**。HK 传入的 regime name 是 `"GAP_AND_GO"` / `"TREND_DAY"`，不在默认 `trend_regimes = {"GAP_GO", "TREND_STRONG", "TREND_WEAK"}` 中，所以该函数对 HK 是死代码路径。本次 Plan B 豁免不影响 HK，但这是一个应记录的潜在 bug。
+4. **cap_tp1 与 validate_target_reachability 的顺序交互**。cap_tp1 先尝试找结构位替换 TP1，如果找不到则 warn；随后 validate_target_reachability 可能再次 warn 或 demote。两层 warn 可能叠加（如 "TP1 距入场 3.2%, 超出预估波动 2.0%; ⚠️ TP1 超出剩余空间 (3.2% > 2.0%)"）。信息重复但不矛盾，可接受但略冗余。
 
 ### 代码层面
 
-5. **预先存在的测试失败（与本次无关）**:
-   - `test_build_telegram_application_wires_dual_requests` — 本地 proxy 配置导致 kwargs 不匹配
-   - `TestFadeEntryStaleness::test_recommend_moderate_still_tradeable` — expiry_dates 环境问题
-   - `test_hk.py` 5 个失败 — HK 模块预存问题
-   - `test_collector_futu.py` 4 个失败 — Futu API mock 问题
+5. **预先存在的测试失败（与本次无关，共 12 个）**:
+   - `test_us_playbook.py` 3 个: telegram application + option expiry 环境问题
+   - `test_hk.py` 5 个: HK 模块预存问题
+   - `test_collector_futu.py` 4 个: Futu API mock 问题
 
-6. **`direction_confidence` 未持久化**。仅在格式化时计算，不参与 auto-scan 决策。如需用于 L1/L2 screen，需提前计算并存入 `USPlaybookResult.direction_confidence`。
+6. **HK playbook.py 被 linter 回退**。git stash 过程中 linter 将 HK playbook.py 回退到旧版（不含新函数导入）。已通过 `git stash pop` 恢复，但如果再次发生类似情况需注意。最终版本已确认包含所有新导入和后处理链修改。
 
-7. **`relative_strength` 依赖 SPY today_bars 缓存**。首次查询非 SPY 标的时，如果 SPY 尚未被查询（`_last_today_bars` 中无 SPY），相对强度为 None。正常使用流程中 SPY 通常先于个股被查询（作为 market context），但边缘情况下可能缺失。
-
-8. **近端 Plan C 可能与旧 Plan C 失效信息冲突**。`ensure_near_entry_exists` 替换旧 Plan C 时，旧 Plan C 的失效/切换逻辑（如"跌回 VA → 转 RANGE"）被丢弃。但新的"失效与切换" section 已独立生成此信息，所以不存在信息丢失——只是从 Plan C 迁移到了独立 section。
+7. **US/HK 后处理链有两个入口**。`_generate_action_plans()` 中有两个 `if ctx:` 块（主链 + issue4 trend downgrade 链），两处都需要保持同步。未来如果新增后处理步骤，容易遗漏其中一处。可考虑提取为共享函数。
 
 ### 性能层面
 
-9. **`compute_relative_strength` 每次 pipeline 调用一次**。涉及 pct_change + corrcoef 计算，对 60-bar 数据开销极小（<1ms）。无需缓存。
+8. **`calculate_atr_5min` 每次 pipeline 调用一次**。resample + True Range 对 ~390 bar 数据开销极小（<1ms），无需缓存。
 
-10. **`_compute_direction_confidence` 在 format 中调用**。同一个 result 的 playbook 如果被多次格式化（如 auto-scan 重新渲染），会重复计算。开销极小，但如需优化可缓存到 `USPlaybookResult.direction_confidence`。
+9. **新增 4 个后处理步骤**。每个都是 O(1) per plan（最多 3 个 plan），总开销可忽略。

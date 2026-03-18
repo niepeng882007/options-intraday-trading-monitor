@@ -464,6 +464,10 @@ class USPredictor:
             if last_raw.regime != regime.regime:
                 regime_volatile = True
 
+        # 12b. 5-min ATR
+        from src.common.indicators import calculate_atr_5min
+        atr_5min = calculate_atr_5min(today) if today is not None and not today.empty else 0.0
+
         # 13. Relative strength vs SPY
         relative_strength = None
         rs_cfg = cfg.get("relative_strength", {})
@@ -495,6 +499,7 @@ class USPredictor:
             option_market=option_market,
             market_tone=None,  # set by caller after pipeline
             avg_daily_range_pct=rvol_profile.avg_daily_range_pct if rvol_profile else 0.0,
+            atr_5min=atr_5min,
             regime_volatile=regime_volatile,
             intraday_levels=intraday_levels,
             relative_strength=relative_strength,

@@ -17,14 +17,18 @@ from src.common.action_plan import (  # noqa: F401 — re-export for backward co
     calculate_rr as _calculate_rr,
     cap_tp1 as _cap_tp1_common,
     cap_tp2 as _cap_tp2_common,
+    check_all_demoted as _check_all_demoted,
     check_entry_reachability as _check_entry_reachability,
     compact_option_line as _compact_option_line,
+    compute_effective_rr as _compute_effective_rr,
     enforce_direction_consistency as _enforce_direction_consistency,
+    enforce_stop_floor as _enforce_stop_floor,
     ensure_near_entry_exists as _ensure_near_entry_exists_common,
     find_fade_entry_zone as _find_fade_entry_zone_common,
     format_action_plan as _format_action_plan,
     nearest_levels as _nearest_levels_common,
     reachable_range_pct as _reachable_range_pct,
+    validate_target_reachability as _validate_target_reachability,
 )
 from src.common.formatting import (
     action_label as _action_label,
@@ -1131,8 +1135,11 @@ def _generate_action_plans(
         if ctx:
             levels = _us_key_levels_to_dict(vp, kl, gamma_wall, current_price=price)
             plans = _ensure_near_entry_exists_common(plans, price, direction, levels, option_line)
+            plans = [_enforce_stop_floor(p, ctx) for p in plans]
             plans = [_cap_tp1(p, ctx, vp, kl, gamma_wall, current_price=price) for p in plans]
             plans = [_cap_tp2(p, ctx, vp, kl, gamma_wall, current_price=price) for p in plans]
+            plans = [_validate_target_reachability(p, ctx) for p in plans]
+            plans = [_compute_effective_rr(p, ctx) for p in plans]
             plans = [_check_entry_reachability(p, price, ctx) for p in plans]
             plans = _apply_vwap_deviation_warning_common(plans, price, kl.vwap)
             plans = _apply_gamma_wall_warning_common(plans, price, gamma_wall, ctx)
@@ -1140,6 +1147,7 @@ def _generate_action_plans(
             plans = _apply_min_rr_gate(plans, ctx)
             plans = _enforce_direction_consistency(plans, regime.regime.name, direction)
             plans = _apply_market_direction_warning(plans, ctx)
+            plans = _check_all_demoted(plans)
         return plans
 
     if regime.regime.family == RegimeFamily.TREND:
@@ -1206,8 +1214,11 @@ def _generate_action_plans(
         levels = _us_key_levels_to_dict(vp, kl, gamma_wall, current_price=price)
         # ensure_near_entry_exists BEFORE cap/gate (so injected Plan C gets full checks)
         plans = _ensure_near_entry_exists_common(plans, price, direction, levels, option_line)
+        plans = [_enforce_stop_floor(p, ctx) for p in plans]
         plans = [_cap_tp1(p, ctx, vp, kl, gamma_wall, current_price=price) for p in plans]
         plans = [_cap_tp2(p, ctx, vp, kl, gamma_wall, current_price=price) for p in plans]
+        plans = [_validate_target_reachability(p, ctx) for p in plans]
+        plans = [_compute_effective_rr(p, ctx) for p in plans]
         plans = [_check_entry_reachability(p, price, ctx) for p in plans]
         plans = _apply_vwap_deviation_warning_common(plans, price, kl.vwap)
         plans = _apply_gamma_wall_warning_common(plans, price, gamma_wall, ctx)
@@ -1215,6 +1226,7 @@ def _generate_action_plans(
         plans = _apply_min_rr_gate(plans, ctx)
         plans = _enforce_direction_consistency(plans, regime.regime.name, direction)
         plans = _apply_market_direction_warning(plans, ctx)
+        plans = _check_all_demoted(plans)
     return plans
 
 
@@ -2090,6 +2102,7 @@ def format_us_playbook_message(
         market_direction=_spy_direction,
         current_price=r.price,
         decoupled_from_benchmark=_decoupled,
+        atr_5min=getattr(result, "atr_5min", 0.0),
     )
 
     _intraday_levels = getattr(result, "intraday_levels", None)
@@ -2160,7 +2173,9 @@ def format_us_playbook_message(
             rs_parts.append(f"相关性 {_rs.correlation:.2f}")
         lines.append(f"▸ 相对强度: {' | '.join(rs_parts)}")
 
-    # Remaining volatility estimate
+    # ATR + Remaining volatility estimate
+    if _plan_ctx.atr_5min > 0:
+        lines.append(f"▸ 波动: 5min ATR ${_plan_ctx.atr_5min:.2f}")
     if _plan_ctx.avg_daily_range_pct > 0 and _min_left > 0:
         from src.common.action_plan import reachable_range_pct as _rrp
         _remaining_vol = _rrp(_plan_ctx)

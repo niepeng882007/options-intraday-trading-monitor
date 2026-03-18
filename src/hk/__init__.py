@@ -87,6 +87,7 @@ class Playbook:
     option_rec: OptionRecommendation | None = None
     key_levels_obj: HKKeyLevels | None = None
     avg_daily_range_pct: float = 0.0
+    atr_5min: float = 0.0
 
 
 @dataclass

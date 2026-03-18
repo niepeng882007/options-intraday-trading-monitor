@@ -14,6 +14,16 @@ logger = setup_logger("common_action_plan")
 
 _esc = html.escape
 
+# ATR-based stop trigger probabilities (to be calibrated with backtest data)
+_STOP_PROB_TIGHT = 0.80    # stop < 0.5x ATR
+_STOP_PROB_NARROW = 0.65   # stop < 1.0x ATR
+_STOP_PROB_DEFAULT = 0.40  # stop >= 1.0x ATR
+
+# Target reach probabilities based on remaining volatility
+_TP_PROB_DEFAULT = 0.50    # tp <= remaining_vol
+_TP_PROB_STRETCH = 0.25    # tp > remaining_vol
+_TP_PROB_EXTREME = 0.10    # tp > 1.5x remaining_vol
+
 
 @dataclass
 class ActionPlan:
@@ -42,6 +52,9 @@ class ActionPlan:
     warning: str = ""              # 附加警告 (如 VWAP 偏离)
     reachability_tag: str = ""     # "" / "远端" / "⛔不可达"
     is_near_entry: bool = False    # True = 近端备选 (距当前价 < 0.3%)
+    effective_rr: float = 0.0          # 概率加权后的有效 R:R
+    stop_atr_multiple: float = 0.0     # 止损占 5min ATR 的倍数
+    stop_floor_applied: bool = False    # True = 止损被自动扩大
 
 
 @dataclass
@@ -57,6 +70,7 @@ class PlanContext:
     market_direction: str = ""          # "bullish" / "bearish" / "" (unknown)
     current_price: float = 0.0         # 当前价，用于近端入场计算
     decoupled_from_benchmark: bool = False  # 个股脱钩大盘
+    atr_5min: float = 0.0              # 5分钟 ATR (绝对值)
 
 
 def calculate_rr(
@@ -171,13 +185,22 @@ def format_action_plan(plan: ActionPlan) -> list[str]:
     else:
         lines.append("  入场: 等待方向明确后入场")
     if plan.stop_loss is not None:
-        lines.append(f"  止损: {plan.stop_loss:,.2f} ({_esc(plan.stop_loss_reason)})")
+        sl_line = f"  止损: {plan.stop_loss:,.2f} ({_esc(plan.stop_loss_reason)})"
+        if plan.stop_atr_multiple > 0:
+            atr_check = "✓" if plan.stop_atr_multiple >= 1.5 else "⚠️"
+            sl_line += f" | {plan.stop_atr_multiple:.1f}x ATR {atr_check}"
+        if plan.stop_floor_applied:
+            sl_line += " [已扩大]"
+        lines.append(sl_line)
     if plan.tp1 is not None:
         lines.append(f"  TP1 (50%): {plan.tp1:,.2f} ({plan.tp1_label})")
     if plan.tp2 is not None:
         lines.append(f"  TP2 (清仓): {plan.tp2:,.2f} ({plan.tp2_label})")
     if plan.rr_ratio > 0:
-        lines.append(f"  R:R ≈ 1:{plan.rr_ratio:.1f}")
+        rr_line = f"  R:R ≈ 1:{plan.rr_ratio:.1f}"
+        if plan.effective_rr > 0 and abs(plan.effective_rr - plan.rr_ratio) > 0.05:
+            rr_line += f" (有效 1:{plan.effective_rr:.1f})"
+        lines.append(rr_line)
     if plan.reachability_tag:
         lines.append(f"  📍 {plan.reachability_tag}")
     if plan.option_line:
@@ -460,6 +483,109 @@ def apply_wait_coherence(
     return plans
 
 
+def enforce_stop_floor(plan: ActionPlan, ctx: PlanContext) -> ActionPlan:
+    """Enforce minimum stop-loss distance based on ATR and daily range."""
+    if plan.entry is None or plan.stop_loss is None or ctx.atr_5min <= 0:
+        return plan
+
+    avg_daily_range_abs = ctx.avg_daily_range_pct / 100 * plan.entry if ctx.avg_daily_range_pct > 0 else 0.0
+    min_stop_distance = max(1.5 * ctx.atr_5min, avg_daily_range_abs * 0.05)
+    current_stop_distance = abs(plan.entry - plan.stop_loss)
+    plan.stop_atr_multiple = current_stop_distance / ctx.atr_5min if ctx.atr_5min > 0 else 0.0
+
+    if current_stop_distance < min_stop_distance:
+        if plan.direction == "bearish":
+            plan.stop_loss = plan.entry + min_stop_distance
+        else:
+            plan.stop_loss = plan.entry - min_stop_distance
+        plan.stop_floor_applied = True
+        plan.stop_atr_multiple = min_stop_distance / ctx.atr_5min
+        plan.rr_ratio = calculate_rr(plan.entry, plan.stop_loss, plan.tp1)
+
+    return plan
+
+
+def validate_target_reachability(plan: ActionPlan, ctx: PlanContext) -> ActionPlan:
+    """Validate TP1 against remaining volatility estimate.
+
+    Tier 1: TP1 > remaining_vol → warn
+    Tier 2: TP1 > remaining_vol × 1.5 → demote (不 force-adjust)
+    """
+    if plan.entry is None or plan.tp1 is None:
+        return plan
+    remaining_vol = reachable_range_pct(ctx)
+    if remaining_vol == float("inf"):
+        return plan
+    tp1_dist_pct = abs(plan.tp1 - plan.entry) / plan.entry * 100
+
+    # Tier 2: extreme overshoot → demote
+    if tp1_dist_pct > remaining_vol * 1.5:
+        plan.demoted = True
+        plan.demote_reason = f"TP1 距入场 {tp1_dist_pct:.1f}%, 远超剩余波动 {remaining_vol:.1f}%"
+        return plan
+
+    # Tier 1: moderate overshoot → warn
+    if tp1_dist_pct > remaining_vol:
+        w = f"⚠️ TP1 超出剩余空间 ({tp1_dist_pct:.1f}% > {remaining_vol:.1f}%)"
+        plan.warning = f"{plan.warning}; {w}" if plan.warning else w
+
+    return plan
+
+
+def compute_effective_rr(plan: ActionPlan, ctx: PlanContext) -> ActionPlan:
+    """Compute probability-weighted effective R:R."""
+    if plan.entry is None or plan.stop_loss is None or plan.tp1 is None:
+        plan.effective_rr = 0.0
+        return plan
+
+    stop_distance = abs(plan.entry - plan.stop_loss)
+    tp_distance = abs(plan.tp1 - plan.entry)
+    if stop_distance <= 0 or tp_distance <= 0:
+        plan.effective_rr = 0.0
+        return plan
+
+    # Stop trigger probability based on ATR multiple
+    if ctx.atr_5min > 0:
+        atr_mult = stop_distance / ctx.atr_5min
+        if atr_mult < 0.5:
+            stop_prob = _STOP_PROB_TIGHT
+        elif atr_mult < 1.0:
+            stop_prob = _STOP_PROB_NARROW
+        else:
+            stop_prob = _STOP_PROB_DEFAULT
+    else:
+        stop_prob = _STOP_PROB_DEFAULT
+
+    # Target reach probability based on remaining volatility
+    remaining_vol = reachable_range_pct(ctx)
+    tp_dist_pct = tp_distance / plan.entry * 100 if plan.entry > 0 else 0
+    if remaining_vol == float("inf") or remaining_vol <= 0:
+        tp_prob = _TP_PROB_DEFAULT
+    elif tp_dist_pct <= remaining_vol:
+        tp_prob = _TP_PROB_DEFAULT
+    elif tp_dist_pct <= remaining_vol * 1.5:
+        tp_prob = _TP_PROB_STRETCH
+    else:
+        tp_prob = _TP_PROB_EXTREME
+
+    plan.effective_rr = (tp_prob * tp_distance) / (stop_prob * stop_distance)
+    return plan
+
+
+def check_all_demoted(plans: list[ActionPlan]) -> list[ActionPlan]:
+    """If all plans with entries are demoted/suppressed, add standby warning."""
+    actionable = [p for p in plans if p.entry is not None]
+    if not actionable:
+        return plans
+    all_down = all(p.demoted or p.suppressed for p in actionable)
+    if all_down:
+        for p in actionable:
+            w = "所有方案有效R:R不足或被降级, 建议观望"
+            p.warning = f"{p.warning}; {w}" if p.warning else w
+            break
+    return plans
+
+
 def apply_min_rr_gate(
     plans: list[ActionPlan], ctx: PlanContext,
 ) -> list[ActionPlan]:
@@ -469,6 +595,8 @@ def apply_min_rr_gate(
     - tp1 set but no stop_loss → "无止损位, 风险不可控"
     - tp1 set and stop_loss set → "TP1 过近入场位, 无操作空间"
     - tp1 is None → skip (UNCLEAR Plan B "轻仓试探" semantics)
+
+    Also checks effective_rr when available.
     """
     for plan in plans:
         if plan.entry is None:
@@ -490,6 +618,16 @@ def apply_min_rr_gate(
             plan.demoted = True
             if not plan.demote_reason:
                 plan.demote_reason = f"R:R 仅 1:{plan.rr_ratio:.1f}, 低于阈值 1:{ctx.min_rr:.1f}"
+
+        # Effective R:R checks (when computed)
+        if plan.effective_rr > 0 and not plan.demoted:
+            if plan.effective_rr < 1.5:
+                plan.demoted = True
+                if not plan.demote_reason:
+                    plan.demote_reason = f"有效R:R 仅 {plan.effective_rr:.1f}, 低于首选阈值 1.5"
+        if plan.effective_rr > 8.0:
+            w = f"⚠️ 极端R:R ({plan.effective_rr:.1f}), 请校验止损/目标"
+            plan.warning = f"{plan.warning}; {w}" if plan.warning else w
     return plans
 
 
@@ -520,7 +658,8 @@ def cap_tp1(
             return plan
 
     # No replacement found — keep TP1 but warn
-    plan.warning = f"TP1 距入场 {tp1_dist:.1f}%, 超出预估波动 {reachable:.1f}%"
+    w = f"TP1 距入场 {tp1_dist:.1f}%, 超出预估波动 {reachable:.1f}%"
+    plan.warning = f"{plan.warning}; {w}" if plan.warning else w
     return plan
 
 
@@ -698,10 +837,12 @@ def apply_vwap_deviation_warning(
             continue
         # Price below VWAP + bearish plan → chasing weakness
         if dev_pct < -threshold and plan.direction == "bearish":
-            plan.warning = f"价格已低于 VWAP {abs(dev_pct):.1f}%, 做空需等反弹"
+            w = f"价格已低于 VWAP {abs(dev_pct):.1f}%, 做空需等反弹"
+            plan.warning = f"{plan.warning}; {w}" if plan.warning else w
         # Price above VWAP + bullish plan → chasing strength
         elif dev_pct > threshold and plan.direction == "bullish":
-            plan.warning = f"价格已高于 VWAP {abs(dev_pct):.1f}%, 做多需等回调"
+            w = f"价格已高于 VWAP {abs(dev_pct):.1f}%, 做多需等回调"
+            plan.warning = f"{plan.warning}; {w}" if plan.warning else w
     return plans
 
 

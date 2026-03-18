@@ -420,6 +420,10 @@ class HKPredictor:
             iv_ratio=(atm_iv / avg_iv) if avg_iv > 0 else 0.0,
         )
 
+        # 9b. 5-min ATR
+        from src.common.indicators import calculate_atr_5min
+        atr_5min = calculate_atr_5min(today_bars) if today_bars is not None and not today_bars.empty else 0.0
+
         # 10. Generate playbook
         playbook = generate_playbook(
             regime=regime,
@@ -434,6 +438,7 @@ class HKPredictor:
             key_levels_obj=hk_kl,
             avg_daily_range_pct=avg_daily_range_pct,
         )
+        playbook.atr_5min = atr_5min
 
         return regime, vp, vwap, filters, option_rec, gamma_wall, playbook, today_bars
 

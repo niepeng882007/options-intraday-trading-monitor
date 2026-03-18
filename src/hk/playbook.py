@@ -19,14 +19,18 @@ from src.common.action_plan import (
     calculate_rr as _calculate_rr,
     cap_tp1 as _cap_tp1_common,
     cap_tp2 as _cap_tp2_common,
+    check_all_demoted as _check_all_demoted,
     check_entry_proximity as _check_entry_proximity,
     check_entry_reachability as _check_entry_reachability,
     check_regime_consistency as _check_regime_consistency,
     compact_option_line as _compact_option_line,
+    compute_effective_rr as _compute_effective_rr,
     enforce_direction_consistency as _enforce_direction_consistency,
+    enforce_stop_floor as _enforce_stop_floor,
     find_fade_entry_zone as _find_fade_entry_zone_common,
     format_action_plan as _format_action_plan,
     nearest_levels as _nearest_levels_common,
+    validate_target_reachability as _validate_target_reachability,
 )
 from src.common.formatting import (
     closest_value_area_edge as _closest_value_area_edge,
@@ -619,8 +623,11 @@ def _generate_action_plans(
             plans = _check_regime_consistency(
                 plans, regime.regime.name, price, regime.price, ibh, ibl, vwap,
             )
+            plans = [_enforce_stop_floor(p, ctx) for p in plans]
             plans = [_cap_tp1(p, ctx, levels) for p in plans]
             plans = [_cap_tp2(p, ctx, levels) for p in plans]
+            plans = [_validate_target_reachability(p, ctx) for p in plans]
+            plans = [_compute_effective_rr(p, ctx) for p in plans]
             plans = [_check_entry_reachability(p, price, ctx) for p in plans]
             plans = [_check_entry_proximity(p, price) for p in plans]
             plans = _apply_wait_coherence(plans, ctx)
@@ -628,6 +635,7 @@ def _generate_action_plans(
             plans = _enforce_direction_consistency(plans, regime.regime.name, direction)
             plans = _apply_gamma_wall_warning(plans, price, gamma_wall, ctx)
             plans = _apply_vwap_deviation_warning(plans, price, vwap)
+            plans = _check_all_demoted(plans)
         return plans
 
     if regime.regime in (RegimeType.GAP_AND_GO, RegimeType.TREND_DAY):
@@ -657,8 +665,11 @@ def _generate_action_plans(
         plans = _check_regime_consistency(
             plans, regime.regime.name, price, regime.price, ibh, ibl, vwap,
         )
+        plans = [_enforce_stop_floor(p, ctx) for p in plans]
         plans = [_cap_tp1(p, ctx, levels) for p in plans]
         plans = [_cap_tp2(p, ctx, levels) for p in plans]
+        plans = [_validate_target_reachability(p, ctx) for p in plans]
+        plans = [_compute_effective_rr(p, ctx) for p in plans]
         plans = [_check_entry_reachability(p, price, ctx) for p in plans]
         plans = [_check_entry_proximity(p, price) for p in plans]
         plans = _apply_wait_coherence(plans, ctx)
@@ -666,6 +677,7 @@ def _generate_action_plans(
         plans = _enforce_direction_consistency(plans, regime.regime.name, direction)
         plans = _apply_gamma_wall_warning(plans, price, gamma_wall, ctx)
         plans = _apply_vwap_deviation_warning(plans, price, vwap)
+        plans = _check_all_demoted(plans)
     return plans
 
 
@@ -957,6 +969,7 @@ def format_playbook_message(
         avg_daily_range_pct=playbook.avg_daily_range_pct,
         intraday_range_pct=_intraday_range,
         option_action=recommendation.action if recommendation else "",
+        atr_5min=getattr(playbook, "atr_5min", 0.0),
     )
 
     plans = _generate_action_plans(
@@ -991,6 +1004,10 @@ def format_playbook_message(
         space_parts.append(f"下方至{below[0][0]} {dn_pct:.1f}%")
     if space_parts:
         lines.append(f"▸ 空间: {' / '.join(space_parts)}")
+
+    # ATR
+    if _plan_ctx.atr_5min > 0:
+        lines.append(f"▸ 波动: 5min ATR HK${_plan_ctx.atr_5min:.2f}")
 
     # IV environment
     if option_market and option_market.atm_iv > 0 and option_market.avg_iv > 0:

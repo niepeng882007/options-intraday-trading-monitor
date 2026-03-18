@@ -172,6 +172,7 @@ class USPlaybookResult:
     option_market: OptionMarketSnapshot | None = None
     market_tone: MarketTone | None = None
     avg_daily_range_pct: float = 0.0  # 来自 RvolProfile，0=无历史数据
+    atr_5min: float = 0.0            # 5分钟 ATR (绝对值)
     regime_volatile: bool = False     # True when regime flipped vs last scan
     index_conflict: bool = False      # SPY/QQQ directional regime conflict
     intraday_levels: object | None = None  # IntradayLevels | None (avoid circular import)
