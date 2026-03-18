@@ -6,12 +6,14 @@ from enum import Enum
 
 from src.common.types import (  # noqa: F401
     ChaseRiskResult,
+    DirectionConfidence,
     FilterResult,
     GammaWallResult,
     OptionLeg,
     OptionMarketSnapshot,
     OptionRecommendation,
     QuoteSnapshot,
+    RelativeStrength,
     SpreadMetrics,
     VolumeProfileResult,
 )
@@ -173,6 +175,8 @@ class USPlaybookResult:
     regime_volatile: bool = False     # True when regime flipped vs last scan
     index_conflict: bool = False      # SPY/QQQ directional regime conflict
     intraday_levels: object | None = None  # IntradayLevels | None (avoid circular import)
+    relative_strength: RelativeStrength | None = None  # 个股 vs SPY 相对强度
+    direction_confidence: DirectionConfidence | None = None  # 方向置信度
 
 
 @dataclass

@@ -20,6 +20,7 @@ from src.common.action_plan import (  # noqa: F401 — re-export for backward co
     check_entry_reachability as _check_entry_reachability,
     compact_option_line as _compact_option_line,
     enforce_direction_consistency as _enforce_direction_consistency,
+    ensure_near_entry_exists as _ensure_near_entry_exists_common,
     find_fade_entry_zone as _find_fade_entry_zone_common,
     format_action_plan as _format_action_plan,
     nearest_levels as _nearest_levels_common,
@@ -40,11 +41,13 @@ from src.common.formatting import (
     spread_execution_text as _spread_execution_text,
 )
 from src.common.types import (
+    DirectionConfidence,
     FilterResult,
     GammaWallResult,
     OptionMarketSnapshot,
     OptionRecommendation,
     QuoteSnapshot,
+    RelativeStrength,
     VolumeProfileResult,
 )
 from src.us_playbook import KeyLevels, MarketTone, RegimeFamily, USPlaybookResult, USRegimeResult, USRegimeType
@@ -197,6 +200,104 @@ def _infer_market_direction(result: USPlaybookResult | None) -> str:
     if direction == "neutral" and kl.vwap > 0:
         direction = "bullish" if r.price > kl.vwap else "bearish"
     return direction
+
+
+def _compute_direction_confidence(
+    regime: USRegimeResult,
+    vp: VolumeProfileResult,
+    kl: KeyLevels,
+    direction: str,
+    market_tone: MarketTone | None = None,
+    relative_strength: RelativeStrength | None = None,
+) -> DirectionConfidence:
+    """Aggregate directional confidence from multiple signals.
+
+    Signals (each votes bullish/bearish/neutral):
+    1. regime — regime family + lean
+    2. vwap_position — price vs VWAP
+    3. vwap_slope — VWAP slope direction
+    4. structure — price vs PDH/PDL/PMH/PML
+    5. market_tone — SPY-level tone direction
+    6. relative_strength — stock vs SPY
+
+    Score = aligned_count / total_signals (0.0 - 1.0).
+    """
+    price = regime.price
+    signals: dict[str, str] = {}
+
+    # 1. Regime signal
+    if regime.regime.family == RegimeFamily.TREND:
+        signals["regime"] = direction
+    elif regime.regime.family == RegimeFamily.FADE:
+        # Fade = counter-trend; the "direction" already accounts for this
+        signals["regime"] = direction
+    else:
+        lean = getattr(regime, "lean", "neutral")
+        signals["regime"] = lean if lean in ("bullish", "bearish") else "neutral"
+
+    # 2. VWAP position
+    if kl.vwap > 0 and price > 0:
+        signals["vwap_position"] = "bullish" if price > kl.vwap else "bearish"
+    else:
+        signals["vwap_position"] = "neutral"
+
+    # 3. VWAP slope
+    slope = getattr(regime, "vwap_slope", 0.0)
+    if slope > 0.001:
+        signals["vwap_slope"] = "bullish"
+    elif slope < -0.001:
+        signals["vwap_slope"] = "bearish"
+    else:
+        signals["vwap_slope"] = "neutral"
+
+    # 4. Structure (PDH/PDL/PMH/PML alignment)
+    bullish_struct = sum([
+        kl.pdh > 0 and price > kl.pdh,
+        kl.pmh > 0 and price > kl.pmh,
+    ])
+    bearish_struct = sum([
+        kl.pdl > 0 and price < kl.pdl,
+        kl.pml > 0 and price < kl.pml,
+    ])
+    if bullish_struct > bearish_struct:
+        signals["structure"] = "bullish"
+    elif bearish_struct > bullish_struct:
+        signals["structure"] = "bearish"
+    else:
+        signals["structure"] = "neutral"
+
+    # 5. Market tone
+    if market_tone and market_tone.direction in ("bullish", "bearish"):
+        signals["market_tone"] = market_tone.direction
+    else:
+        signals["market_tone"] = "neutral"
+
+    # 6. Relative strength
+    if relative_strength and relative_strength.label:
+        if relative_strength.label == "强势":
+            signals["relative_strength"] = "bullish"
+        elif relative_strength.label == "弱势":
+            signals["relative_strength"] = "bearish"
+        elif relative_strength.label == "脱钩":
+            signals["relative_strength"] = "neutral"
+        else:
+            signals["relative_strength"] = "neutral"
+    else:
+        signals["relative_strength"] = "neutral"
+
+    # Count alignment with the chosen direction
+    if direction not in ("bullish", "bearish"):
+        return DirectionConfidence(direction="neutral", score=0.0, signals=signals)
+
+    aligned = sum(1 for v in signals.values() if v == direction)
+    total = len(signals)
+    score = aligned / total if total > 0 else 0.0
+
+    return DirectionConfidence(
+        direction=direction,
+        score=round(score, 2),
+        signals=signals,
+    )
 
 
 # ── Grade bar helper ──
@@ -1028,6 +1129,8 @@ def _generate_action_plans(
     ):
         plans = _plans_unclear(price, vp, kl, gamma_wall, regime, option_line, direction_override=direction)
         if ctx:
+            levels = _us_key_levels_to_dict(vp, kl, gamma_wall, current_price=price)
+            plans = _ensure_near_entry_exists_common(plans, price, direction, levels, option_line)
             plans = [_cap_tp1(p, ctx, vp, kl, gamma_wall, current_price=price) for p in plans]
             plans = [_cap_tp2(p, ctx, vp, kl, gamma_wall, current_price=price) for p in plans]
             plans = [_check_entry_reachability(p, price, ctx) for p in plans]
@@ -1100,6 +1203,9 @@ def _generate_action_plans(
 
     # 后处理（仅当有 ctx 时执行）
     if ctx:
+        levels = _us_key_levels_to_dict(vp, kl, gamma_wall, current_price=price)
+        # ensure_near_entry_exists BEFORE cap/gate (so injected Plan C gets full checks)
+        plans = _ensure_near_entry_exists_common(plans, price, direction, levels, option_line)
         plans = [_cap_tp1(p, ctx, vp, kl, gamma_wall, current_price=price) for p in plans]
         plans = [_cap_tp2(p, ctx, vp, kl, gamma_wall, current_price=price) for p in plans]
         plans = [_check_entry_reachability(p, price, ctx) for p in plans]
@@ -1141,24 +1247,32 @@ def _plans_trend_bullish(
         option_line=option_line,
     )
 
-    # Plan B: breakout add-on
-    entry_b = tp1_a[1] if tp1_a else None
-    above_b = _nearest_levels(entry_b, "above", vp, kl, gamma_wall, n=2) if entry_b else []
-    tp1_b = above_b[0] if above_b else None
-    tp2_b = above_b[1] if len(above_b) >= 2 else None
+    # Plan B: hedge — reverse direction (bearish) if trend fails
+    # Entry at nearest resistance above (where trend would stall)
+    hedge_entry_level = tp1_a  # First resistance above VWAP
+    hedge_sl = above[1] if len(above) >= 2 else tp1_a  # Next level above as SL
+    below_hedge = _nearest_levels(kl.vwap, "below", vp, kl, gamma_wall, n=2)
+    hedge_tp1 = below_hedge[0] if below_hedge else None
+    hedge_tp2 = below_hedge[1] if len(below_hedge) >= 2 else None
+
     plan_b = ActionPlan(
-        label="B", name="突破加仓", emoji="📈", is_primary=False,
-        logic=f"突破 {tp1_a[0] if tp1_a else '阻力'} 后追多",
-        direction="bullish",
-        trigger=f"放量突破 {tp1_a[0]} {tp1_a[1]:,.2f}" if tp1_a else "放量突破最近阻力",
-        entry=entry_b, entry_action="做多",
-        stop_loss=tp1_a[1] if tp1_a else None,
-        stop_loss_reason=f"回落 {tp1_a[0]} 下方" if tp1_a else "突破位下方",
-        tp1=tp1_b[1] if tp1_b else None,
-        tp1_label=tp1_b[0] if tp1_b else "",
-        tp2=tp2_b[1] if tp2_b else None,
-        tp2_label=tp2_b[0] if tp2_b else "",
-        rr_ratio=_calculate_rr(entry_b, tp1_a[1] if tp1_a else None, tp1_b[1] if tp1_b else None),
+        label="B", name="反向对冲做空", emoji="📉", is_primary=False,
+        logic=f"若趋势失败, 在 {tp1_a[0] if tp1_a else '阻力'} 受阻反转做空",
+        direction="bearish",
+        trigger=f"价格冲击 {tp1_a[0]} {tp1_a[1]:,.2f} 受阻回落" if tp1_a else "价格冲击阻力受阻",
+        entry=hedge_entry_level[1] if hedge_entry_level else None,
+        entry_action="做空",
+        stop_loss=hedge_sl[1] if hedge_sl else None,
+        stop_loss_reason=hedge_sl[0] if hedge_sl else "阻力上方",
+        tp1=hedge_tp1[1] if hedge_tp1 else None,
+        tp1_label=hedge_tp1[0] if hedge_tp1 else "",
+        tp2=hedge_tp2[1] if hedge_tp2 else None,
+        tp2_label=hedge_tp2[0] if hedge_tp2 else "",
+        rr_ratio=_calculate_rr(
+            hedge_entry_level[1] if hedge_entry_level else None,
+            hedge_sl[1] if hedge_sl else None,
+            hedge_tp1[1] if hedge_tp1 else None,
+        ),
     )
 
     plan_c = ActionPlan(
@@ -1202,23 +1316,31 @@ def _plans_trend_bearish(
         option_line=option_line,
     )
 
-    entry_b = tp1_a[1] if tp1_a else None
-    below_b = _nearest_levels(entry_b, "below", vp, kl, gamma_wall, n=2) if entry_b else []
-    tp1_b = below_b[0] if below_b else None
-    tp2_b = below_b[1] if len(below_b) >= 2 else None
+    # Plan B: hedge — reverse direction (bullish) if trend fails
+    hedge_entry_level = tp1_a  # First support below VWAP
+    hedge_sl = below[1] if len(below) >= 2 else tp1_a  # Next level below as SL
+    above_hedge = _nearest_levels(kl.vwap, "above", vp, kl, gamma_wall, n=2)
+    hedge_tp1 = above_hedge[0] if above_hedge else None
+    hedge_tp2 = above_hedge[1] if len(above_hedge) >= 2 else None
+
     plan_b = ActionPlan(
-        label="B", name="破位加仓", emoji="📉", is_primary=False,
-        logic=f"跌破 {tp1_a[0] if tp1_a else '支撑'} 后追空",
-        direction="bearish",
-        trigger=f"放量跌破 {tp1_a[0]} {tp1_a[1]:,.2f}" if tp1_a else "放量跌破最近支撑",
-        entry=entry_b, entry_action="做空",
-        stop_loss=tp1_a[1] if tp1_a else None,
-        stop_loss_reason=f"反弹 {tp1_a[0]} 上方" if tp1_a else "破位位上方",
-        tp1=tp1_b[1] if tp1_b else None,
-        tp1_label=tp1_b[0] if tp1_b else "",
-        tp2=tp2_b[1] if tp2_b else None,
-        tp2_label=tp2_b[0] if tp2_b else "",
-        rr_ratio=_calculate_rr(entry_b, tp1_a[1] if tp1_a else None, tp1_b[1] if tp1_b else None),
+        label="B", name="反向对冲做多", emoji="📈", is_primary=False,
+        logic=f"若趋势失败, 在 {tp1_a[0] if tp1_a else '支撑'} 企稳反弹做多",
+        direction="bullish",
+        trigger=f"价格下探 {tp1_a[0]} {tp1_a[1]:,.2f} 企稳反弹" if tp1_a else "价格下探支撑企稳",
+        entry=hedge_entry_level[1] if hedge_entry_level else None,
+        entry_action="做多",
+        stop_loss=hedge_sl[1] if hedge_sl else None,
+        stop_loss_reason=hedge_sl[0] if hedge_sl else "支撑下方",
+        tp1=hedge_tp1[1] if hedge_tp1 else None,
+        tp1_label=hedge_tp1[0] if hedge_tp1 else "",
+        tp2=hedge_tp2[1] if hedge_tp2 else None,
+        tp2_label=hedge_tp2[0] if hedge_tp2 else "",
+        rr_ratio=_calculate_rr(
+            hedge_entry_level[1] if hedge_entry_level else None,
+            hedge_sl[1] if hedge_sl else None,
+            hedge_tp1[1] if hedge_tp1 else None,
+        ),
     )
 
     plan_c = ActionPlan(
@@ -1283,25 +1405,24 @@ def _plans_fade_bearish(
         option_line=option_line,
     )
 
-    # Plan B: VWAP regression — dynamic SL: nearest structure above entry
-    plan_b_entry = kl.vwap if kl.vwap > vp.poc else None
-    if plan_b_entry:
-        sl_b_candidates = _nearest_levels(plan_b_entry, "above", vp, kl, gamma_wall, n=1)
-        sl_b_price = sl_b_candidates[0][1] if sl_b_candidates else vp.vah
-        sl_b_label = sl_b_candidates[0][0] if sl_b_candidates else "VAH"
-    else:
-        sl_b_price = vp.vah
-        sl_b_label = "VAH"
+    # Plan B: hedge — bullish reversal if fade fails (VAH breakout)
+    hedge_entry = vp.vah
+    above_hedge = _nearest_levels(vp.vah, "above", vp, kl, gamma_wall, n=2)
+    hedge_tp1 = above_hedge[0] if above_hedge else None
+    hedge_tp2 = above_hedge[1] if len(above_hedge) >= 2 else None
+    hedge_sl_price = vp.poc
     plan_b = ActionPlan(
-        label="B", name="VWAP 回归做空", emoji="📉", is_primary=False,
-        logic="VWAP 上方接空, 目标 POC",
-        direction="bearish",
-        trigger=f"价格反弹至 VWAP {kl.vwap:,.2f}" if plan_b_entry else "价格反弹至 VAH 附近",
-        entry=plan_b_entry, entry_action="做空",
-        stop_loss=sl_b_price, stop_loss_reason=sl_b_label,
-        tp1=vp.poc, tp1_label="POC",
-        tp2=vp.val, tp2_label="VAL",
-        rr_ratio=_calculate_rr(plan_b_entry, sl_b_price, vp.poc),
+        label="B", name="反向对冲做多", emoji="📈", is_primary=False,
+        logic="放量突破 VAH 确认趋势, 反手做多",
+        direction="bullish",
+        trigger=f"放量站稳 VAH {vp.vah:,.2f} 上方",
+        entry=hedge_entry, entry_action="做多",
+        stop_loss=hedge_sl_price, stop_loss_reason="POC",
+        tp1=hedge_tp1[1] if hedge_tp1 else None,
+        tp1_label=hedge_tp1[0] if hedge_tp1 else "",
+        tp2=hedge_tp2[1] if hedge_tp2 else None,
+        tp2_label=hedge_tp2[0] if hedge_tp2 else "",
+        rr_ratio=_calculate_rr(hedge_entry, hedge_sl_price, hedge_tp1[1] if hedge_tp1 else None),
     )
 
     plan_c = ActionPlan(
@@ -1349,25 +1470,24 @@ def _plans_fade_bullish(
         option_line=option_line,
     )
 
-    # Plan B: VWAP regression — dynamic SL: nearest structure below entry
-    plan_b_entry = kl.vwap if kl.vwap < vp.poc else None
-    if plan_b_entry:
-        sl_b_candidates = _nearest_levels(plan_b_entry, "below", vp, kl, gamma_wall, n=1)
-        sl_b_price = sl_b_candidates[0][1] if sl_b_candidates else vp.val
-        sl_b_label = sl_b_candidates[0][0] if sl_b_candidates else "VAL"
-    else:
-        sl_b_price = vp.val
-        sl_b_label = "VAL"
+    # Plan B: hedge — bearish reversal if fade fails (VAL breakdown)
+    hedge_entry = vp.val
+    below_hedge = _nearest_levels(vp.val, "below", vp, kl, gamma_wall, n=2)
+    hedge_tp1 = below_hedge[0] if below_hedge else None
+    hedge_tp2 = below_hedge[1] if len(below_hedge) >= 2 else None
+    hedge_sl_price = vp.poc
     plan_b = ActionPlan(
-        label="B", name="VWAP 回归做多", emoji="📈", is_primary=False,
-        logic="VWAP 下方接多, 目标 POC",
-        direction="bullish",
-        trigger=f"价格回调至 VWAP {kl.vwap:,.2f}" if plan_b_entry else "价格回调至 VAL 附近",
-        entry=plan_b_entry, entry_action="做多",
-        stop_loss=sl_b_price, stop_loss_reason=sl_b_label,
-        tp1=vp.poc, tp1_label="POC",
-        tp2=vp.vah, tp2_label="VAH",
-        rr_ratio=_calculate_rr(plan_b_entry, sl_b_price, vp.poc),
+        label="B", name="反向对冲做空", emoji="📉", is_primary=False,
+        logic="放量跌破 VAL 确认趋势, 反手做空",
+        direction="bearish",
+        trigger=f"放量跌破 VAL {vp.val:,.2f}",
+        entry=hedge_entry, entry_action="做空",
+        stop_loss=hedge_sl_price, stop_loss_reason="POC",
+        tp1=hedge_tp1[1] if hedge_tp1 else None,
+        tp1_label=hedge_tp1[0] if hedge_tp1 else "",
+        tp2=hedge_tp2[1] if hedge_tp2 else None,
+        tp2_label=hedge_tp2[0] if hedge_tp2 else "",
+        rr_ratio=_calculate_rr(hedge_entry, hedge_sl_price, hedge_tp1[1] if hedge_tp1 else None),
     )
 
     plan_c = ActionPlan(
@@ -1442,27 +1562,23 @@ def _build_wide_va_plans_bearish(
         option_line=option_line,
     )
 
-    # Plan B: VWAP regression
-    plan_b_entry = kl.vwap if kl.vwap > il.effective_mid else il.effective_mid
-    sl_b_candidates = _nearest_levels(plan_b_entry, "above", vp, kl, gamma_wall, n=1)
-    sl_b_price = sl_b_candidates[0][1] if sl_b_candidates else il.effective_upper
-    sl_b_label = sl_b_candidates[0][0] if sl_b_candidates else f"{il.source_label}上沿"
+    # Plan B: hedge — bullish breakout if fade fails
+    hedge_entry = il.effective_upper
+    above_hedge = _nearest_levels(il.effective_upper, "above", vp, kl, gamma_wall, n=2)
+    hedge_tp1 = above_hedge[0] if above_hedge else None
+    hedge_tp2 = above_hedge[1] if len(above_hedge) >= 2 else None
     plan_b = ActionPlan(
-        label="B", name="VWAP 回归做空", emoji="📉", is_primary=False,
-        logic="VWAP 上方接空, 目标日内中值",
-        direction="bearish",
-        trigger=f"价格反弹至 VWAP {kl.vwap:,.2f}" if kl.vwap > il.effective_mid
-                else f"价格反弹至{il.source_label}中值 {il.effective_mid:,.2f}",
-        entry=plan_b_entry, entry_action="做空",
-        stop_loss=sl_b_price, stop_loss_reason=sl_b_label,
-        tp1=il.effective_mid if plan_b_entry != il.effective_mid else il.effective_lower,
-        tp1_label=f"{il.source_label}中值" if plan_b_entry != il.effective_mid else f"{il.source_label}下沿",
-        tp2=il.effective_lower if plan_b_entry != il.effective_mid else None,
-        tp2_label=f"{il.source_label}下沿" if plan_b_entry != il.effective_mid else "",
-        rr_ratio=_calculate_rr(
-            plan_b_entry, sl_b_price,
-            il.effective_mid if plan_b_entry != il.effective_mid else il.effective_lower,
-        ),
+        label="B", name="反向对冲做多", emoji="📈", is_primary=False,
+        logic=f"放量突破{il.source_label}上沿, 反手做多",
+        direction="bullish",
+        trigger=f"放量站稳{il.source_label}上沿 {il.effective_upper:,.2f} 上方",
+        entry=hedge_entry, entry_action="做多",
+        stop_loss=il.effective_mid, stop_loss_reason=f"{il.source_label}中值",
+        tp1=hedge_tp1[1] if hedge_tp1 else None,
+        tp1_label=hedge_tp1[0] if hedge_tp1 else "",
+        tp2=hedge_tp2[1] if hedge_tp2 else None,
+        tp2_label=hedge_tp2[0] if hedge_tp2 else "",
+        rr_ratio=_calculate_rr(hedge_entry, il.effective_mid, hedge_tp1[1] if hedge_tp1 else None),
     )
 
     # Plan C: always 5-day VA for invalidation
@@ -1503,27 +1619,23 @@ def _build_wide_va_plans_bullish(
         option_line=option_line,
     )
 
-    # Plan B: VWAP regression
-    plan_b_entry = kl.vwap if kl.vwap < il.effective_mid else il.effective_mid
-    sl_b_candidates = _nearest_levels(plan_b_entry, "below", vp, kl, gamma_wall, n=1)
-    sl_b_price = sl_b_candidates[0][1] if sl_b_candidates else il.effective_lower
-    sl_b_label = sl_b_candidates[0][0] if sl_b_candidates else f"{il.source_label}下沿"
+    # Plan B: hedge — bearish breakdown if fade fails
+    hedge_entry = il.effective_lower
+    below_hedge = _nearest_levels(il.effective_lower, "below", vp, kl, gamma_wall, n=2)
+    hedge_tp1 = below_hedge[0] if below_hedge else None
+    hedge_tp2 = below_hedge[1] if len(below_hedge) >= 2 else None
     plan_b = ActionPlan(
-        label="B", name="VWAP 回归做多", emoji="📈", is_primary=False,
-        logic="VWAP 下方接多, 目标日内中值",
-        direction="bullish",
-        trigger=f"价格回调至 VWAP {kl.vwap:,.2f}" if kl.vwap < il.effective_mid
-                else f"价格回调至{il.source_label}中值 {il.effective_mid:,.2f}",
-        entry=plan_b_entry, entry_action="做多",
-        stop_loss=sl_b_price, stop_loss_reason=sl_b_label,
-        tp1=il.effective_mid if plan_b_entry != il.effective_mid else il.effective_upper,
-        tp1_label=f"{il.source_label}中值" if plan_b_entry != il.effective_mid else f"{il.source_label}上沿",
-        tp2=il.effective_upper if plan_b_entry != il.effective_mid else None,
-        tp2_label=f"{il.source_label}上沿" if plan_b_entry != il.effective_mid else "",
-        rr_ratio=_calculate_rr(
-            plan_b_entry, sl_b_price,
-            il.effective_mid if plan_b_entry != il.effective_mid else il.effective_upper,
-        ),
+        label="B", name="反向对冲做空", emoji="📉", is_primary=False,
+        logic=f"放量跌破{il.source_label}下沿, 反手做空",
+        direction="bearish",
+        trigger=f"放量跌破{il.source_label}下沿 {il.effective_lower:,.2f}",
+        entry=hedge_entry, entry_action="做空",
+        stop_loss=il.effective_mid, stop_loss_reason=f"{il.source_label}中值",
+        tp1=hedge_tp1[1] if hedge_tp1 else None,
+        tp1_label=hedge_tp1[0] if hedge_tp1 else "",
+        tp2=hedge_tp2[1] if hedge_tp2 else None,
+        tp2_label=hedge_tp2[0] if hedge_tp2 else "",
+        rr_ratio=_calculate_rr(hedge_entry, il.effective_mid, hedge_tp1[1] if hedge_tp1 else None),
     )
 
     # Plan C: always 5-day VA for invalidation
@@ -1781,6 +1893,23 @@ def _rvol_assessment(rvol: float) -> str:
     return "趋势级"
 
 
+def _invalidation_text(regime: USRegimeType, direction: str, vp: VolumeProfileResult) -> str:
+    """Generate invalidation/switch condition text from regime type."""
+    family = regime.family
+    if family == RegimeFamily.TREND:
+        if direction == "bullish":
+            return f"价格跌回 VA 内 (< VAH {vp.vah:,.2f}) + RVOL 回落 → 转震荡"
+        return f"价格涨回 VA 内 (> VAL {vp.val:,.2f}) + RVOL 回落 → 转震荡"
+    if family == RegimeFamily.FADE:
+        if direction == "bearish":
+            return f"放量突破 VAH {vp.vah:,.2f} → 转趋势做多"
+        return f"放量跌破 VAL {vp.val:,.2f} → 转趋势做空"
+    if family == RegimeFamily.REVERSAL:
+        return "反转未确认 + RVOL 回落 → 恢复原趋势方向"
+    # UNCLEAR
+    return "保持空仓, 等待 Regime 明确"
+
+
 # ── Preserved: _collect_levels (test compatible) ──
 
 
@@ -1926,6 +2055,17 @@ def format_us_playbook_message(
     first_line = strategy_text.splitlines()[0] if strategy_text else ""
     lines.append(f"▸ 核心策略: {_esc(first_line)}")
 
+    # Direction confidence
+    _dir_conf = _compute_direction_confidence(
+        r, vp, kl, _direction,
+        market_tone=result.market_tone,
+        relative_strength=getattr(result, "relative_strength", None),
+    )
+    if _dir_conf.score > 0:
+        dir_cn = "做多" if _dir_conf.direction == "bullish" else "做空" if _dir_conf.direction == "bearish" else "中性"
+        aligned_names = [k for k, v in _dir_conf.signals.items() if v == _dir_conf.direction]
+        lines.append(f"▸ 方向置信: {dir_cn} {_dir_conf.score:.0%} ({', '.join(aligned_names)})")
+
     lines.append("")
     lines.append(SECTION_SEP)
 
@@ -1939,6 +2079,8 @@ def format_us_playbook_message(
     if quote and quote.high_price > 0 and quote.low_price > 0:
         _intraday_range = (quote.high_price - quote.low_price) / quote.low_price * 100
     _spy_direction = _infer_market_direction(spy_result)
+    _rs = getattr(result, "relative_strength", None)
+    _decoupled = _rs.decoupled if _rs else False
     _plan_ctx = PlanContext(
         minutes_to_close=_min_left,
         rvol=r.rvol,
@@ -1946,6 +2088,8 @@ def format_us_playbook_message(
         intraday_range_pct=_intraday_range,
         option_action=recommendation.action if recommendation else "",
         market_direction=_spy_direction,
+        current_price=r.price,
+        decoupled_from_benchmark=_decoupled,
     )
 
     _intraday_levels = getattr(result, "intraday_levels", None)
@@ -1957,6 +2101,12 @@ def format_us_playbook_message(
     for plan in plans:
         for plan_line in _format_action_plan(plan):
             lines.append(plan_line)
+        lines.append("")
+
+    # ── Section 3b: 失效与切换 ──
+    invalidation = _invalidation_text(r.regime, _direction, vp)
+    if invalidation:
+        lines.append(f"🔄 <b>失效与切换</b>: {_esc(invalidation)}")
         lines.append("")
 
     lines.append(SECTION_SEP)
@@ -2000,6 +2150,22 @@ def format_us_playbook_message(
         space_parts.append(f"下方至{below[0][0]} {dn_pct:.1f}%")
     if space_parts:
         lines.append(f"▸ 空间: {' / '.join(space_parts)}")
+
+    # Relative strength vs SPY
+    if _rs and _rs.label and result.symbol not in ("SPY", "US.SPY"):
+        rs_parts = [f"vs SPY: {_rs.label}"]
+        if _rs.stock_return_pct != 0 or _rs.spy_return_pct != 0:
+            rs_parts.append(f"个股 {_rs.stock_return_pct:+.1f}% / SPY {_rs.spy_return_pct:+.1f}%")
+        if _rs.correlation != 0:
+            rs_parts.append(f"相关性 {_rs.correlation:.2f}")
+        lines.append(f"▸ 相对强度: {' | '.join(rs_parts)}")
+
+    # Remaining volatility estimate
+    if _plan_ctx.avg_daily_range_pct > 0 and _min_left > 0:
+        from src.common.action_plan import reachable_range_pct as _rrp
+        _remaining_vol = _rrp(_plan_ctx)
+        if _remaining_vol < float("inf"):
+            lines.append(f"▸ 预估剩余波动: {_remaining_vol:.1f}% (还剩 {_min_left}min)")
 
     # IV environment (compact)
     if option_market and option_market.atm_iv > 0 and option_market.avg_iv > 0:

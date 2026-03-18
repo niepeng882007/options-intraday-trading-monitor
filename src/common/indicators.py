@@ -5,6 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.common.types import RelativeStrength
+
 
 def calculate_vwap(bars: pd.DataFrame) -> float:
     """Calculate VWAP for today's bars.
@@ -105,3 +107,81 @@ def calculate_vwap_hold_duration(
             break
 
     return count, side
+
+
+def compute_relative_strength(
+    stock_bars: pd.DataFrame,
+    spy_bars: pd.DataFrame,
+    *,
+    correlation_window: int = 30,
+    decouple_threshold: float = 0.40,
+) -> RelativeStrength:
+    """Compute intraday relative strength of stock vs SPY.
+
+    Parameters
+    ----------
+    stock_bars, spy_bars : DataFrame with "Close" column (today's 1-min bars).
+    correlation_window : rolling window for correlation calc.
+    decouple_threshold : |correlation| below this → decoupled.
+
+    Returns
+    -------
+    RelativeStrength dataclass.
+    """
+    if stock_bars.empty or spy_bars.empty:
+        return RelativeStrength(label="数据不足")
+
+    stock_open = float(stock_bars["Close"].iloc[0])
+    spy_open = float(spy_bars["Close"].iloc[0])
+    if stock_open <= 0 or spy_open <= 0:
+        return RelativeStrength(label="数据不足")
+
+    stock_close = float(stock_bars["Close"].iloc[-1])
+    spy_close = float(spy_bars["Close"].iloc[-1])
+
+    stock_ret = (stock_close - stock_open) / stock_open * 100
+    spy_ret = (spy_close - spy_open) / spy_open * 100
+
+    # RS ratio: avoid div-by-zero
+    if abs(spy_ret) < 0.01:
+        rs_ratio = 1.0 + stock_ret / 100  # SPY flat → ratio ≈ 1 + stock move
+    else:
+        rs_ratio = stock_ret / spy_ret if spy_ret != 0 else 1.0
+
+    # Rolling correlation on returns
+    correlation = 0.0
+    min_len = min(len(stock_bars), len(spy_bars))
+    if min_len >= max(correlation_window, 10):
+        stock_returns = stock_bars["Close"].pct_change().dropna().iloc[-min_len + 1:]
+        spy_returns = spy_bars["Close"].pct_change().dropna().iloc[-min_len + 1:]
+        # Align lengths
+        align_len = min(len(stock_returns), len(spy_returns))
+        if align_len >= correlation_window:
+            s = stock_returns.iloc[-align_len:].values
+            b = spy_returns.iloc[-align_len:].values
+            # Use last correlation_window bars
+            s_win = s[-correlation_window:]
+            b_win = b[-correlation_window:]
+            if np.std(s_win) > 0 and np.std(b_win) > 0:
+                correlation = float(np.corrcoef(s_win, b_win)[0, 1])
+
+    decoupled = abs(correlation) < decouple_threshold
+
+    # Label
+    if decoupled:
+        label = "脱钩"
+    elif stock_ret > spy_ret + 0.1:
+        label = "强势"
+    elif stock_ret < spy_ret - 0.1:
+        label = "弱势"
+    else:
+        label = "同步"
+
+    return RelativeStrength(
+        rs_ratio=round(rs_ratio, 3),
+        stock_return_pct=round(stock_ret, 2),
+        spy_return_pct=round(spy_ret, 2),
+        correlation=round(correlation, 3),
+        decoupled=decoupled,
+        label=label,
+    )

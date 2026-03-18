@@ -208,6 +208,11 @@ wide_va:
   vwap_bands_min_bars: 15           # VWAP bands minimum bars (~15min)
   min_band_width_pct: 0.002         # bands min width (0.2%), below → None
 
+relative_strength:
+  enabled: true
+  correlation_window: 30           # rolling correlation window (bars)
+  decouple_threshold: 0.40         # |correlation| < this → "脱钩"
+
 trend_downgrade_confidence: 0.70  # wait + confidence < 此值 + TREND/GAP → 降级为 UNCLEAR plans
 
 hist_cache_ttl: 120  # VP/历史 K 线缓存 TTL（秒）

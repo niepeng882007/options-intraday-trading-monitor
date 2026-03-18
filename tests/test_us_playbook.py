@@ -6584,11 +6584,11 @@ class TestDirectionConsistency:
         if plan_b.direction in ("bullish", "bearish"):
             assert plan_b.direction == "bearish"
 
-    def test_enforce_strips_contradicting_entry(self):
-        """enforce_direction_consistency strips entry from opposing plan."""
+    def test_enforce_strips_contradicting_entry_plan_a(self):
+        """enforce_direction_consistency strips entry from opposing Plan A."""
         from src.common.action_plan import enforce_direction_consistency
         plan = ActionPlan(
-            label="B", name="轻仓做空", emoji="📉", is_primary=False,
+            label="A", name="趋势做空", emoji="📉", is_primary=True,
             logic="test", direction="bearish",
             trigger="test", entry=150.0, entry_action="做空",
             stop_loss=152.0, stop_loss_reason="above",
@@ -6598,6 +6598,21 @@ class TestDirectionConsistency:
         assert plans[0].entry is None
         assert plans[0].entry_action == ""
         assert "矛盾" in plans[0].warning
+
+    def test_enforce_exempts_hedge_plan_b(self):
+        """Plan B in opposite direction (hedge) is exempt from stripping."""
+        from src.common.action_plan import enforce_direction_consistency
+        plan = ActionPlan(
+            label="B", name="反向对冲做空", emoji="📉", is_primary=False,
+            logic="test", direction="bearish",
+            trigger="test", entry=150.0, entry_action="做空",
+            stop_loss=152.0, stop_loss_reason="above",
+            tp1=148.0, tp1_label="VAL", tp2=None, tp2_label="", rr_ratio=1.5,
+        )
+        plans = enforce_direction_consistency([plan], "TREND_STRONG", "bullish")
+        # Plan B hedge should NOT be stripped
+        assert plans[0].entry == 150.0
+        assert plans[0].warning == ""
 
     def test_enforce_plan_c_exempt(self):
         """Plan C is always exempt from direction consistency enforcement."""
@@ -7358,3 +7373,189 @@ class TestRegimeTransition7Types:
         assert transitioned is True
         assert new_regime.regime == USRegimeType.GAP_FILL
         assert new_regime.gap_fill_pct >= 50
+
+
+# ── Phase 7: Direction & Entry Refactoring Tests ──
+
+
+class TestDirectionConfidence:
+    """Test _compute_direction_confidence from playbook.py."""
+
+    def test_all_aligned_bullish(self):
+        from src.us_playbook.playbook import _compute_direction_confidence
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_STRONG, confidence=0.8,
+            rvol=1.5, price=102.0, gap_pct=0.5, vwap_slope=0.003,
+        )
+        vp = VolumeProfileResult(poc=100.0, vah=101.0, val=99.0)
+        kl = KeyLevels(poc=100, vah=101, val=99, pdh=101.5, pdl=98.5, pmh=101.0, pml=99.0, vwap=100.5)
+        result = _compute_direction_confidence(regime, vp, kl, "bullish")
+        assert result.direction == "bullish"
+        assert result.score > 0.5
+
+    def test_neutral_direction_zero_score(self):
+        from src.us_playbook.playbook import _compute_direction_confidence
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.3,
+            rvol=0.8, price=100.0, gap_pct=0.1,
+        )
+        vp = VolumeProfileResult(poc=100.0, vah=101.0, val=99.0)
+        kl = KeyLevels(poc=100, vah=101, val=99, pdh=101.5, pdl=98.5, pmh=101.0, pml=99.0, vwap=100.0)
+        result = _compute_direction_confidence(regime, vp, kl, "neutral")
+        assert result.direction == "neutral"
+        assert result.score == 0.0
+
+
+class TestRelativeStrength:
+    """Test compute_relative_strength from indicators."""
+
+    def test_outperforming_stock(self):
+        from src.common.indicators import compute_relative_strength
+        # Stock up 2%, SPY up 0.5%
+        dates = pd.date_range("2026-03-18 09:30", periods=60, freq="1min")
+        stock_bars = pd.DataFrame({
+            "Open": [100] * 60,
+            "High": [100 + i * 0.033 + 0.1 for i in range(60)],
+            "Low": [100 + i * 0.033 - 0.1 for i in range(60)],
+            "Close": [100 + i * 0.033 for i in range(60)],
+            "Volume": [1000] * 60,
+        }, index=dates)
+        spy_bars = pd.DataFrame({
+            "Open": [450] * 60,
+            "High": [450 + i * 0.0083 + 0.05 for i in range(60)],
+            "Low": [450 + i * 0.0083 - 0.05 for i in range(60)],
+            "Close": [450 + i * 0.0083 for i in range(60)],
+            "Volume": [10000] * 60,
+        }, index=dates)
+        rs = compute_relative_strength(stock_bars, spy_bars)
+        assert rs.stock_return_pct > rs.spy_return_pct
+        assert rs.label in ("强势", "同步")
+
+    def test_empty_bars(self):
+        from src.common.indicators import compute_relative_strength
+        empty = pd.DataFrame()
+        non_empty = pd.DataFrame({
+            "Open": [100], "High": [101], "Low": [99], "Close": [100], "Volume": [1000],
+        })
+        rs = compute_relative_strength(empty, non_empty)
+        assert rs.label == "数据不足"
+
+
+class TestPlanBHedgeStructure:
+    """Test that Plan B is now reverse direction (hedge) in trend/fade plans."""
+
+    def _vp(self):
+        return VolumeProfileResult(poc=252, vah=255, val=249)
+
+    def _kl(self):
+        return KeyLevels(poc=252, vah=255, val=249, pdh=257, pdl=248, pmh=254, pml=250.5, vwap=251.5)
+
+    def _gw(self):
+        return GammaWallResult(call_wall_strike=260, put_wall_strike=245, max_pain=252)
+
+    def test_trend_bullish_plan_b_is_bearish(self):
+        plans = _generate_action_plans(
+            USRegimeResult(regime=USRegimeType.TREND_STRONG, confidence=0.8, rvol=1.5, price=252, gap_pct=0.5),
+            "bullish", self._vp(), self._kl(), self._gw(), None,
+        )
+        plan_b = next(p for p in plans if p.label == "B")
+        assert plan_b.direction == "bearish"
+        assert "对冲" in plan_b.name or "反向" in plan_b.name
+
+    def test_trend_bearish_plan_b_is_bullish(self):
+        plans = _generate_action_plans(
+            USRegimeResult(regime=USRegimeType.TREND_STRONG, confidence=0.8, rvol=1.5, price=252, gap_pct=0.5),
+            "bearish", self._vp(), self._kl(), self._gw(), None,
+        )
+        plan_b = next(p for p in plans if p.label == "B")
+        assert plan_b.direction == "bullish"
+
+    def test_fade_bearish_plan_b_is_bullish(self):
+        plans = _generate_action_plans(
+            USRegimeResult(regime=USRegimeType.RANGE, confidence=0.7, rvol=0.8, price=254.5, gap_pct=0.1),
+            "bearish", self._vp(), self._kl(), self._gw(), None,
+        )
+        plan_b = next(p for p in plans if p.label == "B")
+        assert plan_b.direction == "bullish"
+
+    def test_fade_bullish_plan_b_is_bearish(self):
+        plans = _generate_action_plans(
+            USRegimeResult(regime=USRegimeType.RANGE, confidence=0.7, rvol=0.8, price=249.5, gap_pct=0.1),
+            "bullish", self._vp(), self._kl(), self._gw(), None,
+        )
+        plan_b = next(p for p in plans if p.label == "B")
+        assert plan_b.direction == "bearish"
+
+
+class TestInvalidationSection:
+    """Test that the formatted playbook includes '失效与切换' section."""
+
+    def test_trend_includes_invalidation(self):
+        regime = USRegimeResult(
+            regime=USRegimeType.TREND_STRONG, confidence=0.8,
+            rvol=1.5, price=260.0, gap_pct=0.5,
+        )
+        kl = KeyLevels(poc=255, vah=258, val=252, pdh=261, pdl=249, pmh=259, pml=253, vwap=256)
+        vp = VolumeProfileResult(poc=255, vah=258, val=252)
+        result = USPlaybookResult(
+            symbol="AAPL", name="Apple", regime=regime,
+            key_levels=kl, volume_profile=vp, gamma_wall=None,
+            filters=FilterResult(tradeable=True),
+            generated_at=datetime(2026, 3, 18, 10, 30, tzinfo=ZoneInfo("America/New_York")),
+            quote=QuoteSnapshot(symbol="AAPL", last_price=260.0, high_price=261.0, low_price=258.0),
+        )
+        msg = format_us_playbook_message(result)
+        assert "失效与切换" in msg
+
+    def test_unclear_includes_invalidation(self):
+        regime = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.3,
+            rvol=0.8, price=255.0, gap_pct=0.1,
+        )
+        kl = KeyLevels(poc=255, vah=258, val=252, pdh=261, pdl=249, pmh=259, pml=253, vwap=256)
+        vp = VolumeProfileResult(poc=255, vah=258, val=252)
+        result = USPlaybookResult(
+            symbol="SPY", name="S&P 500 ETF", regime=regime,
+            key_levels=kl, volume_profile=vp, gamma_wall=None,
+            filters=FilterResult(tradeable=True),
+            generated_at=datetime(2026, 3, 18, 10, 30, tzinfo=ZoneInfo("America/New_York")),
+            quote=QuoteSnapshot(symbol="SPY", last_price=255.0, high_price=256.0, low_price=254.0),
+        )
+        msg = format_us_playbook_message(result)
+        assert "失效与切换" in msg
+
+
+class TestEndToEndActionPlans:
+    """End-to-end test: _generate_action_plans produces valid three-plan structure."""
+
+    def _vp(self):
+        return VolumeProfileResult(poc=252, vah=255, val=249)
+
+    def _kl(self):
+        return KeyLevels(poc=252, vah=255, val=249, pdh=257, pdl=248, pmh=254, pml=250.5, vwap=251.5)
+
+    def test_all_regimes_produce_three_plans(self):
+        """Every regime type produces exactly 3 plans."""
+        for regime_type in [USRegimeType.TREND_STRONG, USRegimeType.RANGE, USRegimeType.UNCLEAR,
+                            USRegimeType.GAP_GO, USRegimeType.TREND_WEAK]:
+            regime = USRegimeResult(regime=regime_type, confidence=0.7, rvol=1.0, price=252, gap_pct=0.5)
+            plans = _generate_action_plans(regime, "bullish", self._vp(), self._kl(), None, None)
+            assert len(plans) == 3, f"{regime_type.name} produced {len(plans)} plans"
+            labels = [p.label for p in plans]
+            assert "A" in labels
+            assert "B" in labels
+            assert "C" in labels
+
+    def test_plan_a_primary(self):
+        regime = USRegimeResult(regime=USRegimeType.TREND_STRONG, confidence=0.8, rvol=1.5, price=252, gap_pct=0.5)
+        plans = _generate_action_plans(regime, "bullish", self._vp(), self._kl(), None, None)
+        plan_a = next(p for p in plans if p.label == "A")
+        assert plan_a.is_primary is True
+
+    def test_plan_b_is_hedge(self):
+        """Plan B should have opposite direction to Plan A (hedge)."""
+        regime = USRegimeResult(regime=USRegimeType.TREND_STRONG, confidence=0.8, rvol=1.5, price=252, gap_pct=0.5)
+        plans = _generate_action_plans(regime, "bullish", self._vp(), self._kl(), None, None)
+        plan_a = next(p for p in plans if p.label == "A")
+        plan_b = next(p for p in plans if p.label == "B")
+        assert plan_a.direction != plan_b.direction

@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from src.common.chart import ChartData, generate_chart_async
+from src.common.indicators import compute_relative_strength
 from src.common.types import FilterResult, GammaWallResult, OptionMarketSnapshot, OptionRecommendation, PlaybookResponse, QuoteSnapshot, VolumeProfileResult
 from src.common.gamma_wall import calculate_gamma_wall
 from src.us_playbook import (
@@ -463,6 +464,21 @@ class USPredictor:
             if last_raw.regime != regime.regime:
                 regime_volatile = True
 
+        # 13. Relative strength vs SPY
+        relative_strength = None
+        rs_cfg = cfg.get("relative_strength", {})
+        if rs_cfg.get("enabled", True) and symbol not in ("SPY", "US.SPY"):
+            spy_today = self._last_today_bars.get("US.SPY") if "US.SPY" in self._last_today_bars else self._last_today_bars.get("SPY")
+            if spy_today is not None and not spy_today.empty and not today.empty:
+                try:
+                    relative_strength = compute_relative_strength(
+                        today, spy_today,
+                        correlation_window=rs_cfg.get("correlation_window", 30),
+                        decouple_threshold=rs_cfg.get("decouple_threshold", 0.40),
+                    )
+                except Exception:
+                    logger.debug("Relative strength calc failed for %s", symbol)
+
         name = self.watchlist.get_name(symbol)
         result = USPlaybookResult(
             symbol=symbol,
@@ -481,6 +497,7 @@ class USPredictor:
             avg_daily_range_pct=rvol_profile.avg_daily_range_pct if rvol_profile else 0.0,
             regime_volatile=regime_volatile,
             intraday_levels=intraday_levels,
+            relative_strength=relative_strength,
         )
         self._last_playbooks[symbol] = result
         self._last_today_bars[symbol] = today

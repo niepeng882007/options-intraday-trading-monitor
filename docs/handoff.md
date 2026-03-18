@@ -1,67 +1,96 @@
-# US 日型判断引擎重构 (4 → 7+1) — 交接文档
+# 方向判断与入场计算重构 — 交接文档
 
 > 日期: 2026-03-18
+> 前序: US 日型判断引擎重构 (4 → 7+1) — 已合入 main
+
+---
 
 ## 本次完成了什么
 
-### 三个 Phase 全部落地
+### 7 个 Phase 全部落地
 
-16 个文件，+1444 / -545 行。517 测试通过（3 个预先存在的失败不受影响）。
+9 个文件修改，519 测试通过（+34 新增），0 新回归。
 
-#### Phase 1: 枚举 + family 迁移（零行为变更）
+#### Phase 1: 数据结构扩展
 
-| 旧枚举 | 新枚举 | family |
-|--------|--------|--------|
-| GAP_AND_GO | GAP_GO | TREND |
-| TREND_DAY | TREND_STRONG | TREND |
-| — | TREND_WEAK | TREND |
-| FADE_CHOP | RANGE | FADE |
-| — | NARROW_GRIND | FADE |
-| — | V_REVERSAL | REVERSAL |
-| — | GAP_FILL | REVERSAL |
-| UNCLEAR | UNCLEAR | UNCLEAR |
+| 文件 | 新增 |
+|------|------|
+| `src/common/types.py` | `DirectionConfidence` dataclass（方向 + score + 6 信号 map）、`RelativeStrength` dataclass（rs_ratio, correlation, decoupled, label） |
+| `src/common/action_plan.py` | `ActionPlan` +`reachability_tag`/`is_near_entry`；`PlanContext` +`current_price`/`decoupled_from_benchmark` |
+| `src/us_playbook/__init__.py` | `USPlaybookResult` +`relative_strength`/`direction_confidence` |
 
-- 新增 `RegimeFamily` 枚举，`USRegimeType.family` property
-- `USRegimeResult` 新增 6 个字段（`rvol_corrected`, `vwap_slope`, `vwap_hold_minutes`, `gap_fill_pct`, `reversal_confirmed`, `classified_at`）
-- 全量 caller 迁移：main.py / playbook.py / option_recommend.py / stabilizer.py / regime.py / backtest (evaluators + simulator + daily_bias_eval) / action_plan.py / tests
-- 旧枚举引用 grep 验证为 0
+#### Phase 2: 相对强度 (R4)
 
-#### Phase 2: 分类引擎升级
+- **`src/common/indicators.py`**: `compute_relative_strength(stock_bars, spy_bars)` — 日内回报对比、滚动 30-bar 相关性、脱钩判断（|corr| < 0.40）
+- **`src/us_playbook/main.py`**: pipeline 步骤 13 集成，跳过 SPY 自身
+- **`config/us_playbook_settings.yaml`**: `relative_strength` 配置块（enabled, correlation_window, decouple_threshold）
 
-- **TREND_STRONG vs TREND_WEAK 拆分**：RVOL 路径通过 VWAP hold duration（>60min）+ 高 RVOL 区分 → TREND_STRONG；结构路径/持续路径 → TREND_WEAK
-- **NARROW_GRIND 检测**：RVOL < 0.5 且日内 range < ADR × 50%
-- **RVOL 开盘校正**：`correct_rvol_open()` 在 09:30-09:45 窗口内用历史同时段 RVOL 中位数修正
-- **VWAP Hold Duration**：`calculate_vwap_hold_duration()` 从尾部计算连续 VWAP 同侧 bar 数
-- **配置扩展**：`config/us_playbook_settings.yaml` 新增 `rvol_correction` / `vwap_trend` / `unclear_timeout_minutes` / `trend_strong_rvol` / `narrow_grind_*`
+#### Phase 3: 方向置信度 (R1)
 
-#### Phase 3: 中场转换 + 差异化行为
+- **`src/us_playbook/playbook.py`**: `_compute_direction_confidence()` — 聚合 6 个信号（regime, vwap_position, vwap_slope, structure, market_tone, relative_strength）
+- Section 2 核心结论区显示 `▸ 方向置信: 做多 83% (regime, vwap_position, structure, ...)`
 
-- **V_REVERSAL 检测**：`_detect_v_reversal()` — 开盘单方向 >0.5% 后反转穿越 open，尾部确认 bar 趋势 + 量能
-- **GAP_FILL 检测**：`_detect_gap_fill()` — 缺口回补 >50%，RVOL 衰减
-- **`detect_regime_transition()` 扩展**：TREND family 现在可转 V_REVERSAL / GAP_FILL（不仅是 UNCLEAR/RANGE → TREND 升级）
-- **UNCLEAR 超时**：`RegimeStabilizer` 60 分钟后强制归类（有 lean → TREND_WEAK，RVOL <0.5 → NARROW_GRIND，兜底 → RANGE）
-- **Playbook 差异化**：8 种日型各有独立的结论文本、原因分析、ActionPlan 路由（TREND_WEAK 缩减仓位警告；NARROW_GRIND demote Plans A/B；V_REVERSAL/GAP_FILL 独立方案）
-- **Option 差异化**：NARROW_GRIND 直接 wait，V_REVERSAL 用 `lean` 反转方向
-- **Regime 历史追踪**：`USPredictor._regime_history` 记录 symbol 的日型变化时间线
-- **10 个新测试**：TestVReversalDetection (3) / TestGapFillDetection (2) / TestUnclearTimeout (3) / TestRegimeTransition7Types (2)
+#### Phase 4: 入场可达性 (R2)
+
+- **`check_entry_reachability()`**: 二元→三档（""=近端 / "远端" / "⛔不可达"=demote）
+  - 近端阈值: `reachable × 0.3`；远端: `≤ reachable`；不可达: `> reachable`
+- **`generate_near_entry_plan()`**: 在当前价 0.3% 内找结构位生成完整 Plan C（entry/SL/TP/RR）
+- **`ensure_near_entry_exists()`**: 无近端入场方案时自动注入，替换旧 Plan C
+- **`format_action_plan()`**: 支持 `reachability_tag` 渲染（📍远端）、近端 Plan C 完整渲染（非简化格式）
+- **`apply_min_rr_gate()`**: 有 entry 的 Plan C 参与 R:R 门控（F6）
+
+#### Phase 5a: Plan B 反向对冲
+
+所有 `_plans_*` 的 Plan B 从**同方向加仓**改为**反向对冲**:
+
+| 函数 | 旧 Plan B | 新 Plan B |
+|------|-----------|-----------|
+| `_plans_trend_bullish` | 突破加仓 (bullish) | 反向对冲做空 (bearish) |
+| `_plans_trend_bearish` | 破位加仓 (bearish) | 反向对冲做多 (bullish) |
+| `_plans_fade_bearish` | VWAP 回归做空 (bearish) | 反向对冲做多 (bullish) |
+| `_plans_fade_bullish` | VWAP 回归做多 (bullish) | 反向对冲做空 (bearish) |
+| `_build_wide_va_plans_bearish` | VWAP 回归做空 | 反向对冲做多 |
+| `_build_wide_va_plans_bullish` | VWAP 回归做多 | 反向对冲做空 |
+
+UNCLEAR plans 的 Plan B 保持不变（观察/均值回归/轻仓试探语义不变）。
+
+#### Phase 5b: 近端入场 + 失效 section
+
+- `_generate_action_plans()` 后处理链头部新增 `ensure_near_entry_exists`（在 cap/gate 之前，注入的 Plan C 经过完整检查）
+- 新增 `_invalidation_text()` + "🔄 失效与切换" section（从旧 Plan C 逻辑提取，按 regime family 生成失效条件文本）
+
+#### Phase 5c: 共享后处理适配
+
+- **`enforce_direction_consistency()`**: Plan B 豁免——反向对冲 Plan B 不再被 strip（F1）
+- **`apply_wait_coherence()`**: 对冲 Plan B 不被 suppress——观望时对冲反而更重要（F5）
+- **`apply_market_direction_warning()`**: `decoupled_from_benchmark=True` 时警告降级为 "脱钩, 权重降低"
+
+#### Phase 6: 集成显示
+
+- `PlanContext` 构造传入 `current_price` + `decoupled_from_benchmark`
+- Section 4 新增 `▸ 相对强度: vs SPY: 强势 | 个股 +1.2% / SPY +0.3% | 相关性 0.72`
+- Section 4 新增 `▸ 预估剩余波动: 1.2% (还剩 180min)`
+
+#### Phase 7: 测试 (34 新增)
+
+| 测试文件 | 新增类/用例数 | 覆盖内容 |
+|----------|---------------|----------|
+| `test_common_action_plan.py` | +15 | Plan C 完整渲染、reachability_tag、三档可达性、近端生成、近端注入/不注入、enforce 豁免、wait coherence 豁免、脱钩降级 |
+| `test_us_playbook.py` | +19 | 方向置信度、相对强度、Plan B 对冲结构（4 regime）、失效 section（trend/unclear）、端到端三方案结构 |
 
 ### 关键文件清单
 
 | 文件 | 改动性质 |
 |------|----------|
-| `src/us_playbook/__init__.py` | 枚举 + dataclass 扩展 |
-| `src/us_playbook/regime.py` | 核心分类 + V_REVERSAL/GAP_FILL 检测 + transition |
-| `src/us_playbook/main.py` | RVOL 校正集成 + regime 历史 + 新参数传递 |
-| `src/us_playbook/playbook.py` | 8 种日型差异化展示 |
-| `src/us_playbook/option_recommend.py` | NARROW_GRIND/V_REVERSAL 方向逻辑 |
-| `src/us_playbook/stabilizer.py` | UNCLEAR 超时 + 8 枚举 strength |
-| `src/us_playbook/indicators.py` | `correct_rvol_open()` |
-| `src/common/indicators.py` | `calculate_vwap_hold_duration()` |
-| `src/common/action_plan.py` | trend/fade 字符串集合更新 |
-| `config/us_playbook_settings.yaml` | 新配置节 |
-| `src/us_playbook/backtest/evaluators.py` | 新日型准确性标准 |
-| `src/us_playbook/backtest/simulator.py` | TREND_WEAK 模拟 + signal_type.rsplit bug fix |
-| `tests/test_us_playbook.py` | 枚举迁移 + 10 个新测试 |
+| `src/common/types.py` | +2 dataclass |
+| `src/common/indicators.py` | +`compute_relative_strength()` |
+| `src/common/action_plan.py` | dataclass 扩展 + 5 函数修改 + 2 函数新增 + 格式化适配 |
+| `src/us_playbook/__init__.py` | re-export + USPlaybookResult +2 字段 |
+| `src/us_playbook/playbook.py` | `_compute_direction_confidence()` + 6 个 `_plans_*` 重构 + `_invalidation_text()` + 显示集成 |
+| `src/us_playbook/main.py` | pipeline +relative_strength 集成 |
+| `config/us_playbook_settings.yaml` | +`relative_strength` 配置块 |
+| `tests/test_common_action_plan.py` | +15 测试 |
+| `tests/test_us_playbook.py` | +19 测试 |
 
 ---
 
@@ -73,58 +102,62 @@
 python -m src.us_playbook.backtest -d 20 -v
 ```
 
-运行 20 天回测，确认：
-- 新日型（TREND_WEAK, NARROW_GRIND）在输出中出现
+确认:
+- Plan B 对冲方案在回测 simulator 中的表现（当前 simulator 只跟 Plan A 入场，需要确认是否需要扩展 simulator 支持多 plan 评估）
+- 近端 Plan C 注入频率是否合理（过高说明 Plan A/B 入场位经常远离当前价）
 - 总体准确率 ≥ 旧系统
-- TREND_STRONG vs TREND_WEAK 分布是否合理（预期 TREND_WEAK 占多数）
-
-如果准确率下降，调节 `vwap_trend.hold_minutes_trend_bias`（当前 60min）和 `trend_strong_rvol`（当前 0 即用 gap_and_go_rvol 1.5）。
 
 ### 2. 实盘观察
 
-手动触发几个标的的 playbook（SPY、TSLA），在不同时段确认：
-- 09:35 查询 → RVOL 校正显示 `(⚠️ 开盘放大, 校正值 X.XX)`
-- VWAP 趋势显示 `▸ VWAP 趋势: 斜率 +X.XXXX%/bar | 单侧持续 Xmin`
-- 各日型 emoji + 中文名正确
-- NARROW_GRIND 触发观望
-- UNCLEAR 超过 60min 后切换为具体日型
+手动触发 playbook，确认:
+- `▸ 方向置信: 做多 67% (regime, vwap_position, structure)` 显示正常
+- `▸ 相对强度: vs SPY: 强势 | ...` 显示正常（SPY 自身不显示）
+- `🔄 失效与切换:` section 内容与 regime 一致
+- 📍远端 标签出现在合理位置
+- Plan B 名称显示"反向对冲做空/做多"
 
-### 3. 自动扫描信号类型映射
+### 3. HK 模块 Plan B 对齐（独立任务）
 
-`regime_to_signal_type()` 已更新，但 L1/L2 逻辑中的 `expected_regimes` 映射需要验证新类型是否正确路由：
-- TREND_WEAK 应触发 BREAKOUT 信号但用更高 confidence 门槛 — **当前未实现此差异化门槛**
-- V_REVERSAL 应触发 `REVERSAL_{dir}` 信号 — **当前仅通过 `detect_regime_transition()` 路径触发，未在 L1 screen 中覆盖**
+本次仅改 US，HK 的 Plan B 仍是同方向"突破加仓"。审查报告 F11 建议作为后续独立任务处理。需要评估 HK 模块是否也需要反向对冲语义。
 
 ### 4. Playbook 版本 diff
 
-计划中的 "每次更新标注与上一版的变化"（Step 3.4）— `_regime_history` 已存储数据，但 playbook 格式化中**尚未读取和展示** "vs 上一版" 字段。需要在 `format_us_playbook_message()` 中加入。
+审查报告提及的 "每次更新标注与上一版的变化"（模板 v2 要求）。`_regime_history` 已存储数据，但 playbook 格式化中尚未读取和展示 "vs 上一版" 字段。
 
-### 5. 相对强度 (个股 vs SPY)
+### 5. `direction_confidence` 回填到 USPlaybookResult
 
-计划中提到的 "个股 vs SPY 相关性，脱钩时降低大盘权重" — **未实现**。可作为后续独立 PR。
+当前 `_compute_direction_confidence()` 在格式化时计算并显示，但未回填到 `result.direction_confidence` 字段。如果 auto-scan 或其他下游需要用方向置信度做决策，需要在 `_run_analysis_pipeline()` 或 `format_us_playbook_message()` 中回填。
 
 ---
 
 ## 未解决的问题
 
+### 审查报告遗留
+
+1. **F11: HK 模块 Plan B 语义未同步**。HK 的 Plan B 仍是同方向加仓。模板 v2 是通用模板，两个市场 Plan B 含义不一致。声明为后续独立任务。
+
+2. **F12: 方向置信度 ≠ regime 置信度**。`regime.confidence = 0.65` 表示 regime 分类信心，`DirectionConfidence.score` 表示做多/做空信号对齐度。docstring 已区分，但 playbook 输出中两个百分比挨着显示，可能让用户混淆。考虑在 UI 中加注释或调整布局。
+
+3. **F13: HK `check_entry_proximity` 与近端 Plan C 潜在冲突**。HK 的 `check_entry_proximity` 会 demote entry < 0.5% 的方案。若 HK 未来采用近端 Plan C（entry 在 0.3% 以内），会冲突。当前无需操作。
+
+4. **F1 底层问题: HK `enforce_direction_consistency` 实际无效**。HK 传入的 regime name 是 `"GAP_AND_GO"` / `"TREND_DAY"`，不在默认 `trend_regimes = {"GAP_GO", "TREND_STRONG", "TREND_WEAK"}` 中，所以该函数对 HK 是死代码路径。本次 Plan B 豁免不影响 HK，但这是一个应记录的潜在 bug。
+
 ### 代码层面
 
-1. **3 个预先存在的测试失败**（与本次重构无关）：
+5. **预先存在的测试失败（与本次无关）**:
    - `test_build_telegram_application_wires_dual_requests` — 本地 proxy 配置导致 kwargs 不匹配
-   - `test_recommend_moderate_still_tradeable` / `test_recommend_none_shows_near_val` — expiry_dates 在测试环境中生成了已过期日期
+   - `TestFadeEntryStaleness::test_recommend_moderate_still_tradeable` — expiry_dates 环境问题
+   - `test_hk.py` 5 个失败 — HK 模块预存问题
+   - `test_collector_futu.py` 4 个失败 — Futu API mock 问题
 
-2. **`signal_type.rsplit` bug**：simulator.py 中旧的 `split("_")[0]` 已修复为 `rsplit("_", 1)[0]`，但 **by_regime 统计的历史数据可能需要清理**（如果存在持久化的 backtest 结果缓存）。
+6. **`direction_confidence` 未持久化**。仅在格式化时计算，不参与 auto-scan 决策。如需用于 L1/L2 screen，需提前计算并存入 `USPlaybookResult.direction_confidence`。
 
-3. **V_REVERSAL / GAP_FILL 在 backtest 中不可评分**：当前标记为 `scorable=False`，因为它们是中场转换不会出现在初始分类中。如需回测验证这两种转换的准确性，需要另建评估框架（在每天多个时间点采样 regime transition）。
+7. **`relative_strength` 依赖 SPY today_bars 缓存**。首次查询非 SPY 标的时，如果 SPY 尚未被查询（`_last_today_bars` 中无 SPY），相对强度为 None。正常使用流程中 SPY 通常先于个股被查询（作为 market context），但边缘情况下可能缺失。
 
-4. **RVOL 校正的历史数据依赖**：`correct_rvol_open()` 需要 ≥3 天历史 bars 才能计算中位数。首次运行或历史数据不足时不做校正，这是预期行为但可能让用户困惑。
+8. **近端 Plan C 可能与旧 Plan C 失效信息冲突**。`ensure_near_entry_exists` 替换旧 Plan C 时，旧 Plan C 的失效/切换逻辑（如"跌回 VA → 转 RANGE"）被丢弃。但新的"失效与切换" section 已独立生成此信息，所以不存在信息丢失——只是从 Plan C 迁移到了独立 section。
 
-### 设计层面
+### 性能层面
 
-5. **TREND_WEAK L1 门槛**：计划说 "L1 screen 用更高 confidence 门槛"，但当前 TREND_WEAK 用的是和 TREND_STRONG 相同的 `bo_min_conf`。需要决定是否为 TREND_WEAK 单独设一个更高的门槛（如 0.80 vs 0.70）。
+9. **`compute_relative_strength` 每次 pipeline 调用一次**。涉及 pct_change + corrcoef 计算，对 60-bar 数据开销极小（<1ms）。无需缓存。
 
-6. **NARROW_GRIND 不触发自动扫描**：这是设计决策（`regime_to_signal_type()` 返回 None），但也意味着如果市场从 NARROW_GRIND 突然转为趋势日，只能靠 `detect_regime_transition()` 路径捕获。
-
-7. **adaptive_thresholds key 保持旧名**：config keys `gap_and_go` / `trend_day` / `fade_chop` 与枚举名不一致。这是有意为之（避免 stabilizer 缓存失效），但长期可能造成混淆。
-
-8. **Playbook 中文文本硬编码**：`_plans_fade_bearish()` 等函数中仍有 `"转 TREND_STRONG"` 等硬编码字符串用于 Plan C 逻辑触发文本。已从 Phase 1 迁移为新枚举名，但理想方案是用 `REGIME_NAME_CN` 映射替代。
+10. **`_compute_direction_confidence` 在 format 中调用**。同一个 result 的 playbook 如果被多次格式化（如 auto-scan 重新渲染），会重复计算。开销极小，但如需优化可缓存到 `USPlaybookResult.direction_confidence`。

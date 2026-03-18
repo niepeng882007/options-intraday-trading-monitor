@@ -108,6 +108,26 @@ class PlaybookResponse:
 
 
 @dataclass
+class DirectionConfidence:
+    """Aggregated directional confidence from multiple signals."""
+    direction: str             # "bullish" / "bearish" / "neutral"
+    score: float               # 0.0 - 1.0
+    signals: dict[str, str] = field(default_factory=dict)
+    # e.g. {"regime": "bullish", "vwap_slope": "bullish", "structure": "neutral", ...}
+
+
+@dataclass
+class RelativeStrength:
+    """Individual stock relative strength vs benchmark (SPY)."""
+    rs_ratio: float = 0.0          # stock_return / spy_return (>1 = outperforming)
+    stock_return_pct: float = 0.0  # intraday return %
+    spy_return_pct: float = 0.0    # SPY intraday return %
+    correlation: float = 0.0       # rolling correlation (0-1)
+    decoupled: bool = False        # True when |correlation| < threshold
+    label: str = ""                # "强势" / "弱势" / "同步" / "脱钩"
+
+
+@dataclass
 class OptionMarketSnapshot:
     expiry: str | None = None
     contract_count: int = 0

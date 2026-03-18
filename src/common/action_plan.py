@@ -40,6 +40,8 @@ class ActionPlan:
     demote_reason: str = ""
     suppressed: bool = False       # 因 wait 信号被压制
     warning: str = ""              # 附加警告 (如 VWAP 偏离)
+    reachability_tag: str = ""     # "" / "远端" / "⛔不可达"
+    is_near_entry: bool = False    # True = 近端备选 (距当前价 < 0.3%)
 
 
 @dataclass
@@ -53,6 +55,8 @@ class PlanContext:
     option_action: str = ""             # "wait" / "call" / "put" / ...
     min_rr: float = 0.8
     market_direction: str = ""          # "bullish" / "bearish" / "" (unknown)
+    current_price: float = 0.0         # 当前价，用于近端入场计算
+    decoupled_from_benchmark: bool = False  # 个股脱钩大盘
 
 
 def calculate_rr(
@@ -129,11 +133,13 @@ def compact_option_line(option_rec: OptionRecommendation) -> str | None:
 def format_action_plan(plan: ActionPlan) -> list[str]:
     """Render a single ActionPlan to Telegram HTML lines."""
     tag = "首选" if plan.is_primary else "备选"
+    if plan.is_near_entry:
+        tag = "近端"
     lines = [f"{plan.emoji} <b>{plan.label}: {_esc(plan.name)}</b> ({tag})"]
     lines.append(f"逻辑: {_esc(plan.logic)}")
 
-    if plan.label == "C":
-        # Simplified format for invalidation plan
+    if plan.label == "C" and plan.entry is None:
+        # Simplified format for invalidation plan (no entry)
         lines.append(f"  条件: {_esc(plan.trigger)}")
         lines.append(f"  行动: {_esc(plan.logic)}")
         return lines
@@ -172,6 +178,8 @@ def format_action_plan(plan: ActionPlan) -> list[str]:
         lines.append(f"  TP2 (清仓): {plan.tp2:,.2f} ({plan.tp2_label})")
     if plan.rr_ratio > 0:
         lines.append(f"  R:R ≈ 1:{plan.rr_ratio:.1f}")
+    if plan.reachability_tag:
+        lines.append(f"  📍 {plan.reachability_tag}")
     if plan.option_line:
         lines.append(plan.option_line)
     if plan.demoted and plan.demote_reason:
@@ -289,12 +297,27 @@ def cap_tp2(
 def check_entry_reachability(
     plan: ActionPlan, current_price: float, ctx: PlanContext,
 ) -> ActionPlan:
-    """Demote plan if entry is beyond reachable range."""
+    """Tag plan reachability as "" / "远端" / "⛔不可达".
+
+    Three tiers:
+    - entry_dist <= 0.3% of reachable → "" (near, no tag)
+    - entry_dist <= reachable → "远端" (reachable but far)
+    - entry_dist > reachable → "⛔不可达" (demoted)
+    """
     if plan.entry is None or plan.label == "C":
+        return plan
+    if current_price <= 0:
         return plan
     entry_dist = abs(plan.entry - current_price) / current_price * 100
     reachable = reachable_range_pct(ctx)
-    if entry_dist > reachable:
+    near_threshold = reachable * 0.3  # 30% of reachable range
+
+    if entry_dist <= near_threshold:
+        plan.reachability_tag = ""
+    elif entry_dist <= reachable:
+        plan.reachability_tag = "远端"
+    else:
+        plan.reachability_tag = "⛔不可达"
         plan.demoted = True
         plan.demote_reason = (
             f"入场位距当前价 {entry_dist:.1f}%, "
@@ -303,17 +326,135 @@ def check_entry_reachability(
     return plan
 
 
+def generate_near_entry_plan(
+    current_price: float,
+    direction: str,
+    levels: dict[str, float],
+    option_line: str | None = None,
+) -> ActionPlan | None:
+    """Generate a near-entry Plan C using the closest structural level.
+
+    Entry is set to the nearest level within 0.3% of current_price on
+    the approach side (below for bullish, above for bearish).
+    Returns None if no suitable level exists.
+    """
+    near_pct = 0.003  # 0.3%
+    if current_price <= 0 or direction not in ("bullish", "bearish"):
+        return None
+
+    # Find nearest level on the entry side
+    side = "below" if direction == "bullish" else "above"
+    candidates = nearest_levels(current_price, side, levels, n=3)
+
+    entry_level = None
+    for name, val in candidates:
+        dist = abs(val - current_price) / current_price
+        if dist <= near_pct:
+            entry_level = (name, val)
+            break
+
+    if entry_level is None:
+        # No structural level nearby → use current price directly
+        entry_val = current_price
+        entry_label = "当前价"
+    else:
+        entry_val = entry_level[1]
+        entry_label = entry_level[0]
+
+    # TP: nearest level beyond entry
+    tp_side = "above" if direction == "bullish" else "below"
+    tp_candidates = nearest_levels(entry_val, tp_side, levels, n=2)
+    tp1 = tp_candidates[0] if tp_candidates else None
+    tp2 = tp_candidates[1] if len(tp_candidates) >= 2 else None
+
+    # SL: nearest level on the opposite side
+    sl_side = "below" if direction == "bullish" else "above"
+    sl_candidates = nearest_levels(entry_val, sl_side, levels, n=1)
+    sl = sl_candidates[0] if sl_candidates else None
+
+    entry_action = "做多" if direction == "bullish" else "做空"
+    emoji = "📈" if direction == "bullish" else "📉"
+
+    rr = calculate_rr(entry_val, sl[1] if sl else None, tp1[1] if tp1 else None)
+
+    plan = ActionPlan(
+        label="C", name=f"近端{entry_action}", emoji=emoji, is_primary=False,
+        logic=f"当前价附近 {entry_label} 直接入场",
+        direction=direction,
+        trigger=f"价格在 {entry_label} {entry_val:,.2f} 附近企稳",
+        entry=entry_val, entry_action=entry_action,
+        stop_loss=sl[1] if sl else None,
+        stop_loss_reason=sl[0] if sl else "最近支撑/阻力",
+        tp1=tp1[1] if tp1 else None,
+        tp1_label=tp1[0] if tp1 else "",
+        tp2=tp2[1] if tp2 else None,
+        tp2_label=tp2[0] if tp2 else "",
+        rr_ratio=rr,
+        option_line=option_line,
+        is_near_entry=True,
+    )
+    return plan
+
+
+def ensure_near_entry_exists(
+    plans: list[ActionPlan],
+    current_price: float,
+    direction: str,
+    levels: dict[str, float],
+    option_line: str | None = None,
+) -> list[ActionPlan]:
+    """If no plan has entry within 0.3% of current_price, replace Plan C with a near-entry plan."""
+    if current_price <= 0:
+        return plans
+
+    near_pct = 0.003
+    has_near = False
+    for p in plans:
+        if p.entry is not None and not p.demoted and not p.suppressed:
+            dist = abs(p.entry - current_price) / current_price
+            if dist <= near_pct:
+                has_near = True
+                break
+
+    if has_near:
+        return plans
+
+    near_plan = generate_near_entry_plan(current_price, direction, levels, option_line)
+    if near_plan is None:
+        return plans
+
+    # Replace Plan C (last plan) with near-entry plan
+    for i, p in enumerate(plans):
+        if p.label == "C":
+            plans[i] = near_plan
+            return plans
+
+    # No Plan C found — append
+    plans.append(near_plan)
+    return plans
+
+
 def apply_wait_coherence(
     plans: list[ActionPlan], ctx: PlanContext,
 ) -> list[ActionPlan]:
-    """When option_rec says 'wait', demote Plan A and suppress Plan B."""
+    """When option_rec says 'wait', demote Plan A and suppress Plan B.
+
+    F5: If Plan B is a hedge (different direction from Plan A), skip suppress —
+    hedging is more important during uncertain conditions.
+    """
     if ctx.option_action != "wait":
         return plans
+    plan_a_dir = ""
     for plan in plans:
-        if plan.label == "A" and plan.entry is not None:
-            plan.demoted = True
-            plan.demote_reason = "核心结论为观望, 边缘入场需额外确认"
+        if plan.label == "A":
+            plan_a_dir = plan.direction
+            if plan.entry is not None:
+                plan.demoted = True
+                plan.demote_reason = "核心结论为观望, 边缘入场需额外确认"
         elif plan.label == "B" and plan.entry is not None:
+            # Skip suppress if Plan B is a hedge (opposite direction)
+            if plan_a_dir and plan.direction != plan_a_dir:
+                continue
             plan.suppressed = True
             plan.demote_reason = "核心结论为观望, 中间区域入场暂缓"
     return plans
@@ -330,8 +471,10 @@ def apply_min_rr_gate(
     - tp1 is None → skip (UNCLEAR Plan B "轻仓试探" semantics)
     """
     for plan in plans:
-        if plan.label == "C" or plan.entry is None:
+        if plan.entry is None:
             continue
+        # Skip old-style Plan C (no entry) — already caught above.
+        # New Plan C with entry participates in R:R gate.
         if plan.rr_ratio == 0.0:
             if plan.tp1 is None:
                 continue  # UNCLEAR 轻仓试探, no TP → skip
@@ -584,6 +727,9 @@ def enforce_direction_consistency(
     for plan in plans:
         if plan.label == "C":
             continue
+        # F1: exempt Plan B when it's a hedge (opposite direction)
+        if plan.label == "B" and plan.direction != direction:
+            continue
         if plan.direction == opposite and plan.entry is not None:
             plan.entry = None
             plan.entry_action = ""
@@ -598,6 +744,7 @@ def apply_market_direction_warning(
     """Warn when plan direction conflicts with market (SPY) direction.
 
     Only warns — does not demote.  Skips when market_direction is empty or neutral.
+    When decoupled_from_benchmark is True, downgrades to informational note.
     """
     mkt = ctx.market_direction
     if not mkt or mkt == "neutral":
@@ -608,6 +755,9 @@ def apply_market_direction_warning(
         if plan.direction in ("bullish", "bearish") and plan.direction != mkt:
             mkt_cn = "偏多" if mkt == "bullish" else "偏空"
             dir_cn = "做多" if plan.direction == "bullish" else "做空"
-            w = f"大盘 {mkt_cn}, 个股 {dir_cn} 逆势, 注意风险"
+            if ctx.decoupled_from_benchmark:
+                w = f"大盘 {mkt_cn}, 个股 {dir_cn} 逆势 (个股脱钩, 权重降低)"
+            else:
+                w = f"大盘 {mkt_cn}, 个股 {dir_cn} 逆势, 注意风险"
             plan.warning = f"{plan.warning}; {w}" if plan.warning else w
     return plans

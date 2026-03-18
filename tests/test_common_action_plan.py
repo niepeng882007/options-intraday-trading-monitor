@@ -8,7 +8,10 @@ from src.common.action_plan import (
     calculate_rr,
     reachable_range_pct,
     compact_option_line,
+    enforce_direction_consistency,
+    ensure_near_entry_exists,
     format_action_plan,
+    generate_near_entry_plan,
     nearest_levels,
     find_fade_entry_zone,
     cap_tp2,
@@ -163,11 +166,26 @@ class TestApplyMinRRGate:
         result = apply_min_rr_gate(plans, ctx)
         assert result[0].demoted is False
 
-    def test_plan_c_skipped(self):
+    def test_plan_c_no_entry_skipped(self):
+        """Plan C without entry is skipped (old invalidation style)."""
+        plan = ActionPlan(
+            label="C", name="test", emoji="⚡", is_primary=False,
+            logic="test", direction="bearish", trigger="test",
+            entry=None, entry_action="",
+            stop_loss=None, stop_loss_reason="",
+            tp1=None, tp1_label="", tp2=None, tp2_label="",
+            rr_ratio=0.0,
+        )
+        ctx = PlanContext(min_rr=0.8)
+        result = apply_min_rr_gate([plan], ctx)
+        assert result[0].demoted is False
+
+    def test_plan_c_with_entry_participates(self):
+        """Plan C with entry (near-entry) participates in R:R gate."""
         plans = [self._plan("C", rr=0.3)]
         ctx = PlanContext(min_rr=0.8)
         result = apply_min_rr_gate(plans, ctx)
-        assert result[0].demoted is False
+        assert result[0].demoted is True
 
     def test_rr_zero_no_stop_loss(self):
         """rr=0, tp1 set, no stop_loss → demoted as uncontrollable risk."""
@@ -303,3 +321,218 @@ class TestFormatActionPlan:
         lines = format_action_plan(plan)
         assert any("条件" in l for l in lines)
         assert not any("R:R" in l for l in lines)
+
+    def test_plan_c_near_entry_full_render(self):
+        """Plan C with entry (near-entry) gets full rendering, not simplified."""
+        plan = ActionPlan(
+            label="C", name="近端做多", emoji="📈", is_primary=False,
+            logic="当前价附近直接入场", direction="bullish", trigger="价格企稳",
+            entry=100.0, entry_action="做多",
+            stop_loss=98.0, stop_loss_reason="VAL",
+            tp1=103.0, tp1_label="POC", tp2=105.0, tp2_label="VAH",
+            rr_ratio=1.5, is_near_entry=True,
+        )
+        lines = format_action_plan(plan)
+        assert any("近端" in l for l in lines)
+        assert any("100" in l for l in lines)
+        assert any("R:R" in l for l in lines)
+        # Should NOT have simplified "条件" / "行动" format
+        assert not any("条件" in l for l in lines)
+
+    def test_reachability_tag_rendered(self):
+        """reachability_tag appears in rendered output."""
+        plan = ActionPlan(
+            label="A", name="test", emoji="📈", is_primary=True,
+            logic="test", direction="bullish", trigger="test",
+            entry=100.0, entry_action="做多",
+            stop_loss=95.0, stop_loss_reason="test",
+            tp1=105.0, tp1_label="TP1", tp2=None, tp2_label="",
+            rr_ratio=2.0, reachability_tag="远端",
+        )
+        lines = format_action_plan(plan)
+        assert any("远端" in l for l in lines)
+
+
+class TestEnforceDirectionConsistency:
+    def _plan(self, label, direction="bullish", entry=100.0):
+        return ActionPlan(
+            label=label, name="test", emoji="📈", is_primary=(label == "A"),
+            logic="test", direction=direction, trigger="test",
+            entry=entry, entry_action="做多",
+            stop_loss=95.0, stop_loss_reason="test",
+            tp1=105.0, tp1_label="TP1", tp2=None, tp2_label="",
+            rr_ratio=2.0,
+        )
+
+    def test_strips_opposing_plan_a(self):
+        plan_a = self._plan("A", direction="bearish")
+        plans = enforce_direction_consistency([plan_a], "TREND_STRONG", "bullish")
+        assert plans[0].entry is None
+
+    def test_exempts_hedge_plan_b(self):
+        plan_b = self._plan("B", direction="bearish")
+        plans = enforce_direction_consistency([plan_b], "TREND_STRONG", "bullish")
+        assert plans[0].entry == 100.0  # unchanged
+
+    def test_exempts_plan_c(self):
+        plan_c = self._plan("C", direction="bearish")
+        plans = enforce_direction_consistency([plan_c], "TREND_STRONG", "bullish")
+        assert plans[0].entry == 100.0  # unchanged
+
+    def test_non_trend_regime_no_effect(self):
+        plan = self._plan("A", direction="bearish")
+        plans = enforce_direction_consistency([plan], "RANGE", "bullish")
+        assert plans[0].entry == 100.0
+
+    def test_same_direction_plan_b_not_exempt(self):
+        """Plan B with same direction as regime should still get stripped (not a hedge)."""
+        plan_b = self._plan("B", direction="bullish")
+        # This plan has same direction as regime, but the function checks for opposite direction
+        plans = enforce_direction_consistency([plan_b], "TREND_STRONG", "bullish")
+        # Same direction → should not be stripped
+        assert plans[0].entry == 100.0
+
+
+class TestApplyWaitCoherenceHedge:
+    def _plan(self, label, direction="bullish", entry=100.0):
+        return ActionPlan(
+            label=label, name="test", emoji="📈", is_primary=(label == "A"),
+            logic="test", direction=direction, trigger="test",
+            entry=entry, entry_action="做多",
+            stop_loss=95.0, stop_loss_reason="test",
+            tp1=105.0, tp1_label="TP1", tp2=None, tp2_label="",
+            rr_ratio=2.0,
+        )
+
+    def test_hedge_plan_b_not_suppressed(self):
+        """Plan B with opposite direction (hedge) should not be suppressed on wait."""
+        plan_a = self._plan("A", direction="bullish")
+        plan_b = self._plan("B", direction="bearish")  # hedge
+        ctx = PlanContext(option_action="wait")
+        result = apply_wait_coherence([plan_a, plan_b], ctx)
+        assert result[0].demoted is True  # Plan A still demoted
+        assert result[1].suppressed is False  # Hedge not suppressed
+
+    def test_same_direction_plan_b_suppressed(self):
+        """Plan B with same direction as A should be suppressed on wait."""
+        plan_a = self._plan("A", direction="bullish")
+        plan_b = self._plan("B", direction="bullish")  # same direction
+        ctx = PlanContext(option_action="wait")
+        result = apply_wait_coherence([plan_a, plan_b], ctx)
+        assert result[1].suppressed is True
+
+
+class TestCheckEntryReachabilityThreeTier:
+    def _plan(self, entry=100.0):
+        return ActionPlan(
+            label="A", name="test", emoji="📈", is_primary=True,
+            logic="test", direction="bullish", trigger="test",
+            entry=entry, entry_action="做多",
+            stop_loss=95.0, stop_loss_reason="test",
+            tp1=105.0, tp1_label="TP1", tp2=None, tp2_label="",
+            rr_ratio=2.0,
+        )
+
+    def test_near_entry_no_tag(self):
+        plan = self._plan(entry=100.1)
+        ctx = PlanContext(minutes_to_close=200, rvol=1.0, avg_daily_range_pct=2.0)
+        result = check_entry_reachability(plan, 100.0, ctx)
+        assert result.reachability_tag == ""
+        assert result.demoted is False
+
+    def test_far_entry_tagged(self):
+        plan = self._plan(entry=101.0)  # 1% away
+        ctx = PlanContext(minutes_to_close=200, rvol=1.0, avg_daily_range_pct=2.0)
+        result = check_entry_reachability(plan, 100.0, ctx)
+        assert result.reachability_tag == "远端"
+        assert result.demoted is False
+
+    def test_unreachable_demoted(self):
+        plan = self._plan(entry=110.0)  # 10% away — very far
+        ctx = PlanContext(minutes_to_close=30, rvol=0.5, avg_daily_range_pct=1.0)
+        result = check_entry_reachability(plan, 100.0, ctx)
+        assert result.reachability_tag == "⛔不可达"
+        assert result.demoted is True
+
+
+class TestGenerateNearEntryPlan:
+    def test_generates_plan(self):
+        levels = {"VAL": 99.5, "POC": 100.5, "VAH": 101.5}
+        plan = generate_near_entry_plan(100.0, "bullish", levels)
+        assert plan is not None
+        assert plan.label == "C"
+        assert plan.is_near_entry is True
+        assert plan.direction == "bullish"
+
+    def test_returns_none_neutral(self):
+        levels = {"VAL": 99.5, "POC": 100.5}
+        plan = generate_near_entry_plan(100.0, "neutral", levels)
+        assert plan is None
+
+    def test_returns_none_zero_price(self):
+        plan = generate_near_entry_plan(0.0, "bullish", {"VAL": 99.0})
+        assert plan is None
+
+
+class TestEnsureNearEntryExists:
+    def _plan(self, label, entry=100.0, direction="bullish"):
+        return ActionPlan(
+            label=label, name="test", emoji="📈", is_primary=(label == "A"),
+            logic="test", direction=direction, trigger="test",
+            entry=entry, entry_action="做多",
+            stop_loss=95.0, stop_loss_reason="test",
+            tp1=105.0, tp1_label="TP1", tp2=None, tp2_label="",
+            rr_ratio=2.0,
+        )
+
+    def test_no_injection_when_near_exists(self):
+        """Don't inject Plan C if an existing plan is near current price."""
+        plans = [self._plan("A", entry=100.1), self._plan("B"), self._plan("C", entry=None)]
+        levels = {"VAL": 99.5, "POC": 100.5}
+        result = ensure_near_entry_exists(plans, 100.0, "bullish", levels)
+        # Plan C should remain unchanged (old invalidation style)
+        plan_c = next(p for p in result if p.label == "C")
+        assert plan_c.is_near_entry is False
+
+    def test_injection_when_all_far(self):
+        """Inject near-entry Plan C when all entries are far from current price."""
+        plans = [self._plan("A", entry=95.0), self._plan("B", entry=92.0)]
+        plan_c = ActionPlan(
+            label="C", name="失效", emoji="⚡", is_primary=False,
+            logic="失效", direction="bearish", trigger="test",
+            entry=None, entry_action="",
+            stop_loss=None, stop_loss_reason="",
+            tp1=None, tp1_label="", tp2=None, tp2_label="",
+            rr_ratio=0.0,
+        )
+        plans.append(plan_c)
+        levels = {"VAL": 99.5, "POC": 100.5, "VAH": 101.5}
+        result = ensure_near_entry_exists(plans, 100.0, "bullish", levels)
+        plan_c_new = next(p for p in result if p.label == "C")
+        assert plan_c_new.is_near_entry is True
+        assert plan_c_new.entry is not None
+
+
+class TestApplyMarketDirectionDecoupled:
+    def _plan(self, direction="bullish"):
+        return ActionPlan(
+            label="A", name="test", emoji="📈", is_primary=True,
+            logic="test", direction=direction, trigger="test",
+            entry=100.0, entry_action="做多",
+            stop_loss=95.0, stop_loss_reason="test",
+            tp1=105.0, tp1_label="TP1", tp2=None, tp2_label="",
+            rr_ratio=2.0,
+        )
+
+    def test_decoupled_warning_softened(self):
+        plans = [self._plan("bullish")]
+        ctx = PlanContext(market_direction="bearish", decoupled_from_benchmark=True)
+        result = apply_market_direction_warning(plans, ctx)
+        assert "脱钩" in result[0].warning
+        assert "权重降低" in result[0].warning
+
+    def test_coupled_warning_normal(self):
+        plans = [self._plan("bullish")]
+        ctx = PlanContext(market_direction="bearish", decoupled_from_benchmark=False)
+        result = apply_market_direction_warning(plans, ctx)
+        assert "注意风险" in result[0].warning
