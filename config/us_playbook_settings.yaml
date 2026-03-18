@@ -19,9 +19,14 @@ rvol:
   lookback_days: 10
 
 regime:
-  gap_and_go_rvol: 1.5        # static fallback
+  gap_and_go_rvol: 1.5        # static fallback (config key preserved for stabilizer compat)
   trend_day_rvol: 1.2
   fade_chop_rvol: 1.0
+  # Phase 2: new regime thresholds
+  trend_strong_rvol: 1.5        # VWAP hold > 60min + this RVOL → TREND_STRONG (0 = use gap_and_go_rvol)
+  trend_weak_min_rvol: 1.0
+  narrow_grind_rvol: 0.5
+  narrow_grind_adr_ratio: 0.5
   market_context_symbols: [SPY, QQQ]
   adaptive:
     enabled: true
@@ -31,6 +36,15 @@ regime:
     min_sample_days: 5
     min_trend_day_floor: 1.0
     gap_significance_threshold: 0.3
+  rvol_correction:
+    enabled: true
+    window_start: "09:30"
+    window_end: "09:45"
+  vwap_trend:
+    slope_lookback_bars: 30
+    hold_minutes_trend_bias: 60
+    crossing_count_range: 3
+  unclear_timeout_minutes: 60
   stability:
     rvol_hysteresis: 0.10               # L1 RVOL threshold 偏移比例
     cross_family_cooldown_minutes: 15   # TREND↔FADE family alert 最小间隔

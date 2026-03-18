@@ -2,9 +2,9 @@
 
 Adapted from src/hk/option_recommend.py for US market:
 - DTE filtering: skip 0DTE, prefer 2-7 DTE (weekly)
-- Direction: GAP_AND_GO/TREND_DAY → directional, FADE_CHOP → mean reversion
+- Direction: TREND family → directional, FADE family → mean reversion
 - Chase risk: ET timezone, tighter afternoon thresholds
-- Spread: FADE_CHOP regime → vertical spreads
+- Spread: RANGE regime → vertical spreads
 - Greeks: graceful degradation when LV1 returns None
 """
 
@@ -35,7 +35,7 @@ from src.common.types import (
     SpreadMetrics,
     VolumeProfileResult,
 )
-from src.us_playbook import USRegimeResult, USRegimeType
+from src.us_playbook import RegimeFamily, USRegimeResult, USRegimeType
 from src.utils.logger import setup_logger
 
 logger = setup_logger("us_option_rec")
@@ -188,13 +188,13 @@ def _decide_direction(
 ) -> str:
     """Decide bullish / bearish / neutral based on US regime + price position.
 
-    For GAP_AND_GO / TREND_DAY:
+    For TREND family (GAP_GO / TREND_STRONG / TREND_WEAK):
     - Extreme structure override: >=2 of (PDL/VWAP/PML) below → forced bearish;
       >=2 of (PDH/VWAP/PMH) above → forced bullish.
     - VWAP contradiction veto: price > VAH but < VWAP → neutral (and vice versa).
     - POC=0 fallback: use VWAP instead of hardcoded bullish.
 
-    For FADE_CHOP, uses VA three-zone logic with momentum confirmation:
+    For FADE family (RANGE / NARROW_GRIND), uses VA three-zone logic with momentum confirmation:
     - Edge zone (position_ratio >= 0.70 or <= 0.30): gives direction;
       momentum=0 passes, opposing momentum → neutral.
     - Transition zone (0.30 < ratio < 0.70): requires momentum confirmation;
@@ -203,7 +203,7 @@ def _decide_direction(
     """
     price = regime.price
 
-    if regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+    if regime.regime.family == RegimeFamily.TREND:
         # Extreme structure override (>=2 structural levels aligned)
         bearish_count = sum([
             pdl > 0 and price < pdl,
@@ -238,7 +238,7 @@ def _decide_direction(
             return "neutral"
         return "bullish" if price > vp.poc else "bearish"
 
-    if regime.regime == USRegimeType.FADE_CHOP:
+    if regime.regime.family == RegimeFamily.FADE:
         va_range = vp.vah - vp.val
         if va_range <= 0:
             return "neutral"
@@ -268,7 +268,7 @@ def _decide_direction(
                 if momentum == 1:
                     fade_dir = "bullish"
 
-        # VWAP veto for FADE_CHOP
+        # VWAP veto for FADE family
         if vwap > 0 and fade_dir != "neutral":
             if fade_dir == "bullish" and vwap < vp.val:
                 fade_dir = "neutral"
@@ -276,6 +276,16 @@ def _decide_direction(
                 fade_dir = "neutral"
 
         return fade_dir
+
+    # V_REVERSAL: use lean (post-reversal direction)
+    if regime.regime == USRegimeType.V_REVERSAL:
+        if hasattr(regime, "lean") and regime.lean != "neutral":
+            return regime.lean
+        return "neutral"
+
+    # NARROW_GRIND: no directional edge
+    if regime.regime == USRegimeType.NARROW_GRIND:
+        return "neutral"
 
     # UNCLEAR: use lean hint if available (P0-3)
     if regime.regime == USRegimeType.UNCLEAR and hasattr(regime, "lean") and regime.lean != "neutral":
@@ -295,7 +305,7 @@ def _check_fade_entry_staleness(
 ) -> tuple[str, float]:
     """Check how far price has penetrated into the VA from the entry edge.
 
-    For FADE_CHOP mean-reversion trades:
+    For RANGE/FADE mean-reversion trades:
     - Bullish: entry edge = VAL, penetration = (price - VAL) / (VAH - VAL)
     - Bearish: entry edge = VAH, penetration = (VAH - price) / (VAH - VAL)
 
@@ -337,14 +347,14 @@ def should_wait(
     conditions: list[str] = []
 
     if not filters.tradeable:
-        # Soft blocks can be overridden by confident FADE_CHOP
+        # Soft blocks can be overridden by confident RANGE
         soft_reasons = {"inside_day_rvol", "opex_combo"}
         soft_only = (
             filters.block_reasons
             and all(r in soft_reasons for r in filters.block_reasons)
         )
-        if soft_only and regime.regime == USRegimeType.FADE_CHOP and regime.confidence >= 0.7:
-            # FADE_CHOP 覆盖软阻断：低波动震荡正是均值回归的理想条件
+        if soft_only and regime.regime == USRegimeType.RANGE and regime.confidence >= 0.7:
+            # RANGE 覆盖软阻断：低波动震荡正是均值回归的理想条件
             # 修正 filters 状态，使风险区显示与推荐一致（🟡 而非 🔴）
             filters.tradeable = True
             filters.risk_level = "elevated"
@@ -358,8 +368,8 @@ def should_wait(
         reasons.append(f"Regime UNCLEAR, 置信度仅 {regime.confidence:.0%}")
         conditions.append("等待 Regime 明确后再入场")
 
-    # RVOL absolute floor — skip for FADE_CHOP (low vol is expected in chop)
-    if regime.rvol < 0.5 and regime.regime != USRegimeType.FADE_CHOP:
+    # RVOL absolute floor — skip for RANGE (low vol is expected in chop)
+    if regime.rvol < 0.5 and regime.regime not in (USRegimeType.RANGE, USRegimeType.NARROW_GRIND):
         reasons.append(f"RVOL {regime.rvol:.2f} 极低, 量能不足")
         conditions.append("RVOL 回升至 0.8 以上")
 
@@ -370,7 +380,7 @@ def should_wait(
     # Price too close to POC — no edge
     if vp.poc > 0 and regime.price > 0:
         dist_to_poc = abs(regime.price - vp.poc) / vp.poc
-        if dist_to_poc < 0.003 and regime.regime != USRegimeType.GAP_AND_GO:
+        if dist_to_poc < 0.003 and regime.regime != USRegimeType.GAP_GO:
             reasons.append(f"价格距 POC 仅 {dist_to_poc:.1%}, 无方向性优势")
             conditions.append(f"价格突破 VAH {vp.vah:,.2f} 或跌破 VAL {vp.val:,.2f}")
 
@@ -415,9 +425,9 @@ def recommend(
     has_expiry = bool(expiry_dates)
     cfg = option_cfg or {}
 
-    # Compute intraday momentum for FADE_CHOP direction decision
+    # Compute intraday momentum for RANGE direction decision
     momentum = 0
-    if regime.regime == USRegimeType.FADE_CHOP and today_bars is not None and not today_bars.empty:
+    if regime.regime == USRegimeType.RANGE and today_bars is not None and not today_bars.empty:
         cr_cfg = chase_risk_cfg or {}
         momentum = _compute_fade_momentum(
             today_bars,
@@ -426,7 +436,7 @@ def recommend(
         )
 
     # P2-1: VA width minimum check (before direction decision)
-    if regime.regime == USRegimeType.FADE_CHOP:
+    if regime.regime == USRegimeType.RANGE:
         cr_cfg = chase_risk_cfg or {}
         va_width_pct = (vp.vah - vp.val) / regime.price * 100 if regime.price > 0 else 0
         min_va_width = cr_cfg.get("min_va_width_pct", 0.80)
@@ -444,8 +454,17 @@ def recommend(
         vwap=vwap, pdl=pdl, pdh=pdh, pml=pml, pmh=pmh,
     )
 
-    # P0-1: Local trend veto for FADE_CHOP — structural rejection
-    if regime.regime == USRegimeType.FADE_CHOP and direction != "neutral":
+    # NARROW_GRIND: always wait
+    if regime.regime == USRegimeType.NARROW_GRIND:
+        return OptionRecommendation(
+            action="wait", direction="neutral",
+            rationale="窄幅盘整日, 波动率极低, 不适合期权交易",
+            risk_note=f"RVOL {regime.rvol:.2f}, 日内波幅过小",
+            wait_conditions=["等待波动率回升或方向性突破"],
+        )
+
+    # P0-1: Local trend veto for RANGE — structural rejection
+    if regime.regime == USRegimeType.RANGE and direction != "neutral":
         cr_cfg = chase_risk_cfg or {}
         local_trend = compute_local_trend(
             today_bars if today_bars is not None else pd.DataFrame(),
@@ -482,25 +501,25 @@ def recommend(
         )
 
     if direction == "neutral":
-        # FADE_CHOP neutral — VA edge semantics (no momentum conflict)
-        if regime.regime == USRegimeType.FADE_CHOP and momentum == 0:
+        # RANGE neutral — VA edge semantics (no momentum conflict)
+        if regime.regime == USRegimeType.RANGE and momentum == 0:
             return OptionRecommendation(
                 action="wait", direction="neutral",
                 rationale="震荡日方向不明, 等待 VA 边缘机会",
                 risk_note="价格在 VA 中部, 无明确方向",
                 wait_conditions=["等待价格接近 VA 边缘(VAH/VAL)再入场"],
             )
-        # Momentum conflict explanation for FADE_CHOP
-        if regime.regime == USRegimeType.FADE_CHOP and momentum != 0:
+        # Momentum conflict explanation for RANGE
+        if regime.regime == USRegimeType.RANGE and momentum != 0:
             momentum_label = "上涨" if momentum == 1 else "下跌"
             return OptionRecommendation(
                 action="wait",
                 direction="neutral",
                 rationale=f"震荡日但日内动量偏{momentum_label}, 方向矛盾, 建议观望",
-                risk_note=f"FADE_CHOP 均值回归方向与短期动量({momentum_label})冲突, 入场胜率下降",
+                risk_note=f"RANGE 均值回归方向与短期动量({momentum_label})冲突, 入场胜率下降",
                 wait_conditions=[
                     "等待动量衰减后价格回到 VA 边缘再入场",
-                    f"或等待价格确认{momentum_label}趋势后切换到 TREND_DAY 策略",
+                    f"或等待价格确认{momentum_label}趋势后切换到 TREND_STRONG 策略",
                 ],
             )
         return OptionRecommendation(
@@ -511,10 +530,10 @@ def recommend(
             wait_conditions=["等待价格突破关键位后再入场"],
         )
 
-    # Fade entry staleness check — only for FADE_CHOP mean-reversion
+    # Fade entry staleness check — only for RANGE mean-reversion
     fade_stale_level = "none"
     fade_penetration = 0.0
-    if regime.regime == USRegimeType.FADE_CHOP:
+    if regime.regime == USRegimeType.RANGE:
         cr_cfg = chase_risk_cfg or {}
         fade_stale_level, fade_penetration = _check_fade_entry_staleness(
             price, vp, direction,
@@ -576,12 +595,12 @@ def recommend(
         if chase_risk.level == "moderate":
             prefer_atm = True
 
-    # P1-1: FADE_CHOP option parameter override (longer DTE, prefer ATM, wider delta)
+    # P1-1: RANGE option parameter override (longer DTE, prefer ATM, wider delta)
     dte_min = cfg.get("dte_min", 1)
     dte_preferred_max = cfg.get("dte_preferred_max", 7)
     delta_min = cfg.get("delta_min", 0.30)
     delta_max = cfg.get("delta_max", 0.50)
-    if regime.regime == USRegimeType.FADE_CHOP:
+    if regime.regime == USRegimeType.RANGE:
         rr_cfg = cfg.get("range_reversal", {})
         if rr_cfg:
             dte_min = rr_cfg.get("dte_min", dte_min)
@@ -637,8 +656,8 @@ def recommend(
         and (chain_df["delta"].abs() > 0).any()
     )
 
-    # Try spread for FADE_CHOP regime (skip if DTE <= 3)
-    if regime.regime == USRegimeType.FADE_CHOP and dte > 3:
+    # Try spread for RANGE regime (skip if DTE <= 3)
+    if regime.regime == USRegimeType.RANGE and dte > 3:
         spread_legs = recommend_spread(direction, chain_df, price, expiry, min_oi=min_oi)
         if spread_legs:
             spread_action = "bull_put_spread" if direction == "bullish" else "bear_call_spread"
@@ -657,7 +676,7 @@ def recommend(
                     dte=dte,
                 )
 
-    # Single leg (delta_min/delta_max already set above, with FADE_CHOP override)
+    # Single leg (delta_min/delta_max already set above, with RANGE override)
     leg = recommend_single_leg(
         direction, chain_df, price, expiry,
         prefer_atm=prefer_atm,
@@ -701,20 +720,24 @@ def _build_rationale(
 ) -> str:
     parts = []
     regime_names = {
-        USRegimeType.GAP_AND_GO: "缺口追击",
-        USRegimeType.TREND_DAY: "趋势日",
-        USRegimeType.FADE_CHOP: "震荡日",
+        USRegimeType.GAP_GO: "缺口追击",
+        USRegimeType.TREND_STRONG: "强趋势日",
+        USRegimeType.TREND_WEAK: "弱趋势日",
+        USRegimeType.RANGE: "震荡日",
+        USRegimeType.V_REVERSAL: "V型反转",
+        USRegimeType.GAP_FILL: "缺口回补",
+        USRegimeType.NARROW_GRIND: "窄幅盘整",
         USRegimeType.UNCLEAR: "不明确",
     }
     parts.append(f"Regime: {regime_names.get(regime.regime, '未知')}")
 
-    if regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+    if regime.regime.family == RegimeFamily.TREND:
         if direction == "bullish":
             parts.append(f"价格 {regime.price:,.2f} 突破 VAH {vp.vah:,.2f}")
         else:
             parts.append(f"价格 {regime.price:,.2f} 跌破 VAL {vp.val:,.2f}")
         parts.append(f"RVOL {regime.rvol:.2f} 量能配合")
-    elif regime.regime == USRegimeType.FADE_CHOP:
+    elif regime.regime.family == RegimeFamily.FADE:
         edge_label = f"VAL {vp.val:,.2f}" if direction == "bullish" else f"VAH {vp.vah:,.2f}"
         action_label = "低吸机会" if direction == "bullish" else "高抛机会"
         if fade_penetration >= 0.35:
@@ -741,10 +764,10 @@ def _build_risk_note(
     fade_stale_level: str = "none",
 ) -> str:
     parts = []
-    if regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+    if regime.regime.family == RegimeFamily.TREND:
         parts.append("防守线: VWAP, 跌破建议止损")
         parts.append("失效条件: RVOL 回落至 1.0 以下")
-    elif regime.regime == USRegimeType.FADE_CHOP:
+    elif regime.regime.family == RegimeFamily.FADE:
         parts.append("失效条件: 带量突破 VA 边界")
 
     if dte > 0:

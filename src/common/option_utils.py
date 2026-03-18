@@ -305,10 +305,11 @@ def assess_chase_risk(
         return ChaseRiskResult()
 
     # Trend regimes: VA distance is expected (price breaks away from VA), don't flag as chase
-    if regime in ("GAP_AND_GO", "TREND_DAY"):
+    _regime_upper = regime.upper() if regime else ""
+    if _regime_upper in ("GAP_GO", "GAP_AND_GO", "TREND_STRONG", "TREND_WEAK", "TREND_DAY"):
         va_moderate_pct = 99.0  # effectively disabled
         va_high_pct = 99.0
-        # GAP_AND_GO early session VWAP ≈ open price, allow more deviation
+        # GAP_GO early session VWAP ≈ open price, allow more deviation
         vwap_high_pct += 1.0
 
     # Tighten thresholds based on time remaining

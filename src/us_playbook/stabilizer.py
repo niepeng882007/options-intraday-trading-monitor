@@ -1,6 +1,6 @@
 """Regime Stabilizer — debounce regime oscillations for auto-scan L1.
 
-Prevents noisy TREND_DAY ↔ FADE_CHOP flips when RVOL is near thresholds.
+Prevents noisy TREND_STRONG ↔ RANGE flips when RVOL is near thresholds.
 Only used in L1 scan path; on-demand and L2 use raw regime classification.
 """
 
@@ -10,7 +10,7 @@ import time
 from copy import copy
 from dataclasses import dataclass
 
-from src.us_playbook import USRegimeResult, USRegimeType
+from src.us_playbook import RegimeFamily, USRegimeResult, USRegimeType
 from src.utils.logger import setup_logger
 
 logger = setup_logger("regime_stabilizer")
@@ -18,9 +18,13 @@ logger = setup_logger("regime_stabilizer")
 # Regime strength ordering for upgrade/downgrade detection
 _REGIME_STRENGTH: dict[USRegimeType, int] = {
     USRegimeType.UNCLEAR: 0,
-    USRegimeType.FADE_CHOP: 1,
-    USRegimeType.TREND_DAY: 2,
-    USRegimeType.GAP_AND_GO: 3,
+    USRegimeType.NARROW_GRIND: 1,
+    USRegimeType.RANGE: 1,
+    USRegimeType.TREND_WEAK: 2,
+    USRegimeType.TREND_STRONG: 2,
+    USRegimeType.GAP_GO: 3,
+    USRegimeType.V_REVERSAL: 2,
+    USRegimeType.GAP_FILL: 1,
 }
 
 
@@ -45,6 +49,7 @@ class RegimeStabilizer:
         self._hold_downgrade_min = cfg.get("hold_downgrade_minutes", 30)
         self._hold_from_unclear_min = cfg.get("hold_from_unclear_minutes", 10)
         self._bypass_delta = cfg.get("bypass_confidence_delta", 0.20)
+        self._unclear_timeout_min = cfg.get("unclear_timeout_minutes", 60)
         self._state: dict[str, _Entry] = {}
 
     def stabilize(self, symbol: str, raw: USRegimeResult) -> USRegimeResult:
@@ -67,6 +72,25 @@ class RegimeStabilizer:
 
         # Same regime — refresh price/rvol, reset timer
         if raw.regime == prev.regime:
+            # UNCLEAR timeout: force reclassify after extended unclear period
+            if (
+                raw.regime == USRegimeType.UNCLEAR
+                and self._unclear_timeout_min > 0
+            ):
+                elapsed_min = (now - entry.accepted_at) / 60.0
+                if elapsed_min >= self._unclear_timeout_min:
+                    forced = self._force_reclassify(raw)
+                    if forced is not None:
+                        logger.info(
+                            "UNCLEAR timeout %s: %.0fmin >= %dmin, forced → %s",
+                            symbol, elapsed_min, self._unclear_timeout_min,
+                            forced.regime.value,
+                        )
+                        self._state[symbol] = _Entry(regime=forced, accepted_at=now)
+                        return forced
+                # Don't reset accepted_at for UNCLEAR — preserve original timestamp
+                entry.regime = raw
+                return raw
             entry.regime = raw
             entry.accepted_at = now
             return raw
@@ -128,8 +152,8 @@ class RegimeStabilizer:
 
         # TREND/GAP → FADE: RVOL must drop below trend_th - hysteresis
         if (
-            prev.regime in (USRegimeType.TREND_DAY, USRegimeType.GAP_AND_GO)
-            and raw.regime == USRegimeType.FADE_CHOP
+            prev.regime.family == RegimeFamily.TREND
+            and raw.regime.family == RegimeFamily.FADE
         ):
             threshold = trend_th - hysteresis
             if raw.rvol >= threshold:
@@ -141,8 +165,8 @@ class RegimeStabilizer:
 
         # FADE → TREND/GAP: RVOL must rise above trend_th + hysteresis
         if (
-            prev.regime == USRegimeType.FADE_CHOP
-            and raw.regime in (USRegimeType.TREND_DAY, USRegimeType.GAP_AND_GO)
+            prev.regime.family == RegimeFamily.FADE
+            and raw.regime.family == RegimeFamily.TREND
         ):
             threshold = trend_th + hysteresis
             if raw.rvol < threshold:
@@ -165,6 +189,35 @@ class RegimeStabilizer:
         if new_strength > prev_strength:
             return self._hold_upgrade_min
         return self._hold_downgrade_min
+
+    def _force_reclassify(self, raw: USRegimeResult) -> USRegimeResult | None:
+        """Force-reclassify an UNCLEAR regime after timeout.
+
+        Heuristic priority:
+        1. If lean is bullish/bearish → TREND_WEAK with that lean
+        2. If RVOL < 0.5 → NARROW_GRIND
+        3. Default → RANGE
+        """
+        if raw.regime != USRegimeType.UNCLEAR:
+            return None
+
+        forced = copy(raw)
+        forced.stabilized = True
+
+        if raw.lean in ("bullish", "bearish") and raw.confidence >= 0.30:
+            forced.regime = USRegimeType.TREND_WEAK
+            forced.confidence = max(0.35, raw.confidence)
+            forced.details = f"UNCLEAR timeout → TREND_WEAK ({raw.lean}); {raw.details}"
+        elif raw.rvol < 0.5:
+            forced.regime = USRegimeType.NARROW_GRIND
+            forced.confidence = 0.40
+            forced.details = f"UNCLEAR timeout → NARROW_GRIND (RVOL {raw.rvol:.2f}); {raw.details}"
+        else:
+            forced.regime = USRegimeType.RANGE
+            forced.confidence = 0.40
+            forced.details = f"UNCLEAR timeout → RANGE; {raw.details}"
+
+        return forced
 
     @staticmethod
     def _hold(entry: _Entry, raw: USRegimeResult, symbol: str) -> USRegimeResult:

@@ -251,3 +251,72 @@ def calculate_us_rvol(
         skip_open_minutes, cutoff_time, today_vol, avg_vol, rvol,
     )
     return float(rvol)
+
+
+def correct_rvol_open(
+    raw_rvol: float,
+    current_time: dt_time,
+    history_bars: pd.DataFrame,
+    skip_open_minutes: int = 3,
+    window_start: dt_time = dt_time(9, 30),
+    window_end: dt_time = dt_time(9, 45),
+) -> tuple[float, bool]:
+    """Correct opening RVOL inflation using historical same-window median.
+
+    Within ``window_start``-``window_end``:
+      corrected = raw_rvol / median(historical RVOL at same time)
+    Outside the window: returns raw value unchanged.
+
+    Returns ``(corrected_rvol, was_corrected)``.
+    """
+    if current_time < window_start or current_time > window_end:
+        return raw_rvol, False
+
+    if history_bars is None or history_bars.empty:
+        return raw_rvol, False
+
+    # Compute historical RVOL for same time window across past days
+    skip_cutoff = dt_time(US_OPEN.hour, US_OPEN.minute + skip_open_minutes)
+    hist_dates = sorted(set(history_bars.index.date))
+    if len(hist_dates) < 3:
+        return raw_rvol, False
+
+    # For each historical day, compute RVOL up to current_time
+    hist_rvols: list[float] = []
+    for i, d in enumerate(hist_dates):
+        day_data = history_bars[history_bars.index.date == d]
+        if day_data.empty:
+            continue
+        day_times = day_data.index.time
+        window_bars = day_data[(day_times >= skip_cutoff) & (day_times <= current_time)]
+        if window_bars.empty:
+            continue
+        window_vol = window_bars["Volume"].sum()
+
+        # Compare to earlier days' same window
+        earlier_vols: list[float] = []
+        for prev_d in hist_dates[:i]:
+            prev_day = history_bars[history_bars.index.date == prev_d]
+            if prev_day.empty:
+                continue
+            prev_times = prev_day.index.time
+            prev_window = prev_day[(prev_times >= skip_cutoff) & (prev_times <= current_time)]
+            if not prev_window.empty:
+                earlier_vols.append(prev_window["Volume"].sum())
+
+        if earlier_vols and np.mean(earlier_vols) > 0:
+            hist_rvols.append(window_vol / np.mean(earlier_vols))
+
+    if len(hist_rvols) < 3:
+        return raw_rvol, False
+
+    median_rvol = float(np.median(hist_rvols))
+    if median_rvol <= 0:
+        return raw_rvol, False
+
+    corrected = raw_rvol / median_rvol
+    logger.debug(
+        "RVOL open correction: raw=%.2f, median_hist=%.2f, corrected=%.2f",
+        raw_rvol, median_rvol, corrected,
+    )
+    return corrected, True

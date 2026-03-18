@@ -455,7 +455,7 @@ def _check_regime_accuracy(
     Returns (accurate, details, scorable).
     UNCLEAR is not scorable (D3).
     """
-    if regime == USRegimeType.GAP_AND_GO:
+    if regime == USRegimeType.GAP_GO:
         # Accurate if gap direction confirmed by close position
         if gap_pct > 0 and day_close > vp.vah:
             return True, f"Gap up confirmed: Close {day_close:.2f} > VAH {vp.vah:.2f}", True
@@ -468,7 +468,7 @@ def _check_regime_accuracy(
             return True, f"Close {day_close:.2f} below VAL {vp.val:.2f}", True
         return False, f"Close {day_close:.2f} stayed in value area [{vp.val:.2f}-{vp.vah:.2f}]", True
 
-    if regime == USRegimeType.TREND_DAY:
+    if regime == USRegimeType.TREND_STRONG:
         # Accurate if close outside value area
         if day_close > vp.vah:
             return True, f"Close {day_close:.2f} above VAH {vp.vah:.2f}", True
@@ -476,7 +476,24 @@ def _check_regime_accuracy(
             return True, f"Close {day_close:.2f} below VAL {vp.val:.2f}", True
         return False, f"Close {day_close:.2f} stayed in value area", True
 
-    if regime == USRegimeType.FADE_CHOP:
+    if regime == USRegimeType.TREND_WEAK:
+        # Same as TREND_STRONG: accurate if close outside value area
+        if day_close > vp.vah:
+            return True, f"Close {day_close:.2f} above VAH {vp.vah:.2f}", True
+        if day_close < vp.val:
+            return True, f"Close {day_close:.2f} below VAL {vp.val:.2f}", True
+        return False, f"Close {day_close:.2f} stayed in value area", True
+
+    if regime == USRegimeType.NARROW_GRIND:
+        # Accurate if price stayed within value area (similar to RANGE)
+        if day_high < vp.vah and day_low > vp.val:
+            return True, f"Range [{day_low:.2f}-{day_high:.2f}] within VA", True
+        return False, f"Breached VA: H={day_high:.2f} VAH={vp.vah:.2f}, L={day_low:.2f} VAL={vp.val:.2f}", True
+
+    if regime in (USRegimeType.V_REVERSAL, USRegimeType.GAP_FILL):
+        return False, "N/A (mid-session transition, not scored)", False
+
+    if regime == USRegimeType.RANGE:
         # Accurate if price stayed within value area
         if day_high < vp.vah and day_low > vp.val:
             return True, f"Range [{day_low:.2f}-{day_high:.2f}] within VA", True

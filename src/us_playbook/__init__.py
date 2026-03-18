@@ -17,11 +17,38 @@ from src.common.types import (  # noqa: F401
 )
 
 
+class RegimeFamily(Enum):
+    """High-level regime grouping for routing logic."""
+    TREND = "trend"       # TREND_STRONG, TREND_WEAK, GAP_GO
+    FADE = "fade"         # RANGE, NARROW_GRIND
+    REVERSAL = "reversal" # V_REVERSAL, GAP_FILL
+    UNCLEAR = "unclear"
+
+
 class USRegimeType(Enum):
-    GAP_AND_GO = "gap_and_go"    # Gap + high RVOL + PM breakout
-    TREND_DAY = "trend_day"      # No big gap but directional + elevated RVOL
-    FADE_CHOP = "fade_chop"      # Low RVOL + range-bound
-    UNCLEAR = "unclear"          # Mixed signals
+    TREND_STRONG = "trend_strong"    # High RVOL + VWAP hold + directional
+    TREND_WEAK = "trend_weak"        # Structure-based or persistence trend
+    RANGE = "range"                  # Low RVOL + range-bound (was FADE_CHOP)
+    V_REVERSAL = "v_reversal"        # Mid-session reversal (regime transition)
+    GAP_GO = "gap_go"                # Gap + high RVOL + PM breakout (was GAP_AND_GO)
+    GAP_FILL = "gap_fill"            # Gap reversal / fill (regime transition)
+    NARROW_GRIND = "narrow_grind"    # Ultra-low RVOL + tight range
+    UNCLEAR = "unclear"              # Mixed signals
+
+    @property
+    def family(self) -> RegimeFamily:
+        """Map regime type to its family for routing logic."""
+        _FAMILY_MAP = {
+            USRegimeType.TREND_STRONG: RegimeFamily.TREND,
+            USRegimeType.TREND_WEAK: RegimeFamily.TREND,
+            USRegimeType.GAP_GO: RegimeFamily.TREND,
+            USRegimeType.RANGE: RegimeFamily.FADE,
+            USRegimeType.NARROW_GRIND: RegimeFamily.FADE,
+            USRegimeType.V_REVERSAL: RegimeFamily.REVERSAL,
+            USRegimeType.GAP_FILL: RegimeFamily.REVERSAL,
+            USRegimeType.UNCLEAR: RegimeFamily.UNCLEAR,
+        }
+        return _FAMILY_MAP[self]
 
 
 @dataclass
@@ -53,6 +80,13 @@ class USRegimeResult:
     # e.g. {"gap_and_go": 1.73, "trend_day": 1.15, "fade_chop": 0.88, "pctl_rank": 72.3, "sample": 9}
     lean: str = "neutral"        # "bullish" / "bearish" / "neutral" — UNCLEAR sub-type hint
     stabilized: bool = False     # True when regime held by stabilizer
+    # Phase 2 fields (populated by upgraded classify_us_regime)
+    rvol_corrected: float | None = None   # RVOL after open correction (None = not corrected)
+    vwap_slope: float = 0.0               # VWAP slope %/bar
+    vwap_hold_minutes: int = 0            # Consecutive bars on same VWAP side
+    gap_fill_pct: float = 0.0             # Gap fill percentage (0-100)
+    reversal_confirmed: bool = False      # V_REVERSAL confirmation flag
+    classified_at: float = 0.0            # Unix timestamp of classification
 
 
 @dataclass

@@ -101,15 +101,21 @@ class USTradeSimulator:
     ) -> SimResult:
         """Simulate trades from regime classifications.
 
-        GAP_AND_GO: gap direction following (gap_pct>0 -> long, <0 -> short)
-        TREND_DAY: price vs POC direction
-        FADE_CHOP: mean reversion (near VAH -> short, near VAL -> long)
-        UNCLEAR: no trade
+        GAP_GO: gap direction following (gap_pct>0 -> long, <0 -> short)
+        TREND_STRONG: price vs POC direction
+        TREND_WEAK: same as TREND_STRONG (price vs POC direction)
+        RANGE: mean reversion (near VAH -> short, near VAL -> long)
+        NARROW_GRIND, V_REVERSAL, GAP_FILL, UNCLEAR: no trade
         """
         trades: list[SimTrade] = []
 
         for day_eval in regime_days:
-            if day_eval.predicted == USRegimeType.UNCLEAR:
+            if day_eval.predicted in (
+                USRegimeType.UNCLEAR,
+                USRegimeType.NARROW_GRIND,
+                USRegimeType.V_REVERSAL,
+                USRegimeType.GAP_FILL,
+            ):
                 continue
 
             symbol = day_eval.symbol
@@ -134,20 +140,24 @@ class USTradeSimulator:
             if isinstance(start_idx_in_day, slice):
                 start_idx_in_day = start_idx_in_day.start
 
-            if day_eval.predicted == USRegimeType.GAP_AND_GO:
+            if day_eval.predicted == USRegimeType.GAP_GO:
                 # Gap direction following
                 is_short = day_eval.gap_pct < 0
-                signal_type = "GAP_AND_GO_short" if is_short else "GAP_AND_GO_long"
-            elif day_eval.predicted == USRegimeType.TREND_DAY:
+                signal_type = "GAP_GO_short" if is_short else "GAP_GO_long"
+            elif day_eval.predicted == USRegimeType.TREND_STRONG:
                 # Price vs POC direction
                 is_short = entry_price < day_eval.poc
-                signal_type = "TREND_DAY_short" if is_short else "TREND_DAY_long"
+                signal_type = "TREND_STRONG_short" if is_short else "TREND_STRONG_long"
+            elif day_eval.predicted == USRegimeType.TREND_WEAK:
+                # Same logic as TREND_STRONG: price vs POC direction
+                is_short = entry_price < day_eval.poc
+                signal_type = "TREND_WEAK_short" if is_short else "TREND_WEAK_long"
             else:
-                # FADE_CHOP: mean reversion toward POC
+                # RANGE: mean reversion toward POC
                 dist_to_vah = abs(entry_price - day_eval.vah)
                 dist_to_val = abs(entry_price - day_eval.val)
                 is_short = dist_to_vah < dist_to_val  # nearer VAH -> short
-                signal_type = "FADE_CHOP_short" if is_short else "FADE_CHOP_long"
+                signal_type = "RANGE_short" if is_short else "RANGE_long"
 
             if signal_type in self.skip_signal_types:
                 continue
@@ -307,7 +317,7 @@ class USTradeSimulator:
             for key, group in [
                 (t.signal_type, by_signal_type),
                 (t.symbol, by_symbol),
-                (t.signal_type.split("_")[0], by_regime),
+                (t.signal_type.rsplit("_", 1)[0], by_regime),
             ]:
                 if key not in group:
                     group[key] = {"trades": 0, "wins": 0, "total_pnl": 0.0}

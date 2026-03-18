@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
-from src.common.indicators import calculate_vwap_series, calculate_vwap_slope
+from src.common.indicators import calculate_vwap_hold_duration, calculate_vwap_series, calculate_vwap_slope
 from src.common.types import GammaWallResult, VolumeProfileResult
-from src.us_playbook import USRegimeResult, USRegimeType
+from src.us_playbook import RegimeFamily, USRegimeResult, USRegimeType
 from src.us_playbook.indicators import RvolProfile
 from src.utils.logger import setup_logger
 
@@ -195,6 +196,112 @@ def detect_price_structure(
     return l1_result
 
 
+def _detect_v_reversal(
+    today_bars: pd.DataFrame,
+    open_price: float,
+    prev_close: float,
+    rvol: float,
+    cfg: dict | None = None,
+) -> tuple[bool, str, float]:
+    """Detect V-shaped intraday reversal.
+
+    Conditions:
+    1. Price moved > min_initial_move_pct from open in one direction
+    2. Price has reversed to the other side of open
+    3. Reversal area has elevated RVOL (local volume > avg)
+
+    Returns (detected, direction, confidence).
+    Direction is the POST-reversal direction ("bullish" if reversed up).
+    """
+    if today_bars is None or today_bars.empty or len(today_bars) < 20:
+        return False, "neutral", 0.0
+
+    _cfg = cfg or {}
+    min_move_pct = _cfg.get("min_initial_move_pct", 0.5)
+    confirmation_bars = _cfg.get("confirmation_bars", 5)
+
+    if open_price <= 0:
+        return False, "neutral", 0.0
+
+    high = float(today_bars["High"].max())
+    low = float(today_bars["Low"].min())
+    current = float(today_bars.iloc[-1]["Close"])
+
+    up_move = (high - open_price) / open_price * 100
+    down_move = (open_price - low) / open_price * 100
+
+    # Check for bearish-then-bullish reversal (V bottom)
+    if down_move >= min_move_pct and current > open_price:
+        # Confirm: last N bars trending up
+        tail = today_bars.iloc[-confirmation_bars:]
+        if float(tail.iloc[-1]["Close"]) > float(tail.iloc[0]["Open"]):
+            # Check volume in reversal area
+            avg_vol = float(today_bars["Volume"].mean())
+            tail_vol = float(tail["Volume"].mean())
+            vol_ok = avg_vol <= 0 or tail_vol >= avg_vol
+            if vol_ok:
+                confidence = min(0.70, 0.45 + down_move / 100 * 5)
+                return True, "bullish", confidence
+
+    # Check for bullish-then-bearish reversal (inverted V)
+    if up_move >= min_move_pct and current < open_price:
+        tail = today_bars.iloc[-confirmation_bars:]
+        if float(tail.iloc[-1]["Close"]) < float(tail.iloc[0]["Open"]):
+            avg_vol = float(today_bars["Volume"].mean())
+            tail_vol = float(tail["Volume"].mean())
+            vol_ok = avg_vol <= 0 or tail_vol >= avg_vol
+            if vol_ok:
+                confidence = min(0.70, 0.45 + up_move / 100 * 5)
+                return True, "bearish", confidence
+
+    return False, "neutral", 0.0
+
+
+def _detect_gap_fill(
+    today_bars: pd.DataFrame,
+    gap_pct: float,
+    open_price: float,
+    prev_close: float,
+    rvol: float,
+    cfg: dict | None = None,
+) -> tuple[bool, float, float]:
+    """Detect gap fill — gap has been substantially retraced.
+
+    Returns (detected, fill_pct, confidence).
+    """
+    if today_bars is None or today_bars.empty:
+        return False, 0.0, 0.0
+
+    _cfg = cfg or {}
+    min_gap_pct = _cfg.get("min_gap_pct", 0.2)
+    fill_threshold_pct = _cfg.get("fill_threshold_pct", 50)
+
+    if abs(gap_pct) < min_gap_pct or open_price <= 0 or prev_close <= 0:
+        return False, 0.0, 0.0
+
+    current = float(today_bars.iloc[-1]["Close"])
+    gap_size = open_price - prev_close  # positive = gap up
+
+    if abs(gap_size) < 0.0001:
+        return False, 0.0, 0.0
+
+    # Fill percentage: how much of the gap has been retraced
+    if gap_size > 0:
+        # Gap up: fill = how far price has dropped from open toward prev_close
+        fill = (open_price - current) / gap_size * 100
+    else:
+        # Gap down: fill = how far price has risen from open toward prev_close
+        fill = (current - open_price) / abs(gap_size) * 100
+
+    fill = max(0.0, min(100.0, fill))
+
+    if fill >= fill_threshold_pct:
+        confidence = min(0.70, 0.40 + fill / 100 * 0.3)
+        return True, fill, confidence
+
+    return False, fill, 0.0
+
+
 def detect_regime_transition(
     original: USRegimeResult,
     current_rvol: float,
@@ -218,10 +325,44 @@ def detect_regime_transition(
     """Detect if regime has transitioned from original classification.
 
     Returns (transitioned, new_regime) — only returns True for meaningful
-    upgrades (UNCLEAR/FADE_CHOP → TREND_DAY/GAP_AND_GO).
+    upgrades (UNCLEAR/RANGE → TREND_STRONG/GAP_GO).
     """
-    if original.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
-        return False, None  # already in strong regime, no upgrade needed
+    # Strong trend regimes: only check for V_REVERSAL and GAP_FILL transitions
+    if original.regime.family == RegimeFamily.TREND:
+        # Check V_REVERSAL and GAP_FILL below, but skip re-classification
+        if today_bars is None:
+            return False, None
+        # V_REVERSAL from trending
+        detected, v_dir, v_conf = _detect_v_reversal(
+            today_bars, open_price, prev_close, current_rvol,
+        )
+        if detected and v_conf >= 0.50:
+            return True, USRegimeResult(
+                regime=USRegimeType.V_REVERSAL, confidence=v_conf,
+                rvol=current_rvol, price=current_price,
+                gap_pct=original.gap_pct,
+                spy_regime=spy_regime,
+                details=f"V-reversal {v_dir}: from {original.regime.value}",
+                lean=v_dir,
+                reversal_confirmed=True,
+            )
+        # GAP_FILL from GAP_GO
+        if original.regime == USRegimeType.GAP_GO:
+            detected, fill_pct, fill_conf = _detect_gap_fill(
+                today_bars, original.gap_pct, open_price, prev_close, current_rvol,
+            )
+            if detected and fill_conf >= 0.40:
+                fill_dir = "bearish" if original.gap_pct > 0 else "bullish"
+                return True, USRegimeResult(
+                    regime=USRegimeType.GAP_FILL, confidence=fill_conf,
+                    rvol=current_rvol, price=current_price,
+                    gap_pct=original.gap_pct,
+                    spy_regime=spy_regime,
+                    details=f"Gap fill {fill_pct:.0f}%: gap was {original.gap_pct:+.2f}%",
+                    lean=fill_dir,
+                    gap_fill_pct=fill_pct,
+                )
+        return False, None
 
     new_regime = classify_us_regime(
         price=current_price,
@@ -245,8 +386,8 @@ def detect_regime_transition(
 
     # Only signal meaningful upgrades
     upgrades = {
-        USRegimeType.UNCLEAR: (USRegimeType.TREND_DAY, USRegimeType.GAP_AND_GO),
-        USRegimeType.FADE_CHOP: (USRegimeType.TREND_DAY, USRegimeType.GAP_AND_GO),
+        USRegimeType.UNCLEAR: (USRegimeType.TREND_STRONG, USRegimeType.GAP_GO),
+        USRegimeType.RANGE: (USRegimeType.TREND_STRONG, USRegimeType.GAP_GO),
     }
     valid_targets = upgrades.get(original.regime, ())
     if new_regime.regime in valid_targets and new_regime.confidence >= 0.60:
@@ -259,11 +400,15 @@ def detect_regime_transition(
 def regime_to_signal_type(regime: USRegimeType, direction: str) -> str | None:
     """Map US regime + direction to auto-scan signal type.
 
-    Returns signal type string or None for UNCLEAR.
+    Returns signal type string or None for UNCLEAR/NARROW_GRIND.
     """
-    if regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+    if regime.family == RegimeFamily.TREND:
         return f"BREAKOUT_{direction.upper()}"
-    if regime == USRegimeType.FADE_CHOP:
+    if regime.family == RegimeFamily.FADE and regime != USRegimeType.NARROW_GRIND:
+        return f"RANGE_REVERSAL_{direction.upper()}"
+    if regime == USRegimeType.V_REVERSAL:
+        return f"REVERSAL_{direction.upper()}"
+    if regime == USRegimeType.GAP_FILL:
         return f"RANGE_REVERSAL_{direction.upper()}"
     return None
 
@@ -289,13 +434,17 @@ def classify_us_regime(
     today_bars: pd.DataFrame | None = None,
     structure_trend_cfg: dict | None = None,
     vwap: float = 0.0,
+    vwap_trend_cfg: dict | None = None,
+    narrow_grind_rvol: float = 0.5,
+    narrow_grind_adr_ratio: float = 0.5,
+    trend_strong_rvol: float = 0.0,  # 0=use gap_and_go_rvol
 ) -> USRegimeResult:
-    """Classify US intraday regime into 4 styles.
+    """Classify US intraday regime.
 
     Styles:
-        GAP_AND_GO: Gap + high RVOL + price beyond PM range
-        TREND_DAY: Moderate RVOL + directional, no big gap
-        FADE_CHOP: Low RVOL + range-bound
+        GAP_GO: Gap + high RVOL + price beyond PM range
+        TREND_STRONG: Moderate RVOL + directional, no big gap
+        RANGE: Low RVOL + range-bound
         UNCLEAR: Mixed signals
 
     If ``rvol_profile`` is provided with sufficient sample size (>= 5),
@@ -336,7 +485,7 @@ def classify_us_regime(
     else:
         small_gap = abs(gap_pct) < 0.5  # fallback static
 
-    # VWAP-confirmed gap relaxation for TREND_DAY
+    # VWAP-confirmed gap relaxation for TREND_STRONG
     _vwap_confirms = (price < vp.val and vwap > 0 and price < vwap) or \
                      (price > vp.vah and vwap > 0 and price > vwap)
     if rvol_profile and rvol_profile.avg_daily_range_pct > 0:
@@ -362,6 +511,19 @@ def classify_us_regime(
         if not near_gamma and gamma_wall.put_wall_strike > 0:
             near_gamma = abs(price - gamma_wall.put_wall_strike) / price < 0.01
 
+    # ── Phase 2: VWAP hold duration (computed once, used by TREND split) ──
+    _vwap_cfg = vwap_trend_cfg or {}
+    _hold_min_threshold = _vwap_cfg.get("hold_minutes_trend_bias", 60)
+    if today_bars is not None and not today_bars.empty:
+        _vwap_hold_bars, _vwap_hold_side = calculate_vwap_hold_duration(today_bars)
+        _vwap_hold_min = _vwap_hold_bars  # 1 bar = 1 minute for 1m bars
+    else:
+        _vwap_hold_bars, _vwap_hold_side = 0, "neutral"
+        _vwap_hold_min = 0
+
+    # Phase 2: effective RVOL threshold for TREND_STRONG
+    _trend_strong_threshold = trend_strong_rvol if trend_strong_rvol > 0 else gap_and_go_rvol
+
     result: USRegimeResult | None = None
 
     # Large gap signal: gap occupies >= 80% of ADR → treat as gap-driven even if PM absorbed
@@ -369,7 +531,7 @@ def classify_us_regime(
     if rvol_profile and rvol_profile.avg_daily_range_pct > 0:
         large_gap_signal = normalized_gap >= 0.8
 
-    # ── GAP_AND_GO ──
+    # ── GAP_GO ──
     if rvol >= gap_and_go_rvol and (pm_breakout or large_gap_signal):
         if pm_breakout:
             direction = "above PMH" if above_pm else "below PML"
@@ -380,12 +542,12 @@ def classify_us_regime(
         if not pm_breakout:
             confidence = max(0.1, confidence - 0.10)
         # SPY context adjustment (P1-3: asymmetric — boost stronger, penalty milder)
-        if spy_regime == USRegimeType.FADE_CHOP:
+        if spy_regime == USRegimeType.RANGE:
             confidence = max(0.1, confidence - 0.15)
-        elif spy_regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+        elif spy_regime in (USRegimeType.GAP_GO, USRegimeType.TREND_STRONG):
             confidence = min(1.0, confidence + 0.15)
         result = USRegimeResult(
-            regime=USRegimeType.GAP_AND_GO, confidence=confidence,
+            regime=USRegimeType.GAP_GO, confidence=confidence,
             rvol=rvol, price=price, gap_pct=gap_pct,
             spy_regime=spy_regime,
             adaptive_thresholds=adaptive_info,
@@ -395,14 +557,14 @@ def classify_us_regime(
     # Elapsed ratio for exhaustion check (US session = 390 1m bars)
     _elapsed_ratio = min(1.0, len(today_bars) / 390) if today_bars is not None and not today_bars.empty else 0.0
 
-    # ── TREND_DAY ──
+    # ── TREND_STRONG ──
     if result is None and rvol >= trend_day_rvol and _gap_ok and outside_va:
         direction = "above VAH" if price > vp.vah else "below VAL"
         confidence = min(1.0, (rvol - trend_day_rvol) / 0.5 * 0.3 + 0.5)
         # P1-3: SPY context — milder penalty + new boost branch
-        if spy_regime == USRegimeType.FADE_CHOP:
+        if spy_regime == USRegimeType.RANGE:
             confidence = max(0.1, confidence - 0.12)
-        elif spy_regime in (USRegimeType.TREND_DAY, USRegimeType.GAP_AND_GO):
+        elif spy_regime in (USRegimeType.TREND_STRONG, USRegimeType.GAP_GO):
             confidence = min(1.0, confidence + 0.10)
         # P0-1: Trend exhaustion — downgrade to UNCLEAR if range consumed
         _trend_dir = "bullish" if price > vp.vah else "bearish"
@@ -421,15 +583,20 @@ def classify_us_regime(
             if not small_gap:
                 confidence = max(0.1, confidence - 0.10)
             _gap_note = ", VWAP-confirmed gap relaxation" if not small_gap else ""
+            # Phase 2: TREND_STRONG vs TREND_WEAK split
+            if rvol >= _trend_strong_threshold or _vwap_hold_min >= _hold_min_threshold:
+                _rvol_regime = USRegimeType.TREND_STRONG
+            else:
+                _rvol_regime = USRegimeType.TREND_WEAK
             result = USRegimeResult(
-                regime=USRegimeType.TREND_DAY, confidence=confidence,
+                regime=_rvol_regime, confidence=confidence,
                 rvol=rvol, price=price, gap_pct=gap_pct,
                 spy_regime=spy_regime,
                 adaptive_thresholds=adaptive_info,
                 details=f"RVOL {rvol:.2f} >= {trend_day_rvol:.2f} ({threshold_label}), small gap {gap_pct:+.2f}%, price {direction}{_gap_note}",
             )
 
-    # ── TREND_DAY (Structure-based) ──
+    # ── TREND_WEAK (Structure-based) ──
     _st_cfg = structure_trend_cfg or {}
     if result is None and _st_cfg.get("enabled", False) and today_bars is not None:
         structure = detect_price_structure(
@@ -443,10 +610,10 @@ def classify_us_regime(
         )
         if structure is not None:
             confidence = structure.confidence
-            # SPY context adjustment (same as RVOL-based TREND_DAY)
-            if spy_regime == USRegimeType.FADE_CHOP:
+            # SPY context adjustment (same as RVOL-based TREND)
+            if spy_regime == USRegimeType.RANGE:
                 confidence = max(0.1, confidence - 0.12)
-            elif spy_regime in (USRegimeType.TREND_DAY, USRegimeType.GAP_AND_GO):
+            elif spy_regime in (USRegimeType.TREND_STRONG, USRegimeType.GAP_GO):
                 confidence = min(1.0, confidence + 0.10)
             # P0-1: Trend exhaustion — downgrade to UNCLEAR if range consumed
             _exhausted, _exhaust_detail = _check_trend_exhaustion(today_bars, rvol_profile, _elapsed_ratio)
@@ -462,7 +629,7 @@ def classify_us_regime(
             else:
                 layer_label = f"L{structure.layer}"
                 result = USRegimeResult(
-                    regime=USRegimeType.TREND_DAY, confidence=confidence,
+                    regime=USRegimeType.TREND_WEAK, confidence=confidence,
                     rvol=rvol, price=price, gap_pct=gap_pct,
                     spy_regime=spy_regime,
                     adaptive_thresholds=adaptive_info,
@@ -474,7 +641,7 @@ def classify_us_regime(
                     lean=structure.direction,
                 )
 
-    # ── TREND_DAY (Persistence — inside VA but still trending) ──
+    # ── TREND_WEAK (Persistence — inside VA but still trending) ──
     _enough_bars = today_bars is not None and len(today_bars) >= 30
     if (result is None and rvol >= trend_day_rvol and small_gap
             and inside_va and open_price > 0 and _enough_bars):
@@ -497,13 +664,13 @@ def classify_us_regime(
         if abs(intraday_return) >= _persist_threshold and vwap_agrees:
             base_confidence = min(1.0, (rvol - trend_day_rvol) / 0.5 * 0.3 + 0.5)
             confidence = max(0.1, base_confidence - 0.15)
-            if spy_regime == USRegimeType.FADE_CHOP:
+            if spy_regime == USRegimeType.RANGE:
                 confidence = max(0.1, confidence - 0.12)
-            elif spy_regime in (USRegimeType.TREND_DAY, USRegimeType.GAP_AND_GO):
+            elif spy_regime in (USRegimeType.TREND_STRONG, USRegimeType.GAP_GO):
                 confidence = min(1.0, confidence + 0.10)
             direction = "above VAH" if price > vp.vah else "below VAL" if price < vp.val else "in VA"
             result = USRegimeResult(
-                regime=USRegimeType.TREND_DAY, confidence=confidence,
+                regime=USRegimeType.TREND_WEAK, confidence=confidence,
                 rvol=rvol, price=price, gap_pct=gap_pct,
                 spy_regime=spy_regime,
                 adaptive_thresholds=adaptive_info,
@@ -514,9 +681,9 @@ def classify_us_regime(
                 lean=_trend_lean,
             )
 
-    # ── FADE_CHOP ──
+    # ── RANGE ──
     # P0-2: Directional trap check — low RVOL + strong unidirectional move
-    # should NOT be classified as FADE_CHOP; route to UNCLEAR instead.
+    # should NOT be classified as RANGE; route to UNCLEAR instead.
     _directional_trap = False
     if (
         result is None
@@ -542,11 +709,31 @@ def classify_us_regime(
                     lean=_trap_lean,
                 )
 
+    # ── NARROW_GRIND ──
+    if result is None and rvol < narrow_grind_rvol:
+        _narrow_range = False
+        if rvol_profile and rvol_profile.avg_daily_range_pct > 0 and today_bars is not None and not today_bars.empty:
+            today_high = float(today_bars["High"].max())
+            today_low = float(today_bars["Low"].min())
+            if today_low > 0:
+                today_range_pct = (today_high - today_low) / today_low * 100
+                if today_range_pct < rvol_profile.avg_daily_range_pct * narrow_grind_adr_ratio:
+                    _narrow_range = True
+        if _narrow_range:
+            confidence = min(1.0, (narrow_grind_rvol - rvol) / 0.3 * 0.2 + 0.5)
+            result = USRegimeResult(
+                regime=USRegimeType.NARROW_GRIND, confidence=confidence,
+                rvol=rvol, price=price, gap_pct=gap_pct,
+                spy_regime=spy_regime,
+                adaptive_thresholds=adaptive_info,
+                details=f"RVOL {rvol:.2f} < {narrow_grind_rvol:.2f}, range {today_range_pct:.2f}% < {rvol_profile.avg_daily_range_pct * narrow_grind_adr_ratio:.2f}% (ADR*{narrow_grind_adr_ratio})",
+            )
+
     if result is None and rvol < fade_chop_rvol and (inside_va or near_gamma):
         reason = "in value area" if inside_va else "near Gamma wall"
         confidence = min(1.0, (fade_chop_rvol - rvol) / 0.3 * 0.3 + 0.5)
         result = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=confidence,
+            regime=USRegimeType.RANGE, confidence=confidence,
             rvol=rvol, price=price, gap_pct=gap_pct,
             spy_regime=spy_regime,
             adaptive_thresholds=adaptive_info,
@@ -619,8 +806,14 @@ def classify_us_regime(
             lean=lean,
         )
 
-    # ── VP staleness: FADE_CHOP VA unreachable penalty ──
-    if result.regime == USRegimeType.FADE_CHOP and price > 0 and vp.vah > 0 and vp.val > 0:
+    # ── Phase 2: store computed fields on final result ──
+    if today_bars is not None and not today_bars.empty:
+        result.vwap_slope = calculate_vwap_slope(today_bars, lookback=_vwap_cfg.get("slope_lookback_bars", 30))
+        result.vwap_hold_minutes = _vwap_hold_min
+    result.classified_at = time.time()
+
+    # ── VP staleness: RANGE VA unreachable penalty ──
+    if result.regime == USRegimeType.RANGE and price > 0 and vp.vah > 0 and vp.val > 0:
         _va_dist_pct = min(abs(price - vp.vah), abs(price - vp.val)) / price * 100
         if _va_dist_pct > 5.0:
             result.confidence = max(0.1, result.confidence - 0.15)
@@ -634,7 +827,7 @@ def classify_us_regime(
         result.details = f"{result.details}; {thin_note}" if result.details else thin_note
 
     # ── PM estimated penalty ──
-    if pm_source == "gap_estimate" and result.regime == USRegimeType.GAP_AND_GO:
+    if pm_source == "gap_estimate" and result.regime == USRegimeType.GAP_GO:
         result.confidence = max(0.1, result.confidence - 0.15)
         pm_note = "PM estimated (gap range)"
         result.details = f"{result.details}; {pm_note}" if result.details else pm_note
@@ -644,7 +837,7 @@ def classify_us_regime(
 
 # ── Index Consistency ──
 
-_DIRECTIONAL_REGIMES = {USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY}
+_DIRECTIONAL_REGIMES = {USRegimeType.GAP_GO, USRegimeType.TREND_STRONG, USRegimeType.TREND_WEAK, USRegimeType.V_REVERSAL}
 
 
 def check_index_consistency(

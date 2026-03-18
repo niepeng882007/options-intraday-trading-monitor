@@ -638,7 +638,7 @@ class TestConfidenceSensitivity:
             days.append(RegimeEvalDay(
                 date=date(2026, 3, i + 1),
                 symbol="SPY",
-                predicted=USRegimeType.GAP_AND_GO,
+                predicted=USRegimeType.GAP_GO,
                 confidence=0.68,  # Just below scan threshold
                 rvol=1.8,
                 vah=505, val=495, poc=500,

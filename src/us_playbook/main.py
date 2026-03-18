@@ -23,6 +23,7 @@ from src.common.gamma_wall import calculate_gamma_wall
 from src.us_playbook import (
     KeyLevels,
     MarketTone,
+    RegimeFamily,
     USPlaybookResult,
     USRegimeResult,
     USRegimeType,
@@ -64,7 +65,7 @@ _executor = ThreadPoolExecutor(max_workers=1)
 _esc = html.escape
 
 # Regime family for hysteresis — TREND family gets lower thresholds to retain, higher to exit
-_TREND_FAMILY = {USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY}
+_TREND_FAMILY = {USRegimeType.GAP_GO, USRegimeType.TREND_STRONG, USRegimeType.TREND_WEAK}
 
 
 @dataclass
@@ -143,6 +144,8 @@ class USPredictor:
         self._last_scan_regimes: dict[str, USRegimeResult] = {}
         # Fade direction cooldown — {symbol: (direction, unix_ts)}
         self._last_fade_directions: dict[str, tuple[str, float]] = {}
+        # Regime history — tracks regime changes per symbol per day
+        self._regime_history: dict[str, list[tuple[str, float, str]]] = {}
 
     def close(self) -> None:
         """Release caches for graceful shutdown."""
@@ -329,6 +332,30 @@ class USPredictor:
                 min_trend_day_floor=adaptive_cfg.get("min_trend_day_floor", 1.0),
             )
 
+        # Phase 2: RVOL open correction
+        rvol_corr_cfg = regime_cfg.get("rvol_correction", {})
+        rvol_corrected = None
+        if rvol_corr_cfg.get("enabled", False):
+            from src.us_playbook.indicators import correct_rvol_open
+            from datetime import time as dt_time
+            now_et = datetime.now(ET)
+            window_start = dt_time(9, 30)
+            window_end = dt_time(9, 45)
+            try:
+                ws = rvol_corr_cfg.get("window_start", "09:30").split(":")
+                window_start = dt_time(int(ws[0]), int(ws[1]))
+                we = rvol_corr_cfg.get("window_end", "09:45").split(":")
+                window_end = dt_time(int(we[0]), int(we[1]))
+            except (ValueError, IndexError):
+                pass
+            rvol_corrected_val, was_corrected = correct_rvol_open(
+                rvol, now_et.time(), hist_bars,
+                window_start=window_start, window_end=window_end,
+            )
+            if was_corrected:
+                rvol_corrected = rvol_corrected_val
+                logger.info("RVOL open correction %s: raw=%.2f → corrected=%.2f", symbol, rvol, rvol_corrected_val)
+
         # 9. Regime classification
         regime = classify_us_regime(
             price=price,
@@ -351,12 +378,27 @@ class USPredictor:
             today_bars=today,
             structure_trend_cfg=regime_cfg.get("structure_trend"),
             vwap=vwap,
+            vwap_trend_cfg=regime_cfg.get("vwap_trend"),
+            narrow_grind_rvol=regime_cfg.get("narrow_grind_rvol", 0.5),
+            narrow_grind_adr_ratio=regime_cfg.get("narrow_grind_adr_ratio", 0.5),
+            trend_strong_rvol=regime_cfg.get("trend_strong_rvol", 0.0),
         )
 
-        # 9a. P1-1: FADE_CHOP exec chain — independent from analysis chain
+        if rvol_corrected is not None:
+            regime.rvol_corrected = rvol_corrected
+
+        # Track regime history
+        regime_key = regime.regime.value
+        if symbol not in self._regime_history:
+            self._regime_history[symbol] = []
+        history = self._regime_history[symbol]
+        if not history or history[-1][0] != regime_key:
+            history.append((regime_key, time.time(), regime.details[:80] if regime.details else ""))
+
+        # 9a. P1-1: RANGE exec chain — independent from analysis chain
         exec_chain_df = chain_df  # default: same as analysis chain
         rr_option = option_cfg.get("range_reversal", {})
-        if regime.regime == USRegimeType.FADE_CHOP and rr_option.get("dte_min"):
+        if regime.regime == USRegimeType.RANGE and rr_option.get("dte_min"):
             rr_expiry = select_expiry(
                 expiry_dates,
                 dte_min=rr_option["dte_min"],
@@ -371,11 +413,11 @@ class USPredictor:
                     if rr_options:
                         exec_chain_df = option_quotes_to_df(rr_options)
                 except Exception:
-                    logger.debug("FADE_CHOP exec chain fetch failed for %s, using analysis chain", symbol)
+                    logger.debug("RANGE exec chain fetch failed for %s, using analysis chain", symbol)
 
         # 9b. Wide VA → intraday levels
         intraday_levels = None
-        if regime.regime == USRegimeType.FADE_CHOP:
+        if regime.regime == USRegimeType.RANGE:
             wide_va_cfg = cfg.get("wide_va", {})
             if wide_va_cfg.get("enabled", True):
                 intraday_levels = build_intraday_levels(
@@ -385,7 +427,7 @@ class USPredictor:
                     wide_va_cfg,
                 )
 
-        # 10. Option recommendation (exec chain for FADE_CHOP, analysis chain otherwise)
+        # 10. Option recommendation (exec chain for RANGE, analysis chain otherwise)
         chase_risk_cfg = self._cfg.get("chase_risk", {})
         option_rec: OptionRecommendation | None = None
         try:
@@ -752,9 +794,9 @@ class USPredictor:
                 # Track regime for transition detection
                 self._last_scan_regimes[symbol] = signal.regime
 
-                # Fade direction cooldown — prevent contradictory FADE_CHOP pushes
+                # Fade direction cooldown — prevent contradictory RANGE pushes
                 if (
-                    signal.regime.regime == USRegimeType.FADE_CHOP
+                    signal.regime.regime == USRegimeType.RANGE
                     and signal.signal_type.startswith("RANGE_REVERSAL")
                 ):
                     cooldown_min = self._cfg.get("chase_risk", {}).get(
@@ -986,7 +1028,7 @@ class USPredictor:
                 # Easier to stay in TREND: lower thresholds
                 adj_gap_rvol *= (1 - rvol_hyst)
                 adj_trend_rvol *= (1 - rvol_hyst)
-            elif last_regime.regime == USRegimeType.FADE_CHOP:
+            elif last_regime.regime == USRegimeType.RANGE:
                 # Harder to leave FADE: raise thresholds
                 adj_gap_rvol *= (1 + rvol_hyst)
                 adj_trend_rvol *= (1 + rvol_hyst)
@@ -1011,6 +1053,10 @@ class USPredictor:
             today_bars=today,
             structure_trend_cfg=regime_cfg.get("structure_trend"),
             vwap=l1_vwap,
+            vwap_trend_cfg=regime_cfg.get("vwap_trend"),
+            narrow_grind_rvol=regime_cfg.get("narrow_grind_rvol", 0.5),
+            narrow_grind_adr_ratio=regime_cfg.get("narrow_grind_adr_ratio", 0.5),
+            trend_strong_rvol=regime_cfg.get("trend_strong_rvol", 0.0),
         )
 
         # Stabilize regime for L1 screening (L2 uses raw re-classification)
@@ -1030,7 +1076,7 @@ class USPredictor:
         bo_min_mag = breakout_cfg.get("min_magnitude_pct", 0.20)
 
         if (
-            regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY)
+            regime.regime.family == RegimeFamily.TREND
             and regime.confidence >= bo_min_conf
             and rvol >= bo_min_rvol
         ):
@@ -1093,7 +1139,7 @@ class USPredictor:
             rng_prox = range_cfg.get("va_proximity_pct", 0.30)
 
             if (
-                regime.regime == USRegimeType.FADE_CHOP
+                regime.regime == USRegimeType.RANGE
                 and regime.confidence >= rng_min_conf
                 and rng_rvol_min <= rvol <= rng_rvol_max
             ):
@@ -1137,7 +1183,7 @@ class USPredictor:
                             logger.info("L1 skip %s: bullish RR but RSI=%.1f >= %d", symbol, rsi, oversold)
                             return None
 
-                    signal_type = regime_to_signal_type(USRegimeType.FADE_CHOP, direction)
+                    signal_type = regime_to_signal_type(USRegimeType.RANGE, direction)
                     boundary = "VAH" if dist_vah < dist_val else "VAL"
                     triggers = [f"接近 {boundary} (距离 {near_boundary:.2f}%)"]
                     return {
@@ -1162,7 +1208,7 @@ class USPredictor:
     ) -> dict | None:
         """Check if a previously scanned symbol has undergone regime transition.
 
-        Only triggers for meaningful upgrades (UNCLEAR/FADE_CHOP → TREND_DAY/GAP_AND_GO).
+        Only triggers for meaningful upgrades (UNCLEAR/RANGE → TREND_STRONG/GAP_GO).
         Uses existing `regime_upgrade` override to bypass cooldown.
         """
         original = self._last_scan_regimes.get(symbol)
@@ -1411,12 +1457,16 @@ class USPredictor:
             today_bars=today,
             structure_trend_cfg=regime_cfg.get("structure_trend"),
             vwap=vwap,
+            vwap_trend_cfg=regime_cfg.get("vwap_trend"),
+            narrow_grind_rvol=regime_cfg.get("narrow_grind_rvol", 0.5),
+            narrow_grind_adr_ratio=regime_cfg.get("narrow_grind_adr_ratio", 0.5),
+            trend_strong_rvol=regime_cfg.get("trend_strong_rvol", 0.0),
         )
 
-        # FADE_CHOP exec chain
+        # RANGE exec chain
         exec_chain_df = chain_df
         rr_option = option_cfg.get("range_reversal", {})
-        if regime.regime == USRegimeType.FADE_CHOP and rr_option.get("dte_min"):
+        if regime.regime == USRegimeType.RANGE and rr_option.get("dte_min"):
             rr_expiry = select_expiry(
                 expiry_dates,
                 dte_min=rr_option["dte_min"],
@@ -1431,7 +1481,7 @@ class USPredictor:
                     if rr_options:
                         exec_chain_df = option_quotes_to_df(rr_options)
                 except Exception:
-                    logger.debug("L2 incremental: FADE_CHOP exec chain failed for %s", symbol)
+                    logger.debug("L2 incremental: RANGE exec chain failed for %s", symbol)
 
         # Option recommendation
         chase_risk_cfg = self._cfg.get("chase_risk", {})
@@ -1529,8 +1579,8 @@ class USPredictor:
 
         # Regime consistency check
         expected_regimes = {
-            "BREAKOUT": (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY),
-            "RANGE_REVERSAL": (USRegimeType.FADE_CHOP,),
+            "BREAKOUT": (USRegimeType.GAP_GO, USRegimeType.TREND_STRONG, USRegimeType.TREND_WEAK),
+            "RANGE_REVERSAL": (USRegimeType.RANGE,),
         }
         signal_prefix = signal_type.rsplit("_", 1)[0] if "_" in signal_type else signal_type
         # Handle BREAKOUT_LONG → BREAKOUT, RANGE_REVERSAL_LONG → RANGE_REVERSAL
@@ -1546,9 +1596,9 @@ class USPredictor:
 
         # SPY context consistency
         spy_ctx = self._spy_context[1]
-        if spy_ctx and direction == "bullish" and spy_ctx.regime == USRegimeType.FADE_CHOP:
+        if spy_ctx and direction == "bullish" and spy_ctx.regime == USRegimeType.RANGE:
             if result.regime.confidence < 0.75:
-                logger.info("L2 reject %s: SPY FADE_CHOP context, conf=%.2f < 0.75", symbol, result.regime.confidence)
+                logger.info("L2 reject %s: SPY RANGE context, conf=%.2f < 0.75", symbol, result.regime.confidence)
                 return None
 
         # P0-1 / P2-1: structural veto from recommend() (trend / VA width etc.)
@@ -1581,6 +1631,7 @@ class USPredictor:
             self._scan_history.clear()
             self._last_scan_regimes.clear()
             self._last_fade_directions.clear()
+            self._regime_history.clear()
             self._last_playbooks.clear()
             self._last_today_bars.clear()
             self._regime_stabilizer.reset()

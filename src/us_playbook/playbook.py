@@ -47,7 +47,7 @@ from src.common.types import (
     QuoteSnapshot,
     VolumeProfileResult,
 )
-from src.us_playbook import KeyLevels, MarketTone, USPlaybookResult, USRegimeResult, USRegimeType
+from src.us_playbook import KeyLevels, MarketTone, RegimeFamily, USPlaybookResult, USRegimeResult, USRegimeType
 from src.us_playbook.levels import IntradayLevels
 from src.us_playbook.option_recommend import _decide_direction
 from src.utils.logger import setup_logger
@@ -58,43 +58,75 @@ ET = ZoneInfo("America/New_York")
 _esc = html.escape
 
 REGIME_EMOJI = {
-    USRegimeType.GAP_AND_GO: "\U0001f680",   # 🚀
-    USRegimeType.TREND_DAY: "\U0001f4c8",    # 📈
-    USRegimeType.FADE_CHOP: "\U0001f4e6",    # 📦
-    USRegimeType.UNCLEAR: "\u2753",           # ❓
+    USRegimeType.GAP_GO: "\U0001f680",           # 🚀
+    USRegimeType.TREND_STRONG: "\U0001f4c8",     # 📈
+    USRegimeType.TREND_WEAK: "\U0001f4c8",       # 📈
+    USRegimeType.RANGE: "\U0001f4e6",            # 📦
+    USRegimeType.V_REVERSAL: "\U0001f504",       # 🔄
+    USRegimeType.GAP_FILL: "\u21a9\ufe0f",       # ↩️
+    USRegimeType.NARROW_GRIND: "\U0001f4cf",     # 📏
+    USRegimeType.UNCLEAR: "\u2753",              # ❓
 }
 
 
 def get_regime_emoji(regime: USRegimeType, direction: str) -> str:
-    """Direction-aware emoji for TREND_DAY and GAP_AND_GO."""
-    if regime == USRegimeType.TREND_DAY:
+    """Direction-aware emoji for TREND_STRONG/TREND_WEAK and GAP_GO."""
+    if regime in (USRegimeType.TREND_STRONG, USRegimeType.TREND_WEAK):
         return "\U0001f4c8" if direction == "bullish" else "\U0001f4c9"  # 📈 / 📉
-    if regime == USRegimeType.GAP_AND_GO:
+    if regime == USRegimeType.GAP_GO:
         return "\U0001f680" if direction == "bullish" else "\U0001f4a5"  # 🚀 / 💥
     return REGIME_EMOJI.get(regime, "\u2753")
 
 REGIME_NAME_CN = {
-    USRegimeType.GAP_AND_GO: "缺口追击日",
-    USRegimeType.TREND_DAY: "趋势日",
-    USRegimeType.FADE_CHOP: "震荡日",
+    USRegimeType.GAP_GO: "缺口追击日",
+    USRegimeType.TREND_STRONG: "强趋势日",
+    USRegimeType.TREND_WEAK: "弱趋势日",
+    USRegimeType.RANGE: "震荡日",
+    USRegimeType.V_REVERSAL: "V型反转日",
+    USRegimeType.GAP_FILL: "缺口回补日",
+    USRegimeType.NARROW_GRIND: "窄幅盘整日",
     USRegimeType.UNCLEAR: "不明确日",
 }
 
 REGIME_STRATEGY = {
-    USRegimeType.GAP_AND_GO: (
+    USRegimeType.GAP_GO: (
         "🚀 缺口追击 — 顺势操作\n"
         "• ATM/轻度 OTM 期权 (Delta 0.3-0.5)\n"
         "• VWAP 为止损线\n"
         "• 顺势加仓，不抄底/摸顶"
     ),
-    USRegimeType.TREND_DAY: (
-        "📈 趋势日 — 方向跟随\n"
+    USRegimeType.TREND_STRONG: (
+        "📈 强趋势日 — 方向跟随\n"
         "• ATM 期权 (Delta 0.4-0.6)\n"
         "• PDH/PDL 为止损线\n"
         "• 目标 VAH/VAL → Gamma Wall"
     ),
-    USRegimeType.FADE_CHOP: (
+    USRegimeType.TREND_WEAK: (
+        "📈 弱趋势日 — 方向跟随\n"
+        "• ATM 期权 (Delta 0.4-0.6)\n"
+        "• PDH/PDL 为止损线\n"
+        "• 目标 VAH/VAL → Gamma Wall"
+    ),
+    USRegimeType.RANGE: (
         "📦 震荡日 — 均值回归\n"
+        "• 严禁 OTM，深度 ITM (Delta > 0.7)\n"
+        "• VAH 附近做空，VAL 附近做多\n"
+        "• 快进快出，不恋战"
+    ),
+    USRegimeType.V_REVERSAL: (
+        "🔄 V型反转 — 方向跟随\n"
+        "• ATM 期权 (Delta 0.4-0.6)\n"
+        "• PDH/PDL 为止损线\n"
+        "• 目标 VAH/VAL → Gamma Wall"
+    ),
+    USRegimeType.GAP_FILL: (
+        "↩️ 缺口回补 — 顺势操作\n"
+        "• ATM/轻度 OTM 期权 (Delta 0.3-0.5)\n"
+        "• VWAP 为止损线\n"
+        "• 顺势加仓，不抄底/摸顶"
+    ),
+    USRegimeType.NARROW_GRIND: (
+        "📏 窄幅盘整 — 均值回归\n"
         "• 严禁 OTM，深度 ITM (Delta > 0.7)\n"
         "• VAH 附近做空，VAL 附近做多\n"
         "• 快进快出，不恋战"
@@ -113,22 +145,23 @@ REGIME_STRATEGY = {
 
 
 def get_regime_strategy(regime: USRegimeType, direction: str) -> str:
-    """Direction-aware strategy text for TREND_DAY and GAP_AND_GO."""
-    if regime == USRegimeType.TREND_DAY:
+    """Direction-aware strategy text for TREND_STRONG/TREND_WEAK and GAP_GO."""
+    if regime in (USRegimeType.TREND_STRONG, USRegimeType.TREND_WEAK):
+        label = "强趋势日" if regime == USRegimeType.TREND_STRONG else "弱趋势日"
         if direction == "bullish":
             return (
-                "📈 趋势日 — 向上跟随\n"
+                f"📈 {label} — 向上跟随\n"
                 "• ATM Call (Delta 0.4-0.6)\n"
                 "• PDH 为止损参考\n"
                 "• 目标 VAH → Call Wall"
             )
         return (
-            "📉 趋势日 — 向下跟随\n"
+            f"📉 {label} — 向下跟随\n"
             "• ATM Put (Delta 0.4-0.6)\n"
             "• PDL 为止损参考\n"
             "• 目标 VAL → Put Wall"
         )
-    if regime == USRegimeType.GAP_AND_GO:
+    if regime == USRegimeType.GAP_GO:
         if direction == "bullish":
             return (
                 "🚀 缺口追击 — 向上顺势\n"
@@ -473,14 +506,14 @@ def _entry_check_text(
             "如果已经放量失守支撑位，这笔单取消。"
         )
     if rec.action == "call":
-        if regime.regime == USRegimeType.FADE_CHOP:
+        if regime.regime.family == RegimeFamily.FADE:
             nearby = _nearest_levels(regime.price, "below", vp, kl, gamma_wall, n=1)
             if nearby:
                 name, val = nearby[0]
                 return f"只在价格回调至 {name} {val:,.2f} 附近、没有带量跌破下方时考虑买入 Call，不追已经瞬间拉高的合约。"
         return "只在价格仍沿着当前多头方向运行、没有跌回防守线下方时考虑买入，不追已经瞬间拉高很多的合约。"
     if rec.action == "put":
-        if regime.regime == USRegimeType.FADE_CHOP:
+        if regime.regime.family == RegimeFamily.FADE:
             nearby = _nearest_levels(regime.price, "above", vp, kl, gamma_wall, n=1)
             if nearby:
                 name, val = nearby[0]
@@ -506,7 +539,7 @@ def _entry_zone_text(
 
     vwap = kl.vwap if kl else 0.0
 
-    if regime.regime == USRegimeType.FADE_CHOP:
+    if regime.regime.family == RegimeFamily.FADE:
         if direction == "bearish":
             # Put: find resistance above
             nearby = _nearest_levels(price, "above", vp, kl, gamma_wall, n=2)
@@ -532,7 +565,7 @@ def _entry_zone_text(
                 return f"最佳入场位: {nearby[0][0]} {nearby[0][1]:,.2f} 附近"
             return "当前价已低于主要支撑位，可直接入场"
 
-    if regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+    if regime.regime.family == RegimeFamily.TREND:
         if vwap > 0:
             if direction == "bullish":
                 return f"回调至 VWAP {vwap:,.2f} 附近是更优入场时机"
@@ -596,7 +629,7 @@ def _risk_action_lines(
     if rec.action == "bear_call_spread":
         stop_ref = f"盈亏平衡 {sm.breakeven:,.2f}" if sm and sm.breakeven > 0 else f"VAH {vp.vah:,.2f}"
         lines = [
-            f"止损触发: 标的涨破{stop_ref}，或 Regime 从 FADE_CHOP 转成 TREND_DAY。",
+            f"止损触发: 标的涨破{stop_ref}，或 Regime 从 RANGE 转成 TREND_STRONG。",
         ]
         if sm and sm.max_loss > 0:
             buy_strike = max(l.strike for l in rec.legs) if rec.legs else 0
@@ -608,7 +641,7 @@ def _risk_action_lines(
     if rec.action == "bull_put_spread":
         stop_ref = f"盈亏平衡 {sm.breakeven:,.2f}" if sm and sm.breakeven > 0 else f"VAL {vp.val:,.2f}"
         lines = [
-            f"止损触发: 标的跌破{stop_ref}，或 Regime 从 FADE_CHOP 转成 TREND_DAY。",
+            f"止损触发: 标的跌破{stop_ref}，或 Regime 从 RANGE 转成 TREND_STRONG。",
         ]
         if sm and sm.max_loss > 0:
             buy_strike = min(l.strike for l in rec.legs) if rec.legs else 0
@@ -625,8 +658,8 @@ def _risk_action_lines(
 
     if rec.action == "call":
         if low_dte:
-            if regime.regime == USRegimeType.FADE_CHOP:
-                # P1-2: FADE_CHOP bullish — skip VAL (entry premise), use deeper support
+            if regime.regime.family == RegimeFamily.FADE:
+                # P1-2: RANGE/NARROW_GRIND bullish — skip VAL (entry premise), use deeper support
                 all_below = _nearest_levels(regime.price, "below", vp, kl, gamma_wall, n=3)
                 deeper = [(n, v) for n, v in all_below if n not in ("VAL",)]
                 if deeper:
@@ -655,8 +688,8 @@ def _risk_action_lines(
 
     if rec.action == "put":
         if low_dte:
-            if regime.regime == USRegimeType.FADE_CHOP:
-                # P1-2: FADE_CHOP bearish — skip VAH (entry premise), use deeper resistance
+            if regime.regime.family == RegimeFamily.FADE:
+                # P1-2: RANGE/NARROW_GRIND bearish — skip VAH (entry premise), use deeper resistance
                 all_above = _nearest_levels(regime.price, "above", vp, kl, gamma_wall, n=3)
                 deeper = [(n, v) for n, v in all_above if n not in ("VAH",)]
                 if deeper:
@@ -696,25 +729,43 @@ def _regime_conclusion(
     vwap: float,
 ) -> str:
     """Generate a narrative conclusion for the current US regime."""
-    if regime.regime == USRegimeType.GAP_AND_GO:
+    if regime.regime == USRegimeType.GAP_GO:
         if regime.price > vp.vah:
             return "缺口向上 + 盘前突破价值区上沿，按向上跳空追击处理。"
         if regime.price < vp.val:
             return "缺口向下 + 跌出价值区下沿，按向下跳空追击处理。"
         return "缺口明显但价格仍在价值区内，先观察能否有效突破 VA 边界。"
 
-    if regime.regime == USRegimeType.TREND_DAY:
+    if regime.regime == USRegimeType.TREND_STRONG:
         if regime.price > vp.vah:
             return "价格已脱离价值区上沿，量能配合趋势方向，按向上趋势日处理。"
         if regime.price < vp.val:
             return "价格已跌出价值区下沿，量能配合趋势方向，按向下趋势日处理。"
         return "趋势方向初现但价格仍在价值区内，跟踪 RVOL 是否持续抬升。"
 
-    if regime.regime == USRegimeType.FADE_CHOP:
+    if regime.regime == USRegimeType.TREND_WEAK:
+        if regime.price > vp.vah:
+            return "价格已脱离价值区上沿，结构趋势信号存在但量能偏弱，按弱趋势日处理。"
+        if regime.price < vp.val:
+            return "价格已跌出价值区下沿，结构趋势信号存在但量能偏弱，按弱趋势日处理。"
+        return "结构趋势信号初现, 量能偏弱，跟踪 RVOL 是否持续抬升以确认趋势。"
+
+    if regime.regime == USRegimeType.RANGE:
         edge, _ = _closest_value_area_edge(regime.price, vp)
         if edge == "VAH":
             return "当前更偏向区间内震荡，优先按上沿回落思路看待，不按单边突破处理。"
         return "当前更偏向区间内震荡，优先按下沿反弹思路看待，不按单边突破处理。"
+
+    if regime.regime == USRegimeType.V_REVERSAL:
+        if regime.reversal_confirmed:
+            return "V型反转确认，反转方向已确认，按反转后的趋势方向跟随处理。"
+        return "V型反转形态出现但尚未完全确认，等待量价配合进一步验证。"
+
+    if regime.regime == USRegimeType.GAP_FILL:
+        return "缺口有回补迹象，价格向缺口方向回归，关注缺口回补完成度和量能变化。"
+
+    if regime.regime == USRegimeType.NARROW_GRIND:
+        return "极低波动窄幅盘整，成交量萎缩，当前不具备入场条件，等待波动率扩张。"
 
     if vwap > 0:
         return "多空信号混杂，先观察价格相对 VWAP 与价值区边界的反应。"
@@ -737,7 +788,7 @@ def _regime_reason_lines(
     uncertainties: list[str] = []
     invalidations: list[str] = []
 
-    if regime.regime == USRegimeType.GAP_AND_GO:
+    if regime.regime == USRegimeType.GAP_GO:
         reasons.append(f"Gap {regime.gap_pct:+.2f}%，开盘跳空幅度已达到追击阈值。")
         reasons.append(f"RVOL {regime.rvol:.2f} 配合跳空方向，量能支撑。")
         if regime.price > vp.vah:
@@ -755,12 +806,12 @@ def _regime_reason_lines(
                 f"自适应阈值: {at.get('sample', '?')}样本 GAP_AND_GO={at.get('gap_and_go', 0):.2f}"
                 f" (rank {at.get('pctl_rank', 0):.0f}%)"
             )
-        if regime.spy_regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+        if regime.spy_regime is not None and regime.spy_regime.family == RegimeFamily.TREND:
             supports.append("SPY 同步处于动量/趋势状态，大盘环境配合。")
         invalidations.append(f"若价格重新回到 VWAP {vwap:,.2f} 下方 (多头) 或上方 (空头)，跳空动量可能衰竭。")
         invalidations.append("若 RVOL 明显回落同时价格回到价值区内，需重新定调。")
 
-    elif regime.regime == USRegimeType.TREND_DAY:
+    elif regime.regime == USRegimeType.TREND_STRONG:
         reasons.append(f"RVOL {regime.rvol:.2f}，量能达到趋势日级别。")
         if regime.price > vp.vah:
             reasons.append(f"价格 {regime.price:,.2f} 高于 VAH {vp.vah:,.2f}，已经脱离价值区上沿。")
@@ -779,12 +830,31 @@ def _regime_reason_lines(
             supports.append(f"已突破前日高点 PDH {kl.pdh:,.2f}，趋势延伸信号。")
         elif kl.pdl > 0 and regime.price < kl.pdl:
             supports.append(f"已跌破前日低点 PDL {kl.pdl:,.2f}，趋势延伸信号。")
-        if regime.spy_regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+        if regime.spy_regime is not None and regime.spy_regime.family == RegimeFamily.TREND:
             supports.append("SPY 同步处于动量/趋势状态，大盘环境配合。")
         invalidations.append(f"若价格重新回到价值区内 ({vp.val:,.2f} - {vp.vah:,.2f})，趋势判断失效。")
         invalidations.append("若后续量能明显回落，需要重新评估。")
 
-    elif regime.regime == USRegimeType.FADE_CHOP:
+    elif regime.regime == USRegimeType.TREND_WEAK:
+        reasons.append(f"RVOL {regime.rvol:.2f}，结构趋势信号存在, 量能偏弱。")
+        if regime.price > vp.vah:
+            reasons.append(f"价格 {regime.price:,.2f} 高于 VAH {vp.vah:,.2f}，已经脱离价值区上沿。")
+        elif regime.price < vp.val:
+            reasons.append(f"价格 {regime.price:,.2f} 低于 VAL {vp.val:,.2f}，已经脱离价值区下沿。")
+        else:
+            reasons.append(
+                f"价格 {regime.price:,.2f} 仍在价值区 {vp.val:,.2f} - {vp.vah:,.2f} 内，"
+                "结构偏趋势但量能不足。"
+            )
+        if vwap > 0:
+            vwap_relation = "高于" if regime.price > vwap else "低于"
+            direction_text = "多头" if regime.price > vwap else "空头"
+            reasons.append(f"当前价{vwap_relation} VWAP {vwap:,.2f}，盘中 {direction_text} 结构仍在。")
+        uncertainties.append("量能不足可能导致趋势无法持续，建议缩减仓位。")
+        invalidations.append(f"若价格重新回到价值区内 ({vp.val:,.2f} - {vp.vah:,.2f})，趋势判断失效。")
+        invalidations.append("若 RVOL 继续走低，可能转为震荡或窄幅盘整。")
+
+    elif regime.regime == USRegimeType.RANGE:
         reasons.append(f"RVOL {regime.rvol:.2f}，当前量能更接近震荡而不是趋势展开。")
         reasons.append(
             f"价格 {regime.price:,.2f} 仍位于 Value Area {vp.val:,.2f} - {vp.vah:,.2f} 内部。"
@@ -812,7 +882,37 @@ def _regime_reason_lines(
                     )
 
         invalidations.append(f"若价格带量突破 VAH {vp.vah:,.2f} 或跌破 VAL {vp.val:,.2f}，区间判断失效。")
-        invalidations.append("若 RVOL 快速抬升并持续放大，需要重新评估是否切换到 TREND_DAY。")
+        invalidations.append("若 RVOL 快速抬升并持续放大，需要重新评估是否切换到 TREND_STRONG。")
+
+    elif regime.regime == USRegimeType.V_REVERSAL:
+        reasons.append("盘中出现 V 型反转形态。")
+        if regime.reversal_confirmed:
+            reasons.append("反转方向已确认，量价配合反转结构。")
+        else:
+            uncertainties.append("反转形态尚未完全确认，需等待量价配合进一步验证。")
+        if vwap > 0:
+            vwap_relation = "高于" if regime.price > vwap else "低于"
+            reasons.append(f"当前价{vwap_relation} VWAP {vwap:,.2f}。")
+        invalidations.append("若价格未能守住反转后的关键位，反转失败可能导致加速下杀。")
+        invalidations.append("追反转需确认量能，RVOL 持续回落则反转不可靠。")
+
+    elif regime.regime == USRegimeType.GAP_FILL:
+        reasons.append(f"Gap {regime.gap_pct:+.2f}%，缺口有回补迹象。")
+        reasons.append("价格向缺口方向回归，关注缺口回补完成度。")
+        if vwap > 0:
+            reasons.append(f"VWAP {vwap:,.2f} 作为回补过程中的动态参考。")
+        invalidations.append("若缺口回补完成后价格重新沿原缺口方向运动，需切换回趋势思路。")
+        invalidations.append("若量能持续萎缩，回补可能中途停止。")
+
+    elif regime.regime == USRegimeType.NARROW_GRIND:
+        reasons.append(f"RVOL {regime.rvol:.2f}，量能极度萎缩。")
+        reasons.append("价格波动率极低，窄幅盘整中。")
+        if vp.vah > 0 and vp.val > 0:
+            va_width_pct = (vp.vah - vp.val) / regime.price * 100 if regime.price > 0 else 0
+            reasons.append(f"VA 宽度仅 {va_width_pct:.1f}%，不具备入场条件。")
+        uncertainties.append("窄幅盘整后可能出现方向性突破，但时间不确定。")
+        invalidations.append("若 RVOL 快速抬升至 1.2 以上，可能转为趋势日。")
+        invalidations.append("若价格突破日内高低区间且量能配合，可重新评估。")
 
     else:  # UNCLEAR (P0-3: sub-type aware guidance)
         lean = getattr(regime, "lean", "neutral")
@@ -821,7 +921,7 @@ def _regime_reason_lines(
             reasons.append("量能已达到趋势日水平，但价格仍在价值区内。")
             lean_text = "偏多" if lean == "bullish" else "偏空" if lean == "bearish" else "方向待定"
             reasons.append(f"可能是突破前蓄力，当前倾向: {lean_text}。")
-            supports.append("若后续带量突破 VA 边界，可转为 TREND_DAY 处理。")
+            supports.append("若后续带量突破 VA 边界，可转为 TREND_STRONG 处理。")
         elif (regime.price > vp.vah or regime.price < vp.val) and regime.rvol < 1.0:
             # Sub-type 3: outside VA but low volume — likely false breakout
             reasons.append("价格虽已脱离价值区，但量能不足，可能是假突破。")
@@ -924,7 +1024,7 @@ def _generate_action_plans(
         and option_rec is not None
         and option_rec.action == "wait"
         and regime.confidence < trend_downgrade_confidence
-        and regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY)
+        and regime.regime.family == RegimeFamily.TREND
     ):
         plans = _plans_unclear(price, vp, kl, gamma_wall, regime, option_line, direction_override=direction)
         if ctx:
@@ -939,12 +1039,41 @@ def _generate_action_plans(
             plans = _apply_market_direction_warning(plans, ctx)
         return plans
 
-    if regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+    if regime.regime.family == RegimeFamily.TREND:
         if direction == "bullish":
             plans = _plans_trend_bullish(price, vp, kl, gamma_wall, option_line)
         else:
             plans = _plans_trend_bearish(price, vp, kl, gamma_wall, option_line)
-    elif regime.regime == USRegimeType.FADE_CHOP:
+        # TREND_WEAK: more conservative — add warning to Plan A
+        if regime.regime == USRegimeType.TREND_WEAK:
+            for p in plans:
+                if p.label == "A" and not p.warning:
+                    p.warning = "弱趋势: 结构信号为主, 量能不足, 建议缩减仓位"
+    elif regime.regime == USRegimeType.V_REVERSAL:
+        # Use trend plans in reversal direction
+        if direction == "bullish":
+            plans = _plans_trend_bullish(price, vp, kl, gamma_wall, option_line)
+        else:
+            plans = _plans_trend_bearish(price, vp, kl, gamma_wall, option_line)
+        # Add reversal-specific warning
+        for p in plans:
+            if p.label == "A":
+                p.warning = f"{p.warning}; V型反转: 追反转需确认量能" if p.warning else "V型反转: 追反转需确认量能"
+    elif regime.regime == USRegimeType.GAP_FILL:
+        # Use fade plans in reverse gap direction
+        edge, _ = _closest_value_area_edge(price, vp)
+        if edge == "VAH":
+            plans = _plans_fade_bearish(price, vp, kl, gamma_wall, option_line)
+        else:
+            plans = _plans_fade_bullish(price, vp, kl, gamma_wall, option_line)
+    elif regime.regime == USRegimeType.NARROW_GRIND:
+        # Low confidence observation — use UNCLEAR plans
+        plans = _plans_unclear(price, vp, kl, gamma_wall, regime, option_line)
+        for p in plans:
+            if p.label in ("A", "B"):
+                p.demoted = True
+                p.demote_reason = p.demote_reason or "窄幅盘整: 极低波动, 不建议主动入场"
+    elif regime.regime.family == RegimeFamily.FADE:
         edge, _ = _closest_value_area_edge(price, vp)
         # P1: direction consistency check — if direction conflicts with VA edge,
         # fall through to UNCLEAR plans instead of generating contradictory fade plans.
@@ -1034,7 +1163,7 @@ def _plans_trend_bullish(
 
     plan_c = ActionPlan(
         label="C", name="失效反转", emoji="⚡", is_primary=False,
-        logic="价格跌回 VA 内 + RVOL 回落 → 转 FADE_CHOP",
+        logic="价格跌回 VA 内 + RVOL 回落 → 转 RANGE",
         direction="bearish",
         trigger=f"跌破 VAH {vp.vah:,.2f} + RVOL 回落",
         entry=None, entry_action="",
@@ -1094,7 +1223,7 @@ def _plans_trend_bearish(
 
     plan_c = ActionPlan(
         label="C", name="失效反转", emoji="⚡", is_primary=False,
-        logic="价格涨回 VA 内 + RVOL 回落 → 转 FADE_CHOP",
+        logic="价格涨回 VA 内 + RVOL 回落 → 转 RANGE",
         direction="bullish",
         trigger=f"站回 VAL {vp.val:,.2f} + RVOL 回落",
         entry=None, entry_action="",
@@ -1125,7 +1254,7 @@ def _plans_fade_bearish(
     price: float, vp: VolumeProfileResult, kl: KeyLevels,
     gamma_wall: GammaWallResult | None, option_line: str | None,
 ) -> list[ActionPlan]:
-    """FADE_CHOP near VAH → short bias."""
+    """RANGE near VAH → short bias."""
     above = _nearest_levels(vp.vah, "above", vp, kl, gamma_wall, n=1)
     sl_a = above[0] if above else None
 
@@ -1177,7 +1306,7 @@ def _plans_fade_bearish(
 
     plan_c = ActionPlan(
         label="C", name="失效反转", emoji="⚡", is_primary=False,
-        logic="放量突破 VAH → 转 TREND_DAY",
+        logic="放量突破 VAH → 转 TREND_STRONG",
         direction="bullish",
         trigger=f"放量站稳 VAH {vp.vah:,.2f} 上方",
         entry=None, entry_action="",
@@ -1191,7 +1320,7 @@ def _plans_fade_bullish(
     price: float, vp: VolumeProfileResult, kl: KeyLevels,
     gamma_wall: GammaWallResult | None, option_line: str | None,
 ) -> list[ActionPlan]:
-    """FADE_CHOP near VAL → long bias."""
+    """RANGE near VAL → long bias."""
     below = _nearest_levels(vp.val, "below", vp, kl, gamma_wall, n=1)
     sl_a = below[0] if below else None
 
@@ -1243,7 +1372,7 @@ def _plans_fade_bullish(
 
     plan_c = ActionPlan(
         label="C", name="失效反转", emoji="⚡", is_primary=False,
-        logic="放量跌破 VAL → 转 TREND_DAY",
+        logic="放量跌破 VAL → 转 TREND_STRONG",
         direction="bearish",
         trigger=f"放量跌破 VAL {vp.val:,.2f}",
         entry=None, entry_action="",
@@ -1266,7 +1395,7 @@ def _plans_fade_wide_va(
     regime: USRegimeResult,
     direction: str,
 ) -> list[ActionPlan]:
-    """FADE_CHOP with wide 5-day VA — use intraday levels as trigger."""
+    """RANGE with wide 5-day VA — use intraday levels as trigger."""
     # Determine fade direction from intraday levels position
     if price >= il.effective_upper:
         fade_dir = "bearish"
@@ -1339,7 +1468,7 @@ def _build_wide_va_plans_bearish(
     # Plan C: always 5-day VA for invalidation
     plan_c = ActionPlan(
         label="C", name="失效反转", emoji="⚡", is_primary=False,
-        logic="放量突破 5日 VAH → 转 TREND_DAY",
+        logic="放量突破 5日 VAH → 转 TREND_STRONG",
         direction="bullish",
         trigger=f"放量站稳 5日 VAH {vp.vah:,.2f} 上方",
         entry=None, entry_action="",
@@ -1400,7 +1529,7 @@ def _build_wide_va_plans_bullish(
     # Plan C: always 5-day VA for invalidation
     plan_c = ActionPlan(
         label="C", name="失效反转", emoji="⚡", is_primary=False,
-        logic="放量跌破 5日 VAL → 转 TREND_DAY",
+        logic="放量跌破 5日 VAL → 转 TREND_STRONG",
         direction="bearish",
         trigger=f"放量跌破 5日 VAL {vp.val:,.2f}",
         entry=None, entry_action="",
@@ -1534,7 +1663,7 @@ def _plans_unclear(
         label="A", name="等待确认", emoji="⏳", is_primary=True,
         logic="多空信号混杂, 等待方向明确后入场",
         direction="neutral",
-        trigger="Regime 转为 TREND_DAY 或 FADE_CHOP",
+        trigger="Regime 转为 TREND_STRONG 或 RANGE",
         entry=None, entry_action="",
         stop_loss=None, stop_loss_reason="",
         tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
@@ -1577,9 +1706,13 @@ def _alternate_regime_info(regime: USRegimeResult) -> tuple[str, int]:
     """Infer alternate regime name and probability (no regime module changes)."""
     conf_pct = int(regime.confidence * 100)
     alt_map = {
-        USRegimeType.GAP_AND_GO: "趋势日",
-        USRegimeType.TREND_DAY: "震荡日",
-        USRegimeType.FADE_CHOP: "趋势日",
+        USRegimeType.GAP_GO: "趋势日",
+        USRegimeType.TREND_STRONG: "震荡日",
+        USRegimeType.TREND_WEAK: "震荡日",
+        USRegimeType.RANGE: "趋势日",
+        USRegimeType.NARROW_GRIND: "趋势日",
+        USRegimeType.V_REVERSAL: "强趋势日",
+        USRegimeType.GAP_FILL: "缺口追击日",
         USRegimeType.UNCLEAR: "震荡日",
     }
     return alt_map.get(regime.regime, "震荡日"), 100 - conf_pct
@@ -1618,7 +1751,7 @@ def _regime_based_conclusion(
 ) -> str:
     """Regime-driven one-line conclusion (no option_rec dependency)."""
     price = regime.price
-    if regime.regime in (USRegimeType.GAP_AND_GO, USRegimeType.TREND_DAY):
+    if regime.regime.family == RegimeFamily.TREND:
         if direction == "bullish":
             target = _nearest_levels(price, "above", vp, kl, n=1)
             tgt = f", 目标 {target[0][0]} {target[0][1]:,.2f}" if target else ""
@@ -1627,7 +1760,7 @@ def _regime_based_conclusion(
         tgt = f", 目标 {target[0][0]} {target[0][1]:,.2f}" if target else ""
         return f"反弹至 VWAP {kl.vwap:,.2f} 附近做空{tgt}"
 
-    if regime.regime == USRegimeType.FADE_CHOP:
+    if regime.regime.family == RegimeFamily.FADE:
         edge, _ = _closest_value_area_edge(price, vp)
         if edge == "VAH":
             return f"VAH {vp.vah:,.2f} 附近做空, 目标 POC {vp.poc:,.2f}"
@@ -1832,6 +1965,8 @@ def format_us_playbook_message(
     lines.append("📝 <b>盘面逻辑</b>")
     rvol_label = _rvol_assessment(r.rvol)
     lines.append(f"▸ 量能: RVOL {r.rvol:.2f} ({rvol_label})")
+    if r.rvol_corrected is not None and r.rvol_corrected != r.rvol:
+        lines.append(f"  (⚠️ 开盘放大, 校正值 {r.rvol_corrected:.2f})")
 
     # Wide VA annotation
     if _intraday_levels and _intraday_levels.is_wide_va:
@@ -1897,6 +2032,15 @@ def format_us_playbook_message(
         amp_str = f"振幅 {_format_percent(quote.amplitude, signed=False)}"
     compact_items = [x for x in [vwap_str, f"RVOL {r.rvol:.2f}", amp_str] if x]
     lines.append(" | ".join(compact_items))
+
+    # VWAP trend (slope + hold duration)
+    if r.vwap_slope != 0 or r.vwap_hold_minutes > 0:
+        vwap_parts: list[str] = []
+        if r.vwap_slope != 0:
+            vwap_parts.append(f"斜率 {r.vwap_slope:+.4f}%/bar")
+        if r.vwap_hold_minutes > 0:
+            vwap_parts.append(f"单侧持续 {r.vwap_hold_minutes}min")
+        lines.append(f"▸ VWAP 趋势: {' | '.join(vwap_parts)}")
 
     # VP levels
     vp_suffix = f" ({vp.trading_days}d)" if vp.trading_days > 0 else ""

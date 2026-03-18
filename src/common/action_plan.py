@@ -390,13 +390,13 @@ def check_regime_consistency(
     ibl: float,
     vwap: float,
 ) -> list[ActionPlan]:
-    """Demote plans when FADE_CHOP regime but price is outside IB range.
+    """Demote plans when range regime but price is outside IB range.
 
     If price is >0.3% outside IB, demote A/B plans.
     If |price - vwap| / vwap > 1.0%, add VWAP deviation warning.
-    Only applies to FADE_CHOP regime.
+    Only applies to RANGE / GAP_FILL / NARROW_GRIND regimes.
     """
-    if regime_type != "FADE_CHOP":
+    if regime_type not in ("RANGE", "GAP_FILL", "NARROW_GRIND"):
         return plans
     if ibh <= 0 or ibl <= 0:
         return plans
@@ -417,7 +417,7 @@ def check_regime_consistency(
             if plan.label in ("A", "B") and plan.entry is not None:
                 plan.demoted = True
                 if not plan.demote_reason:
-                    plan.demote_reason = "FADE_CHOP 但价格已超出 IB 区间, 震荡逻辑存疑"
+                    plan.demote_reason = "震荡 regime 但价格已超出 IB 区间, 震荡逻辑存疑"
 
     # VWAP deviation warning
     if vwap > 0 and price > 0:
@@ -570,11 +570,11 @@ def enforce_direction_consistency(
 ) -> list[ActionPlan]:
     """Strip contradicting entries from trend-regime plans.
 
-    Only applies when ``regime_type`` is a trend regime (GAP_AND_GO / TREND_DAY).
-    Plan C is always exempt.  FADE_CHOP / UNCLEAR are unaffected.
+    Only applies when ``regime_type`` is a trend regime (GAP_GO / TREND_STRONG / TREND_WEAK).
+    Plan C is always exempt.  RANGE / UNCLEAR are unaffected.
     """
     if trend_regimes is None:
-        trend_regimes = {"GAP_AND_GO", "TREND_DAY"}
+        trend_regimes = {"GAP_GO", "TREND_STRONG", "TREND_WEAK"}
     if regime_type not in trend_regimes:
         return plans
     if direction not in ("bullish", "bearish"):

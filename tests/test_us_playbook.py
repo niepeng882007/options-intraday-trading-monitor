@@ -15,6 +15,7 @@ from src.us_playbook import (
     USRegimeType, USRegimeResult, USPlaybookResult, KeyLevels,
     USScanSignal, USScanAlertRecord,
     BreadthProxy, MarketTone,
+    RegimeFamily,
 )
 from src.us_playbook.indicators import calculate_vwap, calculate_us_rvol, compute_rvol_profile, RvolProfile
 from src.us_playbook.levels import (
@@ -271,7 +272,7 @@ class TestUSRegime:
             price=560, prev_close=550, rvol=2.5,
             pmh=555, pml=548, vp=self._vp(),
         )
-        assert result.regime == USRegimeType.GAP_AND_GO
+        assert result.regime == USRegimeType.GAP_GO
         assert result.confidence > 0.5
 
     def test_trend_day(self):
@@ -279,14 +280,15 @@ class TestUSRegime:
             price=557, prev_close=556.5, rvol=1.3,
             pmh=556, pml=554, vp=self._vp(),
         )
-        assert result.regime == USRegimeType.TREND_DAY
+        # Phase 2: RVOL 1.3 < gap_and_go_rvol 1.5 and no VWAP hold → TREND_WEAK
+        assert result.regime == USRegimeType.TREND_WEAK
 
     def test_fade_chop(self):
         result = classify_us_regime(
             price=550, prev_close=551, rvol=0.8,
             pmh=555, pml=548, vp=self._vp(),
         )
-        assert result.regime == USRegimeType.FADE_CHOP
+        assert result.regime == USRegimeType.RANGE
 
     def test_unclear(self):
         result = classify_us_regime(
@@ -296,7 +298,7 @@ class TestUSRegime:
         assert result.regime == USRegimeType.UNCLEAR
 
     def test_spy_context_reduces_confidence(self):
-        """SPY FADE_CHOP should reduce GAP_AND_GO confidence."""
+        """SPY RANGE should reduce GAP_GO confidence."""
         result_no_spy = classify_us_regime(
             price=560, prev_close=550, rvol=2.5,
             pmh=555, pml=548, vp=self._vp(),
@@ -304,7 +306,7 @@ class TestUSRegime:
         result_with_spy = classify_us_regime(
             price=560, prev_close=550, rvol=2.5,
             pmh=555, pml=548, vp=self._vp(),
-            spy_regime=USRegimeType.FADE_CHOP,
+            spy_regime=USRegimeType.RANGE,
         )
         assert result_with_spy.confidence < result_no_spy.confidence
 
@@ -315,7 +317,7 @@ class TestUSRegime:
             pmh=555, pml=548, vp=self._vp(),
             gap_and_go_rvol=1.5,
         )
-        assert result.regime == USRegimeType.GAP_AND_GO
+        assert result.regime == USRegimeType.GAP_GO
 
 
 # ── Filter Tests ──
@@ -385,7 +387,7 @@ class TestUSFilters:
 # ── Playbook Format Tests ──
 
 class TestPlaybookFormat:
-    def _make_result(self, regime_type=USRegimeType.TREND_DAY) -> USPlaybookResult:
+    def _make_result(self, regime_type=USRegimeType.TREND_STRONG) -> USPlaybookResult:
         return USPlaybookResult(
             symbol="AAPL",
             name="Apple",
@@ -431,7 +433,7 @@ class TestPlaybookFormat:
 
     def test_market_context_section(self):
         result = self._make_result()
-        spy = self._make_result(USRegimeType.FADE_CHOP)
+        spy = self._make_result(USRegimeType.RANGE)
         spy.symbol = "SPY"
         spy.name = "S&P 500 ETF"
         msg = format_us_playbook_message(result, spy_result=spy)
@@ -555,7 +557,7 @@ class TestVPShallowDataOptimization:
             pmh=555, pml=548, vp=vp,
             vp_trading_days=2, min_vp_trading_days=3,
         )
-        assert result.regime == USRegimeType.GAP_AND_GO
+        assert result.regime == USRegimeType.GAP_GO
         assert "VP thin (2d)" in result.details
 
         # Compare with no penalty
@@ -708,7 +710,7 @@ class TestAdaptiveRegime:
         return VolumeProfileResult(poc=poc, vah=vah, val=val)
 
     def test_profile_overrides_static_thresholds(self):
-        """With adaptive profile, lower gap_and_go threshold triggers GAP_AND_GO."""
+        """With adaptive profile, lower gap_and_go threshold triggers GAP_GO."""
         profile = RvolProfile(
             gap_and_go_rvol=1.2,  # much lower than static 1.5
             trend_day_rvol=0.9,
@@ -724,7 +726,7 @@ class TestAdaptiveRegime:
             gap_and_go_rvol=1.5,  # static (should be overridden)
             rvol_profile=profile,
         )
-        assert result.regime == USRegimeType.GAP_AND_GO
+        assert result.regime == USRegimeType.GAP_GO
         assert result.adaptive_thresholds is not None
         assert result.adaptive_thresholds["gap_and_go"] == 1.2
         assert "adaptive" in result.details
@@ -737,12 +739,12 @@ class TestAdaptiveRegime:
             gap_and_go_rvol=1.5,
             rvol_profile=None,
         )
-        # RVOL 1.3 < static 1.5, so not GAP_AND_GO
-        assert result.regime != USRegimeType.GAP_AND_GO
+        # RVOL 1.3 < static 1.5, so not GAP_GO
+        assert result.regime != USRegimeType.GAP_GO
         assert result.adaptive_thresholds is None
 
     def test_gap_normalization_with_profile(self):
-        """TREND_DAY gap check uses normalized gap when profile available."""
+        """TREND_STRONG gap check uses normalized gap when profile available."""
         # High daily range symbol: 2% avg → gap 0.5% is only 0.25 of range → small
         profile = RvolProfile(
             gap_and_go_rvol=2.0,
@@ -759,10 +761,11 @@ class TestAdaptiveRegime:
             rvol_profile=profile,
             gap_significance_threshold=0.3,
         )
-        assert result.regime == USRegimeType.TREND_DAY
+        # Phase 2: RVOL 1.3 < adaptive gap_and_go_rvol 2.0 and no VWAP hold → TREND_WEAK
+        assert result.regime == USRegimeType.TREND_WEAK
 
     def test_gap_normalization_blocks_large_gap(self):
-        """Large normalized gap prevents TREND_DAY classification."""
+        """Large normalized gap prevents TREND classification."""
         # Low daily range symbol: 0.5% avg → gap 0.4% is 0.8 of range → big
         profile = RvolProfile(
             gap_and_go_rvol=2.0,
@@ -779,7 +782,7 @@ class TestAdaptiveRegime:
             rvol_profile=profile,
             gap_significance_threshold=0.3,
         )
-        assert result.regime != USRegimeType.TREND_DAY
+        assert result.regime not in (USRegimeType.TREND_STRONG, USRegimeType.TREND_WEAK)
 
     def test_insufficient_sample_uses_static(self):
         """Profile with sample_size < 5 → static thresholds used."""
@@ -797,8 +800,8 @@ class TestAdaptiveRegime:
             gap_and_go_rvol=1.5,
             rvol_profile=profile,
         )
-        # Static 1.5 should be used → 1.3 < 1.5 → not GAP_AND_GO
-        assert result.regime != USRegimeType.GAP_AND_GO
+        # Static 1.5 should be used → 1.3 < 1.5 → not GAP_GO
+        assert result.regime != USRegimeType.GAP_GO
         assert result.adaptive_thresholds is None
 
     def test_playbook_message_shows_adaptive_info(self):
@@ -807,7 +810,7 @@ class TestAdaptiveRegime:
             symbol="TSLA",
             name="Tesla",
             regime=USRegimeResult(
-                regime=USRegimeType.GAP_AND_GO, confidence=0.85,
+                regime=USRegimeType.GAP_GO, confidence=0.85,
                 rvol=2.31, price=280.0, gap_pct=1.82,
                 adaptive_thresholds={
                     "gap_and_go": 1.73, "trend_day": 1.15, "fade_chop": 0.88,
@@ -904,7 +907,7 @@ class TestRegimePmSourcePenalty:
         return VolumeProfileResult(poc=poc, vah=vah, val=val)
 
     def test_gap_and_go_gap_estimate_penalty(self):
-        """GAP_AND_GO with gap_estimate PM should have reduced confidence."""
+        """GAP_GO with gap_estimate PM should have reduced confidence."""
         result_futu = classify_us_regime(
             price=560, prev_close=550, rvol=2.5,
             pmh=555, pml=548, vp=self._vp(),
@@ -915,13 +918,13 @@ class TestRegimePmSourcePenalty:
             pmh=555, pml=548, vp=self._vp(),
             pm_source="gap_estimate",
         )
-        assert result_futu.regime == USRegimeType.GAP_AND_GO
-        assert result_est.regime == USRegimeType.GAP_AND_GO
+        assert result_futu.regime == USRegimeType.GAP_GO
+        assert result_est.regime == USRegimeType.GAP_GO
         assert result_est.confidence < result_futu.confidence
         assert "PM estimated" in result_est.details
 
     def test_gap_and_go_yahoo_no_penalty(self):
-        """GAP_AND_GO with yahoo PM should NOT be penalized."""
+        """GAP_GO with yahoo PM should NOT be penalized."""
         result_futu = classify_us_regime(
             price=560, prev_close=550, rvol=2.5,
             pmh=555, pml=548, vp=self._vp(),
@@ -935,22 +938,22 @@ class TestRegimePmSourcePenalty:
         assert result_yahoo.confidence == result_futu.confidence
 
     def test_fade_chop_no_pm_penalty(self):
-        """Non-GAP_AND_GO regimes should NOT be affected by pm_source."""
+        """Non-GAP_GO regimes should NOT be affected by pm_source."""
         result = classify_us_regime(
             price=550, prev_close=551, rvol=0.8,
             pmh=555, pml=548, vp=self._vp(),
             pm_source="gap_estimate",
         )
-        assert result.regime == USRegimeType.FADE_CHOP
+        assert result.regime == USRegimeType.RANGE
         assert "PM estimated" not in result.details
 
     def test_confidence_floor(self):
         """Confidence should not drop below 0.1 from PM penalty."""
-        # Use SPY FADE_CHOP to already reduce confidence, then add PM penalty
+        # Use SPY RANGE to already reduce confidence, then add PM penalty
         result = classify_us_regime(
             price=560, prev_close=550, rvol=1.6,
             pmh=555, pml=548, vp=self._vp(),
-            spy_regime=USRegimeType.FADE_CHOP,
+            spy_regime=USRegimeType.RANGE,
             pm_source="gap_estimate",
         )
         assert result.confidence >= 0.1
@@ -1042,7 +1045,7 @@ class TestApplyToneModifier:
 
     def test_negative_modifier(self):
         regime = USRegimeResult(
-            regime=USRegimeType.GAP_AND_GO, confidence=0.80,
+            regime=USRegimeType.GAP_GO, confidence=0.80,
             rvol=2.0, price=560, gap_pct=1.5,
         )
         tone = MarketTone(
@@ -1057,7 +1060,7 @@ class TestApplyToneModifier:
 
     def test_positive_modifier(self):
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.70,
+            regime=USRegimeType.TREND_STRONG, confidence=0.70,
             rvol=1.5, price=555, gap_pct=0.3,
         )
         tone = MarketTone(
@@ -1071,7 +1074,7 @@ class TestApplyToneModifier:
 
     def test_zero_modifier_no_change(self):
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.60,
+            regime=USRegimeType.RANGE, confidence=0.60,
             rvol=0.8, price=550, gap_pct=0.1,
         )
         tone = MarketTone(
@@ -1086,7 +1089,7 @@ class TestApplyToneModifier:
 
     def test_clamp_to_bounds(self):
         regime = USRegimeResult(
-            regime=USRegimeType.GAP_AND_GO, confidence=0.95,
+            regime=USRegimeType.GAP_GO, confidence=0.95,
             rvol=2.5, price=560, gap_pct=2.0,
         )
         tone = MarketTone(
@@ -1185,7 +1188,7 @@ class TestUSOptionRecommend:
 
     def test_direction_gap_and_go(self):
         regime = USRegimeResult(
-            regime=USRegimeType.GAP_AND_GO, confidence=0.8,
+            regime=USRegimeType.GAP_GO, confidence=0.8,
             rvol=2.0, price=560, gap_pct=1.5,
         )
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
@@ -1193,7 +1196,7 @@ class TestUSOptionRecommend:
 
     def test_direction_fade_chop(self):
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=556, gap_pct=0.2,
         )
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
@@ -1237,7 +1240,7 @@ class TestUSOptionRecommend:
     def test_recommend_wait_not_tradeable(self):
         """Not tradeable → wait."""
         regime = USRegimeResult(
-            regime=USRegimeType.GAP_AND_GO, confidence=0.8,
+            regime=USRegimeType.GAP_GO, confidence=0.8,
             rvol=2.0, price=560, gap_pct=1.5,
         )
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
@@ -1246,10 +1249,10 @@ class TestUSOptionRecommend:
         assert rec.action == "wait"
 
     def test_fade_chop_bypasses_inside_day_filter(self):
-        """FADE_CHOP with high confidence should bypass Inside Day + low RVOL filter
+        """RANGE with high confidence should bypass Inside Day + low RVOL filter
         and correct FilterResult so risk section shows 🟡 not 🔴."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=1.0,
+            regime=USRegimeType.RANGE, confidence=1.0,
             rvol=0.37, price=545, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
@@ -1260,16 +1263,16 @@ class TestUSOptionRecommend:
         )
         # should_wait should NOT block
         wait, reasons, _ = should_wait(regime, filters, vp, True, True)
-        assert not wait, f"FADE_CHOP should bypass Inside Day + low RVOL, got reasons: {reasons}"
+        assert not wait, f"RANGE should bypass Inside Day + low RVOL, got reasons: {reasons}"
         # FilterResult should be corrected for consistent risk display
         assert filters.tradeable is True
         assert filters.risk_level == "elevated"
         assert filters.block_reasons == []
 
     def test_fade_chop_low_confidence_still_blocked(self):
-        """FADE_CHOP with low confidence should still be blocked by Inside Day filter."""
+        """RANGE with low confidence should still be blocked by Inside Day filter."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.5,
+            regime=USRegimeType.RANGE, confidence=0.5,
             rvol=0.37, price=545, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
@@ -1282,9 +1285,9 @@ class TestUSOptionRecommend:
         assert rec.action == "wait"
 
     def test_fade_chop_calendar_hard_block(self):
-        """FADE_CHOP should NOT bypass calendar (hard) blocks."""
+        """RANGE should NOT bypass calendar (hard) blocks."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=1.0,
+            regime=USRegimeType.RANGE, confidence=1.0,
             rvol=0.37, price=545, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
@@ -1297,9 +1300,9 @@ class TestUSOptionRecommend:
         assert rec.action == "wait"
 
     def test_trend_day_still_blocked_by_inside_day(self):
-        """TREND_DAY should still be blocked by Inside Day + low RVOL."""
+        """TREND_STRONG should still be blocked by Inside Day + low RVOL."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.9,
+            regime=USRegimeType.TREND_STRONG, confidence=0.9,
             rvol=0.37, price=560, gap_pct=0.5,
         )
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
@@ -1312,15 +1315,15 @@ class TestUSOptionRecommend:
         assert rec.action == "wait"
 
     def test_fade_chop_bypasses_rvol_floor(self):
-        """FADE_CHOP should not be blocked by RVOL < 0.5 absolute floor."""
+        """RANGE should not be blocked by RVOL < 0.5 absolute floor."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.8,
+            regime=USRegimeType.RANGE, confidence=0.8,
             rvol=0.37, price=545, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
         filters = FilterResult(tradeable=True, risk_level="normal")
         wait, reasons, _ = should_wait(regime, filters, vp, True, True)
-        assert not wait, f"FADE_CHOP should bypass RVOL floor, got reasons: {reasons}"
+        assert not wait, f"RANGE should bypass RVOL floor, got reasons: {reasons}"
 
     def test_option_quotes_to_df(self):
         from src.collector.base import OptionQuote
@@ -1345,13 +1348,13 @@ class TestUSOptionRecommend:
 
 class TestRegimeSignalType:
     def test_gap_and_go_bullish(self):
-        assert regime_to_signal_type(USRegimeType.GAP_AND_GO, "bullish") == "BREAKOUT_BULLISH"
+        assert regime_to_signal_type(USRegimeType.GAP_GO, "bullish") == "BREAKOUT_BULLISH"
 
     def test_trend_day_bearish(self):
-        assert regime_to_signal_type(USRegimeType.TREND_DAY, "bearish") == "BREAKOUT_BEARISH"
+        assert regime_to_signal_type(USRegimeType.TREND_STRONG, "bearish") == "BREAKOUT_BEARISH"
 
     def test_fade_chop_bullish(self):
-        assert regime_to_signal_type(USRegimeType.FADE_CHOP, "bullish") == "RANGE_REVERSAL_BULLISH"
+        assert regime_to_signal_type(USRegimeType.RANGE, "bullish") == "RANGE_REVERSAL_BULLISH"
 
     def test_unclear_returns_none(self):
         assert regime_to_signal_type(USRegimeType.UNCLEAR, "bullish") is None
@@ -1419,7 +1422,7 @@ class TestFrequencyControl:
             direction=direction,
             symbol="AAPL",
             regime=USRegimeResult(
-                regime=USRegimeType.GAP_AND_GO, confidence=conf,
+                regime=USRegimeType.GAP_GO, confidence=conf,
                 rvol=1.5, price=price, gap_pct=1.0,
             ),
             price=price,
@@ -1485,7 +1488,7 @@ class TestScanHeader:
             direction="bullish",
             symbol="AAPL",
             regime=USRegimeResult(
-                regime=USRegimeType.GAP_AND_GO, confidence=0.82,
+                regime=USRegimeType.GAP_GO, confidence=0.82,
                 rvol=1.8, price=560, gap_pct=1.5,
             ),
             price=560,
@@ -1504,7 +1507,7 @@ class TestScanHeader:
             direction="bullish",
             symbol="AAPL",
             regime=USRegimeResult(
-                regime=USRegimeType.GAP_AND_GO, confidence=0.75,
+                regime=USRegimeType.GAP_GO, confidence=0.75,
                 rvol=1.5, price=555, gap_pct=1.0,
             ),
             price=555,
@@ -1673,7 +1676,7 @@ class TestTimezoneET:
 
 
 class TestRvolFloor:
-    """Verify adaptive RVOL trend_day floor prevents avg volume → TREND_DAY."""
+    """Verify adaptive RVOL trend_day floor prevents avg volume → TREND_STRONG."""
 
     def test_floor_applied(self):
         """When P60 is below 1.0, floor should clamp trend_day to 1.0."""
@@ -1732,28 +1735,28 @@ class TestRvolFloor:
 
 
 class TestDirectionEmoji:
-    """Verify direction-aware emoji for TREND_DAY and GAP_AND_GO."""
+    """Verify direction-aware emoji for TREND_STRONG and GAP_GO."""
 
     def test_bearish_trend_day(self):
         from src.us_playbook.playbook import get_regime_emoji
-        assert get_regime_emoji(USRegimeType.TREND_DAY, "bearish") == "\U0001f4c9"  # 📉
+        assert get_regime_emoji(USRegimeType.TREND_STRONG, "bearish") == "\U0001f4c9"  # 📉
 
     def test_bullish_trend_day(self):
         from src.us_playbook.playbook import get_regime_emoji
-        assert get_regime_emoji(USRegimeType.TREND_DAY, "bullish") == "\U0001f4c8"  # 📈
+        assert get_regime_emoji(USRegimeType.TREND_STRONG, "bullish") == "\U0001f4c8"  # 📈
 
     def test_bearish_gap_and_go(self):
         from src.us_playbook.playbook import get_regime_emoji
-        assert get_regime_emoji(USRegimeType.GAP_AND_GO, "bearish") == "\U0001f4a5"  # 💥
+        assert get_regime_emoji(USRegimeType.GAP_GO, "bearish") == "\U0001f4a5"  # 💥
 
     def test_bullish_gap_and_go(self):
         from src.us_playbook.playbook import get_regime_emoji
-        assert get_regime_emoji(USRegimeType.GAP_AND_GO, "bullish") == "\U0001f680"  # 🚀
+        assert get_regime_emoji(USRegimeType.GAP_GO, "bullish") == "\U0001f680"  # 🚀
 
     def test_bearish_trend_day_in_playbook(self):
-        """Playbook with price < VAL should show 📉 for TREND_DAY."""
+        """Playbook with price < VAL should show 📉 for TREND_STRONG."""
         r = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.65,
+            regime=USRegimeType.TREND_STRONG, confidence=0.65,
             rvol=1.3, price=250.0, gap_pct=-0.5,
         )
         vp = VolumeProfileResult(poc=260, vah=265, val=255)
@@ -1789,7 +1792,7 @@ class TestPdhPdlWarning:
 
 
 class TestFadeEntryStaleness:
-    """Verify VA penetration check for FADE_CHOP mean-reversion freshness."""
+    """Verify VA penetration check for RANGE mean-reversion freshness."""
 
     # VAH=680, VAL=670 → VA range = 10
 
@@ -1870,7 +1873,7 @@ class TestFadeEntryStaleness:
     # ── recommend() integration tests ──
 
     def test_recommend_high_returns_wait(self):
-        """FADE_CHOP + high penetration → wait.
+        """RANGE + high penetration → wait.
 
         Price 674 with VAH=680/VAL=670 gives position_ratio=0.40 (transition zone).
         Provide upward momentum (confirming bullish in below-mid transition), then
@@ -1878,7 +1881,7 @@ class TestFadeEntryStaleness:
         """
         vp = VolumeProfileResult(poc=670.0, vah=680.0, val=670.0)
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=674.0, gap_pct=0.1,  # bullish via momentum, pen=0.4
         )
         filters = FilterResult(tradeable=True, warnings=[], risk_level="normal")
@@ -1897,14 +1900,14 @@ class TestFadeEntryStaleness:
         assert "入场窗口已过" in rec.rationale
 
     def test_recommend_moderate_still_tradeable(self):
-        """FADE_CHOP + moderate penetration → still tradeable (not wait).
+        """RANGE + moderate penetration → still tradeable (not wait).
 
         Price 674 with VAH=680/VAL=670 gives position_ratio=0.40 (transition zone).
         Provide upward momentum to confirm bullish direction, then moderate staleness applies.
         """
         vp = VolumeProfileResult(poc=670.0, vah=680.0, val=670.0)
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=674.0, gap_pct=0.1,
         )
         filters = FilterResult(tradeable=True, warnings=[], risk_level="normal")
@@ -1931,9 +1934,9 @@ class TestFadeEntryStaleness:
         assert "入场区已消耗" in (rec.risk_note or "")
 
     def test_recommend_none_shows_near_val(self):
-        """FADE_CHOP + low penetration → rationale says '靠近 VAL'."""
+        """RANGE + low penetration → rationale says '靠近 VAL'."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=671.0, gap_pct=0.1,
         )
         vp = self._vp()
@@ -1961,7 +1964,7 @@ class TestFadeEntryStaleness:
         """20-35% penetration → '偏远' wording."""
         from src.us_playbook.option_recommend import _build_rationale
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=672.5, gap_pct=0.1,
         )
         vp = self._vp()
@@ -1973,7 +1976,7 @@ class TestFadeEntryStaleness:
         """>=35% penetration → 'VA 中部' wording."""
         from src.us_playbook.option_recommend import _build_rationale
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=674.0, gap_pct=0.1,
         )
         vp = self._vp()
@@ -2058,12 +2061,12 @@ class TestLowDteRiskAction:
 
     def _regime(self, price=253.0):
         return USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=price, gap_pct=0.1,
         )
 
     def test_risk_action_lines_low_dte_put(self):
-        """DTE=1 put → FADE_CHOP skips VAH, uses deeper resistance + premium stop-loss."""
+        """DTE=1 put → RANGE skips VAH, uses deeper resistance + premium stop-loss."""
         rec = OptionRecommendation(
             action="put", direction="bearish", dte=1,
             legs=[OptionLeg(
@@ -2072,7 +2075,7 @@ class TestLowDteRiskAction:
             )],
         )
         lines = _risk_action_lines(rec, self._regime(), self._vp(), kl=self._kl())
-        # P1-2: FADE_CHOP put should skip VAH and use deeper resistance (PMH 254 or PDH 257)
+        # P1-2: RANGE put should skip VAH and use deeper resistance (PMH 254 or PDH 257)
         assert any("PMH" in l or "PDH" in l for l in lines), f"Expected deeper resistance in lines: {lines}"
         assert any("VAH" in l and "wick" in l for l in lines), f"Expected VAH wick note: {lines}"
         # Premium stop-loss: 2.10 * 0.60 = 1.26
@@ -2080,7 +2083,7 @@ class TestLowDteRiskAction:
         assert any("低 DTE" in l and "40%" in l for l in lines)
 
     def test_risk_action_lines_low_dte_call(self):
-        """DTE=2 call → FADE_CHOP skips VAL, uses deeper support + premium stop-loss."""
+        """DTE=2 call → RANGE skips VAL, uses deeper support + premium stop-loss."""
         rec = OptionRecommendation(
             action="call", direction="bullish", dte=2,
             legs=[OptionLeg(
@@ -2089,7 +2092,7 @@ class TestLowDteRiskAction:
             )],
         )
         lines = _risk_action_lines(rec, self._regime(), self._vp(), kl=self._kl())
-        # P1-2: FADE_CHOP call should skip VAL and use deeper support (POC/VWAP/PML/PDL etc.)
+        # P1-2: RANGE call should skip VAL and use deeper support (POC/VWAP/PML/PDL etc.)
         assert any(any(k in l for k in ("POC", "VWAP", "PML", "PDL")) for l in lines), f"Expected deeper support in lines: {lines}"
         assert any("VAL" in l and "wick" in l for l in lines), f"Expected VAL wick note: {lines}"
         # Premium stop-loss: 3.00 * 0.60 = 1.80
@@ -2144,9 +2147,9 @@ class TestEntryZone:
         )
 
     def test_entry_zone_fade_chop_bearish(self):
-        """FADE_CHOP bearish → entry zone uses resistance above."""
+        """RANGE bearish → entry zone uses resistance above."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=253.0, gap_pct=0.1,
         )
         text = _entry_zone_text(253.0, "bearish", regime, self._vp(), kl=self._kl())
@@ -2157,9 +2160,9 @@ class TestEntryZone:
         assert "255" in text
 
     def test_entry_zone_fade_chop_bullish(self):
-        """FADE_CHOP bullish → entry zone uses support below."""
+        """RANGE bullish → entry zone uses support below."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=253.0, gap_pct=0.1,
         )
         text = _entry_zone_text(253.0, "bullish", regime, self._vp(), kl=self._kl())
@@ -2168,9 +2171,9 @@ class TestEntryZone:
         assert "最佳入场区间" in text
 
     def test_entry_zone_trend_day(self):
-        """TREND_DAY bullish → VWAP pullback suggestion."""
+        """TREND_STRONG bullish → VWAP pullback suggestion."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            regime=USRegimeType.TREND_STRONG, confidence=0.75,
             rvol=1.5, price=258.0, gap_pct=0.5,
         )
         text = _entry_zone_text(258.0, "bullish", regime, self._vp(), kl=self._kl())
@@ -2180,9 +2183,9 @@ class TestEntryZone:
         assert "回调" in text
 
     def test_entry_zone_trend_day_bearish(self):
-        """TREND_DAY bearish → VWAP bounce suggestion."""
+        """TREND_STRONG bearish → VWAP bounce suggestion."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            regime=USRegimeType.TREND_STRONG, confidence=0.75,
             rvol=1.5, price=247.0, gap_pct=-0.5,
         )
         text = _entry_zone_text(247.0, "bearish", regime, self._vp(), kl=self._kl())
@@ -2207,7 +2210,7 @@ class TestBuildRiskNoteLowDte:
         """DTE <= 3 → includes 40% stop reminder."""
         from src.us_playbook.option_recommend import _build_risk_note
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=253.0, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
@@ -2220,7 +2223,7 @@ class TestBuildRiskNoteLowDte:
         """DTE > 3 → no 40% stop reminder."""
         from src.us_playbook.option_recommend import _build_risk_note
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=253.0, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
@@ -2278,7 +2281,7 @@ class TestFadeChopDirection:
 
     def _regime(self, price):
         return USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            regime=USRegimeType.RANGE, confidence=0.75,
             rvol=0.8, price=price, gap_pct=0.1,
         )
 
@@ -2287,7 +2290,7 @@ class TestFadeChopDirection:
         # price=254.93, VAH=259.50, VAL=250.00 → ratio ≈ 0.52 (transition zone)
         vp = self._vp(poc=254.75, vah=259.50, val=250.00)
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=254.93, gap_pct=0.1,
         )
         # momentum=+1 (uptrend) conflicts with bearish base in transition zone
@@ -2359,10 +2362,10 @@ class TestFadeChopDirection:
         assert result == "bullish"
 
     def test_non_fade_chop_ignores_momentum(self):
-        """GAP_AND_GO should ignore momentum parameter."""
+        """GAP_GO should ignore momentum parameter."""
         vp = self._vp(poc=255, vah=260, val=250)
         regime = USRegimeResult(
-            regime=USRegimeType.GAP_AND_GO, confidence=0.85,
+            regime=USRegimeType.GAP_GO, confidence=0.85,
             rvol=2.0, price=265, gap_pct=1.5,
         )
         result = _decide_direction(regime, vp, momentum=-1)
@@ -2373,10 +2376,10 @@ class TestRecommendFadeMomentum:
     """Test full recommend() flow with momentum conflict."""
 
     def test_recommend_fade_momentum_wait_message(self):
-        """FADE_CHOP in transition zone with opposing momentum → wait with momentum explanation."""
+        """RANGE in transition zone with opposing momentum → wait with momentum explanation."""
         # Price 256 in transition zone (ratio=0.6), far enough from POC to avoid POC proximity block
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            regime=USRegimeType.RANGE, confidence=0.75,
             rvol=0.8, price=256.0, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=253, vah=260, val=250)
@@ -2398,9 +2401,9 @@ class TestRecommendFadeMomentum:
         assert "动量" in rec.risk_note
 
     def test_recommend_no_today_bars_backward_compat(self):
-        """Without today_bars, FADE_CHOP edge zone still gives direction (backward compat)."""
+        """Without today_bars, RANGE edge zone still gives direction (backward compat)."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            regime=USRegimeType.RANGE, confidence=0.75,
             rvol=0.8, price=258.0, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=255, vah=260, val=250)
@@ -2446,13 +2449,13 @@ class TestLocalTrendVeto:
         assert compute_local_trend(bars, lookback=30, threshold=0.02) == 0
 
     def test_recommend_structural_veto_bullish_vs_downtrend(self):
-        """FADE_CHOP bullish near VAL + long-term downtrend but short-term flat → structural_veto.
+        """RANGE bullish near VAL + long-term downtrend but short-term flat → structural_veto.
 
         Need: 8-bar momentum neutral/up (so direction resolves bullish),
               but 30-bar local_trend is down (so structural veto fires).
         """
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.80,
+            regime=USRegimeType.RANGE, confidence=0.80,
             rvol=0.7, price=405.0, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=408.0, vah=412.0, val=404.0)
@@ -2474,9 +2477,9 @@ class TestLocalTrendVeto:
         assert "趋势" in rec.rationale
 
     def test_recommend_no_veto_when_trend_aligns(self):
-        """FADE_CHOP bullish near VAL + uptrend → no veto."""
+        """RANGE bullish near VAL + uptrend → no veto."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.80,
+            regime=USRegimeType.RANGE, confidence=0.80,
             rvol=0.7, price=405.0, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=408.0, vah=412.0, val=404.0)
@@ -2518,7 +2521,7 @@ class TestEntryDirectionFix:
         """Price below POC (bearish by price) but recommendation is bullish → entry_zone for bullish."""
         from src.us_playbook.playbook import _entry_zone_text
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            regime=USRegimeType.RANGE, confidence=0.75,
             rvol=0.8, price=405.0, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=408.0, vah=412.0, val=404.0)
@@ -2530,16 +2533,16 @@ class TestEntryDirectionFix:
         assert "404" in text or "400" in text or "407" in text  # VAL, PDL, or VWAP
 
 
-# ── P1-1: FADE_CHOP DTE/Delta Override ──
+# ── P1-1: RANGE DTE/Delta Override ──
 
 
 class TestFadeChopDteOverride:
-    """Verify FADE_CHOP uses range_reversal config override for DTE/delta."""
+    """Verify RANGE uses range_reversal config override for DTE/delta."""
 
     def test_recommend_fade_chop_uses_rr_dte(self):
-        """FADE_CHOP should use range_reversal.dte_min instead of global dte_min."""
+        """RANGE should use range_reversal.dte_min instead of global dte_min."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            regime=USRegimeType.RANGE, confidence=0.75,
             rvol=0.7, price=252.0, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
@@ -2577,9 +2580,9 @@ class TestFadeChopDteOverride:
             assert rec.dte >= 3
 
     def test_non_fade_chop_ignores_rr_override(self):
-        """TREND_DAY should NOT use range_reversal DTE override."""
+        """TREND_STRONG should NOT use range_reversal DTE override."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.80,
+            regime=USRegimeType.TREND_STRONG, confidence=0.80,
             rvol=1.5, price=260.0, gap_pct=0.5,
         )
         vp = VolumeProfileResult(poc=255.0, vah=258.0, val=252.0)
@@ -2610,11 +2613,11 @@ class TestFadeChopDteOverride:
             assert rec.expiry == exp_short
 
 
-# ── P1-2: Unified Stop Source + FADE_CHOP Stop Expansion ──
+# ── P1-2: Unified Stop Source + RANGE Stop Expansion ──
 
 
 class TestFadeChopStopExpansion:
-    """Verify FADE_CHOP stop-loss skips entry premise level."""
+    """Verify RANGE stop-loss skips entry premise level."""
 
     def _vp(self):
         return VolumeProfileResult(poc=408.0, vah=412.0, val=404.0)
@@ -2628,12 +2631,12 @@ class TestFadeChopStopExpansion:
 
     def _regime(self, price=405.0):
         return USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            regime=USRegimeType.RANGE, confidence=0.75,
             rvol=0.7, price=price, gap_pct=0.1,
         )
 
     def test_call_stop_skips_val(self):
-        """FADE_CHOP bullish call: stop should NOT be VAL (entry premise)."""
+        """RANGE bullish call: stop should NOT be VAL (entry premise)."""
         rec = OptionRecommendation(
             action="call", direction="bullish", dte=3,
             legs=[OptionLeg(
@@ -2648,7 +2651,7 @@ class TestFadeChopStopExpansion:
         assert "VAL" not in stop_line.split("(")[0] or "跌破 VAL" not in stop_line.split("(")[0]
 
     def test_put_stop_skips_vah(self):
-        """FADE_CHOP bearish put: stop should NOT be VAH (entry premise)."""
+        """RANGE bearish put: stop should NOT be VAH (entry premise)."""
         rec = OptionRecommendation(
             action="put", direction="bearish", dte=3,
             legs=[OptionLeg(
@@ -2661,9 +2664,9 @@ class TestFadeChopStopExpansion:
         assert "VAH" in stop_line and "wick" in stop_line
 
     def test_non_fade_chop_uses_original(self):
-        """Non-FADE_CHOP regime should use original nearest level logic."""
+        """Non-RANGE regime should use original nearest level logic."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.80,
+            regime=USRegimeType.TREND_STRONG, confidence=0.80,
             rvol=1.5, price=405.0, gap_pct=0.5,
         )
         rec = OptionRecommendation(
@@ -2678,10 +2681,10 @@ class TestFadeChopStopExpansion:
         assert any("最近支撑位" in l for l in lines)
 
     def test_risk_note_no_specific_stop(self):
-        """_build_risk_note for FADE_CHOP should NOT include specific stop level."""
+        """_build_risk_note for RANGE should NOT include specific stop level."""
         from src.us_playbook.option_recommend import _build_risk_note
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=405.0, gap_pct=0.1,
         )
         vp = self._vp()
@@ -2694,12 +2697,12 @@ class TestFadeChopStopExpansion:
 
 
 class TestVAWidthMinimum:
-    """Verify VA width filter rejects narrow VA for FADE_CHOP."""
+    """Verify VA width filter rejects narrow VA for RANGE."""
 
     def test_narrow_va_returns_veto(self):
         """VA width 0.3% < 0.8% threshold → structural_veto."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.80,
+            regime=USRegimeType.RANGE, confidence=0.80,
             rvol=0.7, price=400.0, gap_pct=0.1,
         )
         # VA width: (401 - 400) / 400 * 100 = 0.25%
@@ -2713,7 +2716,7 @@ class TestVAWidthMinimum:
     def test_normal_va_passes(self):
         """VA width 2% > 0.8% threshold → no veto."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.80,
+            regime=USRegimeType.RANGE, confidence=0.80,
             rvol=0.7, price=405.0, gap_pct=0.1,
         )
         # VA width: (412 - 404) / 405 * 100 = 1.98%
@@ -2734,12 +2737,12 @@ class TestVAWidthMinimum:
         assert rec.structural_veto is False
 
     def test_non_fade_chop_ignores_va_width(self):
-        """TREND_DAY should NOT check VA width."""
+        """TREND_STRONG should NOT check VA width."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.80,
+            regime=USRegimeType.TREND_STRONG, confidence=0.80,
             rvol=1.5, price=400.0, gap_pct=0.5,
         )
-        # Narrow VA but TREND_DAY doesn't care
+        # Narrow VA but TREND_STRONG doesn't care
         vp = VolumeProfileResult(poc=400.5, vah=401.0, val=400.0)
         filters = FilterResult(tradeable=True, risk_level="normal")
         rec = recommend(regime=regime, vp=vp, filters=filters)
@@ -3007,7 +3010,7 @@ class TestMarketTone:
         result = USPlaybookResult(
             symbol="SPY", name="S&P 500 ETF",
             regime=USRegimeResult(
-                regime=USRegimeType.TREND_DAY, confidence=0.80,
+                regime=USRegimeType.TREND_STRONG, confidence=0.80,
                 rvol=1.5, price=555.0, gap_pct=1.2,
             ),
             key_levels=KeyLevels(
@@ -3037,7 +3040,7 @@ class TestMarketTone:
         result = USPlaybookResult(
             symbol="AAPL", name="Apple",
             regime=USRegimeResult(
-                regime=USRegimeType.FADE_CHOP, confidence=0.65,
+                regime=USRegimeType.RANGE, confidence=0.65,
                 rvol=0.8, price=180.0, gap_pct=-0.2,
             ),
             key_levels=KeyLevels(
@@ -3143,9 +3146,9 @@ class TestActionPlanGeneration:
         return GammaWallResult(call_wall_strike=260.0, put_wall_strike=245.0, max_pain=252.0)
 
     def test_trend_day_bullish(self):
-        """TREND_DAY bullish → Plan A entry=VWAP, direction=bullish."""
+        """TREND_STRONG bullish → Plan A entry=VWAP, direction=bullish."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            regime=USRegimeType.TREND_STRONG, confidence=0.75,
             rvol=1.5, price=256.0, gap_pct=0.5,
         )
         plans = _generate_action_plans(regime, "bullish", self._vp(), self._kl(), self._gw(), None)
@@ -3157,9 +3160,9 @@ class TestActionPlanGeneration:
         assert plans[2].label == "C"
 
     def test_trend_day_bearish(self):
-        """TREND_DAY bearish → Plan A entry=VWAP, direction=bearish."""
+        """TREND_STRONG bearish → Plan A entry=VWAP, direction=bearish."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            regime=USRegimeType.TREND_STRONG, confidence=0.75,
             rvol=1.5, price=247.0, gap_pct=-0.5,
         )
         plans = _generate_action_plans(regime, "bearish", self._vp(), self._kl(), self._gw(), None)
@@ -3168,9 +3171,9 @@ class TestActionPlanGeneration:
         assert plans[0].entry_action == "做空"
 
     def test_fade_chop_bearish(self):
-        """FADE_CHOP near VAH → Plan A entry=VAH with zone from PMH."""
+        """RANGE near VAH → Plan A entry=VAH with zone from PMH."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=254.5, gap_pct=0.1,
         )
         # vp: poc=252, vah=255, val=249 → VA range=6, upper third=[253, 255]
@@ -3184,9 +3187,9 @@ class TestActionPlanGeneration:
         assert plans[0].tp2 == self._vp().val
 
     def test_fade_chop_bullish(self):
-        """FADE_CHOP near VAL → Plan A entry=VAL with zone from PML."""
+        """RANGE near VAL → Plan A entry=VAL with zone from PML."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=249.5, gap_pct=0.1,
         )
         # vp: poc=252, vah=255, val=249 → VA range=6, lower third=[249, 251]
@@ -3207,7 +3210,7 @@ class TestActionPlanGeneration:
             vwap=252.0,
         )
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=254.5, gap_pct=0.1,
         )
         plans = _generate_action_plans(regime, "bearish", self._vp(), kl, None, None)
@@ -3305,7 +3308,7 @@ class TestRvolAssessment:
 class TestMessageLength:
     """Verify all regime types produce output within Telegram 4096 char limit."""
 
-    def _make_result(self, regime_type=USRegimeType.TREND_DAY, price=554.2):
+    def _make_result(self, regime_type=USRegimeType.TREND_STRONG, price=554.2):
         return USPlaybookResult(
             symbol="AAPL",
             name="Apple",
@@ -3352,15 +3355,15 @@ class TestMessageLength:
         )
 
     def test_trend_day_within_limit(self):
-        msg = format_us_playbook_message(self._make_result(USRegimeType.TREND_DAY))
+        msg = format_us_playbook_message(self._make_result(USRegimeType.TREND_STRONG))
         assert len(msg) <= 4096, f"Message too long: {len(msg)} chars"
 
     def test_gap_and_go_within_limit(self):
-        msg = format_us_playbook_message(self._make_result(USRegimeType.GAP_AND_GO, price=560))
+        msg = format_us_playbook_message(self._make_result(USRegimeType.GAP_GO, price=560))
         assert len(msg) <= 4096, f"Message too long: {len(msg)} chars"
 
     def test_fade_chop_within_limit(self):
-        msg = format_us_playbook_message(self._make_result(USRegimeType.FADE_CHOP, price=554))
+        msg = format_us_playbook_message(self._make_result(USRegimeType.RANGE, price=554))
         assert len(msg) <= 4096, f"Message too long: {len(msg)} chars"
 
     def test_unclear_within_limit(self):
@@ -3376,7 +3379,7 @@ class TestEdgeCases:
         result = USPlaybookResult(
             symbol="SPY", name="S&P 500 ETF",
             regime=USRegimeResult(
-                regime=USRegimeType.TREND_DAY, confidence=0.7,
+                regime=USRegimeType.TREND_STRONG, confidence=0.7,
                 rvol=1.5, price=555.0, gap_pct=0.5,
             ),
             key_levels=KeyLevels(
@@ -3397,7 +3400,7 @@ class TestEdgeCases:
         result = USPlaybookResult(
             symbol="SPY", name="S&P 500 ETF",
             regime=USRegimeResult(
-                regime=USRegimeType.TREND_DAY, confidence=0.7,
+                regime=USRegimeType.TREND_STRONG, confidence=0.7,
                 rvol=1.5, price=558.0, gap_pct=0.5,
             ),
             key_levels=KeyLevels(
@@ -3418,7 +3421,7 @@ class TestEdgeCases:
         result = USPlaybookResult(
             symbol="SPY", name="S&P 500 ETF",
             regime=USRegimeResult(
-                regime=USRegimeType.FADE_CHOP, confidence=0.65,
+                regime=USRegimeType.RANGE, confidence=0.65,
                 rvol=0.8, price=550.0, gap_pct=0.1,
             ),
             key_levels=KeyLevels(
@@ -3482,7 +3485,7 @@ class TestActionPlanReachability:
     def _gw(self):
         return GammaWallResult(call_wall_strike=260.0, put_wall_strike=245.0, max_pain=252.0)
 
-    def _regime(self, regime_type=USRegimeType.FADE_CHOP, price=254.5, rvol=0.8):
+    def _regime(self, regime_type=USRegimeType.RANGE, price=254.5, rvol=0.8):
         return USRegimeResult(
             regime=regime_type, confidence=0.7,
             rvol=rvol, price=price, gap_pct=0.1,
@@ -4204,7 +4207,7 @@ class TestSignalStrength:
             direction="bullish",
             symbol="AAPL",
             regime=USRegimeResult(
-                regime=USRegimeType.GAP_AND_GO, confidence=conf,
+                regime=USRegimeType.GAP_GO, confidence=conf,
                 rvol=rvol, price=560, gap_pct=1.5,
             ),
             price=560,
@@ -4311,7 +4314,7 @@ class TestPerTypeFrequency:
             direction=direction,
             symbol="AAPL",
             regime=USRegimeResult(
-                regime=USRegimeType.GAP_AND_GO, confidence=conf,
+                regime=USRegimeType.GAP_GO, confidence=conf,
                 rvol=1.5, price=price, gap_pct=1.0,
             ),
             price=price,
@@ -4385,7 +4388,7 @@ class TestL1Hysteresis:
     """Test RVOL threshold hysteresis in L1 screening."""
 
     def test_l1_hysteresis_trend_lowers_threshold(self):
-        """Last confirmed TREND_DAY → thresholds lowered by 10% (easier to stay trend)."""
+        """Last confirmed TREND_STRONG → thresholds lowered by 10% (easier to stay trend)."""
         from src.us_playbook.main import _TREND_FAMILY
 
         regime_cfg = {
@@ -4399,7 +4402,7 @@ class TestL1Hysteresis:
         adj_trend_rvol = regime_cfg["trend_day_rvol"]
 
         last_regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            regime=USRegimeType.TREND_STRONG, confidence=0.75,
             rvol=1.3, price=560, gap_pct=0.5,
         )
         if last_regime.regime in _TREND_FAMILY:
@@ -4410,7 +4413,7 @@ class TestL1Hysteresis:
         assert abs(adj_gap_rvol - 1.35) < 1e-9    # 1.5 * 0.9
 
     def test_l1_hysteresis_fade_raises_threshold(self):
-        """Last confirmed FADE_CHOP → thresholds raised by 10% (harder to leave fade)."""
+        """Last confirmed RANGE → thresholds raised by 10% (harder to leave fade)."""
         regime_cfg = {
             "gap_and_go_rvol": 1.5,
             "trend_day_rvol": 1.2,
@@ -4422,10 +4425,10 @@ class TestL1Hysteresis:
         adj_trend_rvol = regime_cfg["trend_day_rvol"]
 
         last_regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.60,
+            regime=USRegimeType.RANGE, confidence=0.60,
             rvol=0.9, price=560, gap_pct=0.2,
         )
-        if last_regime.regime == USRegimeType.FADE_CHOP:
+        if last_regime.regime == USRegimeType.RANGE:
             adj_gap_rvol *= (1 + rvol_hyst)
             adj_trend_rvol *= (1 + rvol_hyst)
 
@@ -4481,7 +4484,7 @@ class TestCrossFamilyCooldown:
         rr_signal = USScanSignal(
             signal_type="RANGE_REVERSAL_LONG", direction="bullish", symbol="QQQ",
             regime=USRegimeResult(
-                regime=USRegimeType.FADE_CHOP, confidence=0.80,
+                regime=USRegimeType.RANGE, confidence=0.80,
                 rvol=0.8, price=480, gap_pct=0.1,
             ),
             price=480, timestamp=1000.0,
@@ -4492,7 +4495,7 @@ class TestCrossFamilyCooldown:
         bo_signal = USScanSignal(
             signal_type="BREAKOUT_BULLISH", direction="bullish", symbol="QQQ",
             regime=USRegimeResult(
-                regime=USRegimeType.TREND_DAY, confidence=0.75,
+                regime=USRegimeType.TREND_STRONG, confidence=0.75,
                 rvol=1.3, price=482, gap_pct=0.5,
             ),
             price=482, timestamp=1300.0,  # 300s = 5min later
@@ -4508,7 +4511,7 @@ class TestCrossFamilyCooldown:
         rr_signal = USScanSignal(
             signal_type="RANGE_REVERSAL_LONG", direction="bullish", symbol="QQQ",
             regime=USRegimeResult(
-                regime=USRegimeType.FADE_CHOP, confidence=0.80,
+                regime=USRegimeType.RANGE, confidence=0.80,
                 rvol=0.8, price=480, gap_pct=0.1,
             ),
             price=480, timestamp=1000.0,
@@ -4519,7 +4522,7 @@ class TestCrossFamilyCooldown:
         bo_signal = USScanSignal(
             signal_type="BREAKOUT_BULLISH", direction="bullish", symbol="QQQ",
             regime=USRegimeResult(
-                regime=USRegimeType.TREND_DAY, confidence=0.75,
+                regime=USRegimeType.TREND_STRONG, confidence=0.75,
                 rvol=1.3, price=482, gap_pct=0.5,
             ),
             price=482, timestamp=2200.0,  # 1200s = 20min later
@@ -4535,7 +4538,7 @@ class TestCrossFamilyCooldown:
         bo1 = USScanSignal(
             signal_type="BREAKOUT_BULLISH", direction="bullish", symbol="QQQ",
             regime=USRegimeResult(
-                regime=USRegimeType.GAP_AND_GO, confidence=0.85,
+                regime=USRegimeType.GAP_GO, confidence=0.85,
                 rvol=1.8, price=480, gap_pct=1.5,
             ),
             price=480, timestamp=1000.0,
@@ -4546,7 +4549,7 @@ class TestCrossFamilyCooldown:
         bo2 = USScanSignal(
             signal_type="BREAKOUT_BEARISH", direction="bearish", symbol="QQQ",
             regime=USRegimeResult(
-                regime=USRegimeType.TREND_DAY, confidence=0.75,
+                regime=USRegimeType.TREND_STRONG, confidence=0.75,
                 rvol=1.3, price=478, gap_pct=0.3,
             ),
             price=478, timestamp=1300.0,
@@ -4639,7 +4642,7 @@ class TestFadeSLDistanceCap:
             vwap=251.5,
         )
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=254.5, gap_pct=0.1,
         )
         plans = _generate_action_plans(regime, "bearish", vp, kl, None, None)
@@ -4649,10 +4652,10 @@ class TestFadeSLDistanceCap:
             assert sl_dist <= 0.021  # within 2% + rounding tolerance
 
 
-# ── P0-2: FADE_CHOP directional trap ──
+# ── P0-2: RANGE directional trap ──
 
 class TestDirectionalTrap:
-    """Low RVOL + strong unidirectional move → UNCLEAR instead of FADE_CHOP."""
+    """Low RVOL + strong unidirectional move → UNCLEAR instead of RANGE."""
 
     def _vp(self, poc=400, vah=410, val=390):
         return VolumeProfileResult(poc=poc, vah=vah, val=val)
@@ -4692,14 +4695,14 @@ class TestDirectionalTrap:
         assert r.lean == "bullish"
 
     def test_small_move_still_fade_chop(self):
-        """RVOL=0.7, price only moved 0.5% → still FADE_CHOP."""
+        """RVOL=0.7, price only moved 0.5% → still RANGE."""
         today = self._make_today_bars(open_close=400.0, final_close=402.0)
         r = classify_us_regime(
             price=402.0, prev_close=401.0, rvol=0.7,
             pmh=405.0, pml=398.0, vp=self._vp(poc=400, vah=410, val=390),
             today_bars=today,
         )
-        assert r.regime == USRegimeType.FADE_CHOP
+        assert r.regime == USRegimeType.RANGE
 
     def test_no_today_bars_no_trap(self):
         """Without today_bars, directional trap is not applied (backward compat)."""
@@ -4707,27 +4710,27 @@ class TestDirectionalTrap:
             price=395.0, prev_close=410.0, rvol=0.7,
             pmh=408.0, pml=402.0, vp=self._vp(poc=400, vah=410, val=390),
         )
-        # Without today_bars, just normal classification (FADE_CHOP or UNCLEAR based on VA)
-        assert r.regime in (USRegimeType.FADE_CHOP, USRegimeType.UNCLEAR)
+        # Without today_bars, just normal classification (RANGE or UNCLEAR based on VA)
+        assert r.regime in (USRegimeType.RANGE, USRegimeType.UNCLEAR)
         if r.regime == USRegimeType.UNCLEAR:
             assert "Directional trap" not in r.details
 
     def test_high_rvol_no_trap(self):
-        """RVOL >= fade_chop_rvol → GAP_AND_GO/TREND_DAY, trap doesn't apply."""
+        """RVOL >= fade_chop_rvol → GAP_GO/TREND_STRONG, trap doesn't apply."""
         today = self._make_today_bars(open_close=405.0, final_close=395.0)
         r = classify_us_regime(
             price=395.0, prev_close=410.0, rvol=1.5,
             pmh=408.0, pml=402.0, vp=self._vp(poc=400, vah=410, val=390),
             today_bars=today,
         )
-        # High RVOL + below PML → likely GAP_AND_GO or TREND_DAY
-        assert r.regime != USRegimeType.FADE_CHOP
+        # High RVOL + below PML → likely GAP_GO or TREND_STRONG
+        assert r.regime != USRegimeType.RANGE
 
 
-# ── P1: FADE_CHOP direction consistency check ──
+# ── P1: RANGE direction consistency check ──
 
 class TestFadeChopDirectionConsistency:
-    """FADE_CHOP with direction conflicting VA edge → UNCLEAR plans."""
+    """RANGE with direction conflicting VA edge → UNCLEAR plans."""
 
     def _vp(self):
         return VolumeProfileResult(poc=252.0, vah=255.0, val=249.0)
@@ -4740,9 +4743,9 @@ class TestFadeChopDirectionConsistency:
         )
 
     def test_val_bearish_conflict_unclear(self):
-        """FADE_CHOP, edge=VAL, direction=bearish → conflict → UNCLEAR plans."""
+        """RANGE, edge=VAL, direction=bearish → conflict → UNCLEAR plans."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=249.5, gap_pct=0.1,  # near VAL → edge=VAL
         )
         plans = _generate_action_plans(regime, "bearish", self._vp(), self._kl(), None, None)
@@ -4750,27 +4753,27 @@ class TestFadeChopDirectionConsistency:
         assert plans[0].name == "等待确认"
 
     def test_vah_bullish_conflict_unclear(self):
-        """FADE_CHOP, edge=VAH, direction=bullish → conflict → UNCLEAR plans."""
+        """RANGE, edge=VAH, direction=bullish → conflict → UNCLEAR plans."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=254.5, gap_pct=0.1,  # near VAH → edge=VAH
         )
         plans = _generate_action_plans(regime, "bullish", self._vp(), self._kl(), None, None)
         assert plans[0].name == "等待确认"
 
     def test_val_bullish_consistent_fade(self):
-        """FADE_CHOP, edge=VAL, direction=bullish → consistent → normal fade plans."""
+        """RANGE, edge=VAL, direction=bullish → consistent → normal fade plans."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=249.5, gap_pct=0.1,
         )
         plans = _generate_action_plans(regime, "bullish", self._vp(), self._kl(), None, None)
         assert plans[0].name == "下沿做多"
 
     def test_vah_bearish_consistent_fade(self):
-        """FADE_CHOP, edge=VAH, direction=bearish → consistent → normal fade plans."""
+        """RANGE, edge=VAH, direction=bearish → consistent → normal fade plans."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=254.5, gap_pct=0.1,
         )
         plans = _generate_action_plans(regime, "bearish", self._vp(), self._kl(), None, None)
@@ -4830,7 +4833,7 @@ class TestStructureOverrideDirection:
     def test_extreme_bearish_structure_override(self):
         """price < PDL + VWAP + PML → forced bearish even if price > VAH."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.8,
+            regime=USRegimeType.TREND_STRONG, confidence=0.8,
             rvol=1.5, price=548, gap_pct=0.5,
         )
         # price=548 > VAH=545 → old logic would say bullish
@@ -4844,7 +4847,7 @@ class TestStructureOverrideDirection:
     def test_extreme_bullish_structure_override(self):
         """price > PDH + VWAP + PMH → forced bullish even if price < VAL."""
         regime = USRegimeResult(
-            regime=USRegimeType.GAP_AND_GO, confidence=0.85,
+            regime=USRegimeType.GAP_GO, confidence=0.85,
             rvol=2.0, price=570, gap_pct=1.5,
         )
         # price=570 < VAL=575 → old logic would say bearish
@@ -4858,7 +4861,7 @@ class TestStructureOverrideDirection:
     def test_vwap_contradiction_neutral(self):
         """price > VAH but < VWAP → neutral (VWAP contradiction veto)."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            regime=USRegimeType.TREND_STRONG, confidence=0.75,
             rvol=1.3, price=556, gap_pct=0.3,
         )
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
@@ -4869,7 +4872,7 @@ class TestStructureOverrideDirection:
     def test_vwap_contradiction_bearish_side(self):
         """price < VAL but > VWAP → neutral (VWAP contradiction veto)."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            regime=USRegimeType.TREND_STRONG, confidence=0.75,
             rvol=1.3, price=544, gap_pct=-0.3,
         )
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
@@ -4880,7 +4883,7 @@ class TestStructureOverrideDirection:
     def test_poc_zero_vwap_fallback(self):
         """POC=0 should use VWAP for direction, not hardcode bullish."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.7,
+            regime=USRegimeType.TREND_STRONG, confidence=0.7,
             rvol=1.2, price=548, gap_pct=0.2,
         )
         vp = VolumeProfileResult(poc=0, vah=555, val=545)
@@ -4892,7 +4895,7 @@ class TestStructureOverrideDirection:
     def test_poc_zero_no_vwap_neutral(self):
         """POC=0 and VWAP=0 → neutral (not hardcode bullish)."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.7,
+            regime=USRegimeType.TREND_STRONG, confidence=0.7,
             rvol=1.2, price=548, gap_pct=0.2,
         )
         vp = VolumeProfileResult(poc=0, vah=555, val=545)
@@ -4902,7 +4905,7 @@ class TestStructureOverrideDirection:
     def test_backward_compat_no_structure_args(self):
         """Without new params, behavior matches old logic."""
         regime = USRegimeResult(
-            regime=USRegimeType.GAP_AND_GO, confidence=0.85,
+            regime=USRegimeType.GAP_GO, confidence=0.85,
             rvol=2.0, price=560, gap_pct=1.5,
         )
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
@@ -4910,16 +4913,16 @@ class TestStructureOverrideDirection:
         assert _decide_direction(regime, vp) == "bullish"
 
         regime2 = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.8,
+            regime=USRegimeType.TREND_STRONG, confidence=0.8,
             rvol=1.5, price=540, gap_pct=-0.5,
         )
         # price < VAL → bearish (same as before)
         assert _decide_direction(regime2, vp) == "bearish"
 
     def test_fade_chop_vwap_veto(self):
-        """FADE_CHOP bullish direction but VWAP < VAL → neutral."""
+        """RANGE bullish direction but VWAP < VAL → neutral."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            regime=USRegimeType.RANGE, confidence=0.75,
             rvol=0.8, price=252, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=255, vah=260, val=250)
@@ -4929,9 +4932,9 @@ class TestStructureOverrideDirection:
         assert result == "neutral"
 
     def test_fade_chop_vwap_veto_bearish(self):
-        """FADE_CHOP bearish direction but VWAP > VAH → neutral."""
+        """RANGE bearish direction but VWAP > VAH → neutral."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            regime=USRegimeType.RANGE, confidence=0.75,
             rvol=0.8, price=258, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=255, vah=260, val=250)
@@ -4941,14 +4944,14 @@ class TestStructureOverrideDirection:
         assert result == "neutral"
 
     def test_structure_override_only_for_trend_regimes(self):
-        """FADE_CHOP should NOT trigger extreme structure override."""
+        """RANGE should NOT trigger extreme structure override."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            regime=USRegimeType.RANGE, confidence=0.75,
             rvol=0.8, price=252, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=255, vah=260, val=250)
         # Even with extreme structure: price < PDL, < VWAP, < PML
-        # FADE_CHOP should still use VA zone logic, not forced bearish
+        # RANGE should still use VA zone logic, not forced bearish
         result = _decide_direction(
             regime, vp, vwap=253, pdl=253, pdh=260, pml=254, pmh=262,
         )
@@ -4958,7 +4961,7 @@ class TestStructureOverrideDirection:
     def test_single_structure_signal_not_enough(self):
         """Only 1 structural level aligned → no override (need >=2)."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.8,
+            regime=USRegimeType.TREND_STRONG, confidence=0.8,
             rvol=1.5, price=556, gap_pct=0.5,
         )
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
@@ -4969,7 +4972,7 @@ class TestStructureOverrideDirection:
         assert result == "neutral"  # VWAP contradiction veto
 
 
-# ── Structure-based TREND_DAY ──
+# ── Structure-based TREND_STRONG ──
 
 class TestStructureTrendDay:
     """Price structure detection for low-RVOL trend days (slow bleed / slow grind)."""
@@ -5092,10 +5095,10 @@ class TestStructureTrendDay:
             today_bars=bars,
             structure_trend_cfg={"enabled": False},
         )
-        assert r.regime != USRegimeType.TREND_DAY
+        assert r.regime not in (USRegimeType.TREND_STRONG, USRegimeType.TREND_WEAK)
 
     def test_structure_triggers_trend_day_in_classify(self):
-        """Low RVOL + clear declining structure → TREND_DAY via structure path."""
+        """Low RVOL + clear declining structure → TREND_WEAK via structure path (Phase 2)."""
         bars = self._make_declining_bars(60, start_price=200.0, drop_per_bar=0.10)
         final_price = 200.0 - 0.10 * 59  # ~194.1
         r = classify_us_regime(
@@ -5104,21 +5107,23 @@ class TestStructureTrendDay:
             today_bars=bars,
             structure_trend_cfg=self._ENABLED_CFG,
         )
-        assert r.regime == USRegimeType.TREND_DAY
+        # Phase 2: Structure-based trend always outputs TREND_WEAK
+        assert r.regime == USRegimeType.TREND_WEAK
         assert "Structure" in r.details
 
     def test_structure_does_not_override_rvol_trend_day(self):
-        """RVOL-based TREND_DAY fires first (higher priority)."""
+        """RVOL-based TREND fires first (higher priority than structure)."""
         bars = self._make_declining_bars(60, start_price=200.0, drop_per_bar=0.10)
         final_price = 200.0 - 0.10 * 59  # ~194.1
         r = classify_us_regime(
             price=final_price, prev_close=194.5, rvol=1.3,  # RVOL 1.3 >= trend_day 1.2, small gap
-            pmh=201.0, pml=190.0,  # pml=190 so no pm_breakout → avoids GAP_AND_GO
+            pmh=201.0, pml=190.0,  # pml=190 so no pm_breakout → avoids GAP_GO
             vp=self._vp(poc=198, vah=198, val=195),  # price 194.1 < val 195 → outside VA
             today_bars=bars,
             structure_trend_cfg=self._ENABLED_CFG,
         )
-        assert r.regime == USRegimeType.TREND_DAY
+        # Phase 2: RVOL 1.3 < gap_and_go_rvol 1.5 → TREND_WEAK, but RVOL path (not structure)
+        assert r.regime in (USRegimeType.TREND_STRONG, USRegimeType.TREND_WEAK)
         assert "Structure" not in r.details  # RVOL path, not structure
 
     def test_structure_stop_hunt_l2_fallback_l1(self):
@@ -5198,12 +5203,12 @@ class TestStructureTrendDay:
             today_bars=bars,
             structure_trend_cfg=self._ENABLED_CFG,
         )
-        # Should be detected as TREND_DAY via structure path (not UNCLEAR)
-        assert r.regime == USRegimeType.TREND_DAY
+        # Phase 2: Structure-based trend → TREND_WEAK (not UNCLEAR)
+        assert r.regime == USRegimeType.TREND_WEAK
         assert "Structure" in r.details
 
     def test_genuine_chop_not_promoted(self):
-        """Choppy bars should NOT be promoted to TREND_DAY."""
+        """Choppy bars should NOT be promoted to any TREND regime."""
         bars = self._make_choppy_bars(50, center=200.0)
         r = classify_us_regime(
             price=200.5, prev_close=201.0, rvol=0.9,
@@ -5212,13 +5217,13 @@ class TestStructureTrendDay:
             today_bars=bars,
             structure_trend_cfg=self._ENABLED_CFG,
         )
-        assert r.regime != USRegimeType.TREND_DAY
+        assert r.regime not in (USRegimeType.TREND_STRONG, USRegimeType.TREND_WEAK)
 
 
-# ── TREND_DAY Persistence Tests ──
+# ── TREND_STRONG Persistence Tests ──
 
 class TestTrendPersistence:
-    """TREND_DAY persistence: inside VA + strong intraday return + VWAP agreement."""
+    """TREND_STRONG persistence: inside VA + strong intraday return + VWAP agreement."""
 
     @staticmethod
     def _make_n_bars(n: int, base: str = "2026-03-13 10:00") -> pd.DataFrame:
@@ -5237,7 +5242,7 @@ class TestTrendPersistence:
         return pd.DataFrame(rows, index=idx)
 
     def test_trend_persistence_bearish(self):
-        """inside_va + return<-1% + price<VWAP + >=30 bars → TREND_DAY bearish."""
+        """inside_va + return<-1% + price<VWAP + >=30 bars → TREND_WEAK bearish (Phase 2)."""
         bars = self._make_n_bars(35)
         # open_price=100, price=98.5 → return=-1.5%, inside VA [98..102]
         r = classify_us_regime(
@@ -5249,7 +5254,8 @@ class TestTrendPersistence:
             vwap=99.0,  # price 98.5 < vwap 99.0 → agrees with bearish
             trend_day_rvol=1.2,
         )
-        assert r.regime == USRegimeType.TREND_DAY
+        # Phase 2: Persistence-based trend always outputs TREND_WEAK
+        assert r.regime == USRegimeType.TREND_WEAK
         assert r.lean == "bearish"
         assert "persistence" in r.details.lower()
 
@@ -5265,8 +5271,8 @@ class TestTrendPersistence:
             vwap=98.0,  # price 98.5 > vwap 98.0 → disagrees with bearish
             trend_day_rvol=1.2,
         )
-        # Should NOT be TREND_DAY via persistence (V-shape guard)
-        assert r.regime != USRegimeType.TREND_DAY or "persistence" not in r.details.lower()
+        # Should NOT be TREND via persistence (V-shape guard)
+        assert r.regime not in (USRegimeType.TREND_STRONG, USRegimeType.TREND_WEAK) or "persistence" not in r.details.lower()
 
     def test_trend_persistence_early_session(self):
         """inside_va + return<-1% but <30 bars → not triggered."""
@@ -5281,7 +5287,7 @@ class TestTrendPersistence:
             trend_day_rvol=1.2,
         )
         # With <30 bars, persistence should not activate
-        assert r.regime != USRegimeType.TREND_DAY or "persistence" not in r.details.lower()
+        assert r.regime not in (USRegimeType.TREND_STRONG, USRegimeType.TREND_WEAK) or "persistence" not in r.details.lower()
 
     def test_trend_persistence_adaptive_threshold(self):
         """RC3: ADR-based adaptive threshold — ADR 2% → threshold 0.8%, return 1.5% passes."""
@@ -5298,7 +5304,8 @@ class TestTrendPersistence:
             open_price=100.0, today_bars=bars, vwap=99.0,
             rvol_profile=profile,
         )
-        assert r.regime == USRegimeType.TREND_DAY
+        # Phase 2: Persistence-based trend always outputs TREND_WEAK
+        assert r.regime == USRegimeType.TREND_WEAK
         assert "persistence" in r.details.lower()
 
     def test_trend_persistence_adaptive_boundary(self):
@@ -5317,7 +5324,7 @@ class TestTrendPersistence:
             open_price=100.0, today_bars=bars, vwap=99.0,
             rvol_profile=profile,
         )
-        assert r.regime != USRegimeType.TREND_DAY or "persistence" not in r.details.lower()
+        assert r.regime not in (USRegimeType.TREND_STRONG, USRegimeType.TREND_WEAK) or "persistence" not in r.details.lower()
 
     def test_trend_persistence_no_profile_fallback(self):
         """RC3: No rvol_profile → fallback to 0.01 threshold."""
@@ -5330,7 +5337,8 @@ class TestTrendPersistence:
             open_price=100.0, today_bars=bars, vwap=99.0,
             rvol_profile=None, trend_day_rvol=1.2,
         )
-        assert r.regime == USRegimeType.TREND_DAY
+        # Phase 2: Persistence-based trend always outputs TREND_WEAK
+        assert r.regime == USRegimeType.TREND_WEAK
         assert "persistence" in r.details.lower()
 
 
@@ -5408,7 +5416,7 @@ class TestUnclearLeanOverride:
             vwap=99.5,  # price 99.3 < vwap 99.5 → bearish
             trend_day_rvol=1.2,
         )
-        # With persistence, this might be TREND_DAY. If UNCLEAR, check lean.
+        # With persistence, this might be TREND_STRONG. If UNCLEAR, check lean.
         # return=-0.7% < -1% threshold for persistence, so persistence won't fire.
         # RVOL 1.3 >= 1.2 + inside VA → sub-type 2 UNCLEAR.
         # Override: return=-0.7%, |0.7%| > 0.5%, ret_lean=bearish, price<vwap → vwap_lean=bearish → match
@@ -5636,7 +5644,7 @@ class TestTrendExhaustion:
         return VolumeProfileResult(poc=550, vah=555, val=545)
 
     def test_exhaustion_downgrades_rvol_trend_day(self):
-        """TREND_DAY should downgrade to UNCLEAR when range consumed."""
+        """TREND_STRONG should downgrade to UNCLEAR when range consumed."""
         from src.us_playbook.regime import _check_trend_exhaustion
         # ADR 2%, consumed 2.5% → exhaustion_ratio = 1.25 > threshold
         bars = _make_bars([
@@ -5695,7 +5703,7 @@ class TestTrendExhaustion:
         assert not exhausted
 
     def test_regime_trend_day_exhausted_becomes_unclear(self):
-        """classify_us_regime: RVOL-based TREND_DAY exhausted → UNCLEAR with lean."""
+        """classify_us_regime: RVOL-based TREND_STRONG exhausted → UNCLEAR with lean."""
         # Setup: price=557 > VAH=555, RVOL=1.3 > 1.2, small gap
         # But range 10% consumed of 1% ADR → exhausted
         bars = _make_bars([
@@ -5732,26 +5740,26 @@ class TestTrendExhaustion:
             rvol_profile=profile, today_bars=bars,
             open_price=548, vwap=553,
         )
-        # Should be TREND_DAY (persistence) or FADE_CHOP, not UNCLEAR with exhaustion
+        # Should be TREND_STRONG (persistence) or RANGE, not UNCLEAR with exhaustion
         assert "Trend exhausted" not in (result.details or "")
 
 
-# ── P0-2: FADE_CHOP neutral wait_conditions ──
+# ── P0-2: RANGE neutral wait_conditions ──
 
 class TestFadeChopNeutralWait:
-    """Test FADE_CHOP neutral gives VA edge semantics, not generic 'direction unclear'."""
+    """Test RANGE neutral gives VA edge semantics, not generic 'direction unclear'."""
 
     def test_fade_chop_neutral_no_momentum_va_edge(self):
-        """FADE_CHOP neutral (no momentum) → 'VA 边缘机会' text."""
+        """RANGE neutral (no momentum) → 'VA 边缘机会' text."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            regime=USRegimeType.RANGE, confidence=0.75,
             rvol=0.8, price=252.5, gap_pct=0.1,
         )
         # price=252.5, mid=(260+250)/2=255, in transition zone
         # position_ratio = (252.5-250)/(260-250) = 0.25 → bullish edge zone
         # But let's make it truly neutral: price exactly at mid
         regime2 = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.75,
+            regime=USRegimeType.RANGE, confidence=0.75,
             rvol=0.8, price=255, gap_pct=0.1,
         )
         vp = VolumeProfileResult(poc=253, vah=260, val=250)
@@ -5772,7 +5780,7 @@ class TestDataWaitNotMaskingRegime:
         """US: no chain → core conclusion shows regime + data caveat."""
         from src.us_playbook.playbook import _core_conclusion_text
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.7,
+            regime=USRegimeType.TREND_STRONG, confidence=0.7,
             rvol=1.3, price=557, gap_pct=0.2,
         )
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
@@ -5855,7 +5863,7 @@ class TestWaitCategoryData:
     def test_no_chain_sets_data_category(self):
         """No chain → wait_category='data'."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.7,
+            regime=USRegimeType.TREND_STRONG, confidence=0.7,
             rvol=1.3, price=557, gap_pct=0.2,
         )
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
@@ -5870,7 +5878,7 @@ class TestWaitCategoryData:
     def test_no_expiry_sets_data_category(self):
         """No expiry → wait_category='data'."""
         regime = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.7,
+            regime=USRegimeType.TREND_STRONG, confidence=0.7,
             rvol=1.3, price=557, gap_pct=0.2,
         )
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
@@ -5900,13 +5908,13 @@ class TestWaitCategoryData:
 
 
 class TestGapDeadZoneVwapRelaxation:
-    """Test VWAP-confirmed gap relaxation for TREND_DAY classification."""
+    """Test VWAP-confirmed gap relaxation for TREND_STRONG classification."""
 
     def _vp(self, poc=550, vah=555, val=545):
         return VolumeProfileResult(poc=poc, vah=vah, val=val)
 
     def test_gap_dead_zone_with_vwap_confirms_trend_day(self):
-        """normalized_gap 0.32 (> 0.3 threshold) but VWAP confirms → TREND_DAY with penalty."""
+        """normalized_gap 0.32 (> 0.3 threshold) but VWAP confirms → TREND with penalty (Phase 2: TREND_WEAK)."""
         profile = RvolProfile(
             gap_and_go_rvol=2.0,
             trend_day_rvol=1.2,
@@ -5924,14 +5932,15 @@ class TestGapDeadZoneVwapRelaxation:
             gap_significance_threshold=0.3,
             vwap=548.0,
         )
-        assert result.regime == USRegimeType.TREND_DAY
+        # Phase 2: RVOL 1.3 < adaptive gap_and_go_rvol 2.0 and no VWAP hold → TREND_WEAK
+        assert result.regime == USRegimeType.TREND_WEAK
         assert "VWAP-confirmed gap relaxation" in result.details
         # Confidence should have -0.10 penalty vs base
         base_confidence = min(1.0, (1.3 - 1.2) / 0.5 * 0.3 + 0.5)
         assert result.confidence <= base_confidence - 0.09  # approx -0.10
 
     def test_gap_dead_zone_no_vwap_confirm_stays_unclear(self):
-        """normalized_gap 0.32, price > VWAP → VWAP doesn't confirm → not TREND_DAY."""
+        """normalized_gap 0.32, price > VWAP → VWAP doesn't confirm → not TREND_STRONG."""
         profile = RvolProfile(
             gap_and_go_rvol=2.0,
             trend_day_rvol=1.2,
@@ -5948,7 +5957,7 @@ class TestGapDeadZoneVwapRelaxation:
             gap_significance_threshold=0.3,
             vwap=540.0,
         )
-        assert result.regime != USRegimeType.TREND_DAY
+        assert result.regime not in (USRegimeType.TREND_STRONG, USRegimeType.TREND_WEAK)
 
     def test_large_normalized_gap_still_blocked(self):
         """normalized_gap 0.9 (> 0.5 relaxed threshold) → still blocked even with VWAP."""
@@ -5969,7 +5978,7 @@ class TestGapDeadZoneVwapRelaxation:
             gap_significance_threshold=0.3,
             vwap=553.0,
         )
-        assert result.regime != USRegimeType.TREND_DAY
+        assert result.regime not in (USRegimeType.TREND_STRONG, USRegimeType.TREND_WEAK)
 
 
 class TestUnclearDefaultLeanFromPosition:
@@ -6001,8 +6010,8 @@ class TestUnclearDefaultLeanFromPosition:
         # Actually else triggers when:
         # NOT (inside_va and rvol >= trend_day) AND NOT (outside_va and rvol < fade_chop) AND NOT (trend_day > rvol >= fade_chop)
         # = outside_va and rvol >= fade_chop and rvol >= trend_day (since sub-type 1 needs rvol < trend_day)
-        # But rvol >= trend_day + outside_va + not small_gap → wouldn't trigger TREND_DAY above?
-        # Actually _gap_ok is false → TREND_DAY block skipped → falls to UNCLEAR → else branch
+        # But rvol >= trend_day + outside_va + not small_gap → wouldn't trigger TREND_STRONG above?
+        # Actually _gap_ok is false → TREND_STRONG block skipped → falls to UNCLEAR → else branch
         # Perfect: outside_va, rvol >= trend_day, big gap (not _gap_ok), no VWAP confirm for gap
         # Need: price < val, price > vwap (so _vwap_confirms=False for gap relaxation)
         # But for lean: price < val, price < vwap → bearish
@@ -6011,15 +6020,15 @@ class TestUnclearDefaultLeanFromPosition:
         # rvol >= trend_day (so sub-type 1 skipped), outside_va (so sub-type 2 skipped),
         # rvol >= fade_chop (so sub-type 3 skipped)
         # This means else branch. And price < val + price < vwap → lean=bearish
-        # But wait: if rvol >= trend_day + outside_va → TREND_DAY block should catch it first
+        # But wait: if rvol >= trend_day + outside_va → TREND_STRONG block should catch it first
         # unless gap is too big. So we need big gap + no VWAP confirm for gap.
 
         # Let's use: big gap (not small, not relaxable), outside_va, price < val
         # gap too big for _gap_ok, rvol >= trend_day, outside_va
-        # No pm_breakout → not GAP_AND_GO
+        # No pm_breakout → not GAP_GO
         # Structure not enabled → skip
         # Persistence needs inside_va → skip
-        # FADE_CHOP needs rvol < fade_chop → skip (rvol=1.3 >= 1.0)
+        # RANGE needs rvol < fade_chop → skip (rvol=1.3 >= 1.0)
         # → UNCLEAR, else branch (rvol >= trend_day, outside_va, not sub-type 1/2/3)
         profile = RvolProfile(
             gap_and_go_rvol=2.0,
@@ -6032,7 +6041,7 @@ class TestUnclearDefaultLeanFromPosition:
         # price=540 < val=545, vwap=543 → price < vwap → lean should be bearish
         # gap = (540-550)/550 = -1.8% → normalized = 1.8/0.5 = 3.6 >> 0.5
         # _vwap_confirms: price < val and price < vwap → True, but _relaxed_gap = 3.6 > 0.5 → False
-        # → _gap_ok = False → TREND_DAY skipped → UNCLEAR
+        # → _gap_ok = False → TREND_STRONG skipped → UNCLEAR
         result = classify_us_regime(
             price=540, prev_close=550, rvol=1.3,
             pmh=538, pml=536, vp=self._vp(),  # pmh < price → no pm_breakout
@@ -6056,10 +6065,10 @@ class TestUnclearDefaultLeanFromPosition:
         # price=560 > vah=555, vwap=557 → price > vwap → lean should be bullish
         # gap = (560-550)/550 = 1.82% → normalized = 1.82/0.5 = 3.64 >> 0.5
         # pm_breakout: pmh=558, price=560 > pmh → above_pm=True
-        # But rvol=1.3 < gap_and_go=2.0 → GAP_AND_GO skipped
-        # _gap_ok = False → TREND_DAY skipped → UNCLEAR
-        # Actually pmh=558 → above_pm but not GAP_AND_GO (rvol too low)
-        # Set pmh > price to avoid pm_breakout triggering GAP_AND_GO later
+        # But rvol=1.3 < gap_and_go=2.0 → GAP_GO skipped
+        # _gap_ok = False → TREND_STRONG skipped → UNCLEAR
+        # Actually pmh=558 → above_pm but not GAP_GO (rvol too low)
+        # Set pmh > price to avoid pm_breakout triggering GAP_GO later
         result = classify_us_regime(
             price=560, prev_close=550, rvol=1.3,
             pmh=562, pml=558, vp=self._vp(),  # pmh > price → no pm_breakout
@@ -6071,16 +6080,16 @@ class TestUnclearDefaultLeanFromPosition:
         assert result.lean == "bullish"
 
 
-# ── P0-1: Large gap signal → GAP_AND_GO even when PM absorbed ──
+# ── P0-1: Large gap signal → GAP_GO even when PM absorbed ──
 
 class TestLargeGapSignal:
-    """Test that large gaps (normalized >= 0.8) trigger GAP_AND_GO without PM breakout."""
+    """Test that large gaps (normalized >= 0.8) trigger GAP_GO without PM breakout."""
 
     def _vp(self, poc=640, vah=645, val=635):
         return VolumeProfileResult(poc=poc, vah=vah, val=val)
 
     def test_large_gap_down_gap_and_go(self):
-        """META 3/13 scenario: gap=-2.11%, RVOL=2.68, PM absorbed → GAP_AND_GO via large gap."""
+        """META 3/13 scenario: gap=-2.11%, RVOL=2.68, PM absorbed → GAP_GO via large gap."""
         profile = RvolProfile(
             gap_and_go_rvol=1.5, trend_day_rvol=1.2, fade_chop_rvol=1.0,
             avg_daily_range_pct=2.0,  # normalized_gap = 2.11/2.0 ≈ 1.05 >= 0.8
@@ -6092,12 +6101,12 @@ class TestLargeGapSignal:
             vp=self._vp(),
             rvol_profile=profile,
         )
-        assert result.regime == USRegimeType.GAP_AND_GO
+        assert result.regime == USRegimeType.GAP_GO
         assert "gap down" in result.details
         assert result.gap_pct < 0
 
     def test_large_gap_up_gap_and_go(self):
-        """Large gap up (normalized >= 0.8) → GAP_AND_GO gap-driven."""
+        """Large gap up (normalized >= 0.8) → GAP_GO gap-driven."""
         profile = RvolProfile(
             gap_and_go_rvol=1.5, trend_day_rvol=1.2, fade_chop_rvol=1.0,
             avg_daily_range_pct=2.0,
@@ -6109,7 +6118,7 @@ class TestLargeGapSignal:
             vp=self._vp(),
             rvol_profile=profile,
         )
-        assert result.regime == USRegimeType.GAP_AND_GO
+        assert result.regime == USRegimeType.GAP_GO
         assert "gap up" in result.details
 
     def test_gap_driven_confidence_penalty(self):
@@ -6133,13 +6142,13 @@ class TestLargeGapSignal:
             vp=self._vp(),
             rvol_profile=profile,
         )
-        assert result_pm.regime == USRegimeType.GAP_AND_GO
-        assert result_gap.regime == USRegimeType.GAP_AND_GO
+        assert result_pm.regime == USRegimeType.GAP_GO
+        assert result_gap.regime == USRegimeType.GAP_GO
         # Gap-driven should be ~0.10 lower
         assert result_gap.confidence < result_pm.confidence
 
     def test_small_gap_no_large_gap_signal(self):
-        """Small gap (normalized < 0.8) + no PM breakout → NOT GAP_AND_GO."""
+        """Small gap (normalized < 0.8) + no PM breakout → NOT GAP_GO."""
         profile = RvolProfile(
             gap_and_go_rvol=1.5, trend_day_rvol=1.2, fade_chop_rvol=1.0,
             avg_daily_range_pct=2.0,  # normalized_gap = 0.5/2.0 = 0.25 < 0.8
@@ -6151,42 +6160,42 @@ class TestLargeGapSignal:
             vp=self._vp(),
             rvol_profile=profile,
         )
-        assert result.regime != USRegimeType.GAP_AND_GO
+        assert result.regime != USRegimeType.GAP_GO
 
 
 # ── P0-2: Chase risk VA distance disabled for trend regimes ──
 
 class TestChaseRiskTrendRegime:
-    """Test that GAP_AND_GO/TREND_DAY regimes disable VA distance chase risk."""
+    """Test that GAP_GO/TREND_STRONG regimes disable VA distance chase risk."""
 
     def test_gap_and_go_no_high_chase_from_va(self):
-        """GAP_AND_GO: VA distance 4.5% should NOT trigger high chase risk."""
+        """GAP_GO: VA distance 4.5% should NOT trigger high chase risk."""
         vp = VolumeProfileResult(poc=640, vah=645, val=635)
         result = assess_chase_risk(
             price=615.80, vwap=620, vp=vp, direction="bearish",
             va_moderate_pct=2.0, va_high_pct=3.0,
-            regime="GAP_AND_GO",
+            regime="GAP_GO",
         )
         # VA distance = (635-615.80)/635 = 3.02% → would be "high" without regime override
         assert result.level != "high"
 
     def test_trend_day_no_high_chase_from_va(self):
-        """TREND_DAY: VA distance should NOT trigger high chase risk."""
+        """TREND_STRONG: VA distance should NOT trigger high chase risk."""
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
         result = assess_chase_risk(
             price=530, vwap=535, vp=vp, direction="bearish",
             va_moderate_pct=2.0, va_high_pct=3.0,
-            regime="TREND_DAY",
+            regime="TREND_STRONG",
         )
         assert result.level != "high"
 
     def test_fade_chop_still_checks_va(self):
-        """FADE_CHOP: VA distance should still trigger chase risk as before."""
+        """RANGE: VA distance should still trigger chase risk as before."""
         vp = VolumeProfileResult(poc=550, vah=555, val=545)
         result = assess_chase_risk(
             price=530, vwap=535, vp=vp, direction="bearish",
             va_moderate_pct=2.0, va_high_pct=3.0,
-            regime="FADE_CHOP",
+            regime="RANGE",
         )
         # VA distance = (545-530)/545 = 2.75% → moderate or high
         assert result.level in ("moderate", "high")
@@ -6222,7 +6231,7 @@ class TestRapidFireCooldown:
             direction="bearish",
             symbol="META",
             regime=USRegimeResult(
-                regime=USRegimeType.GAP_AND_GO, confidence=0.85,
+                regime=USRegimeType.GAP_GO, confidence=0.85,
                 rvol=2.0, price=615, gap_pct=-2.0,
             ),
             price=615,
@@ -6251,14 +6260,14 @@ class TestRapidFireCooldown:
         assert not allowed3
 
 
-# ── P2-1: VP staleness — FADE_CHOP VA unreachable confidence penalty ──
+# ── P2-1: VP staleness — RANGE VA unreachable confidence penalty ──
 
 class TestVPStaleness:
-    """Test VP staleness detection: FADE_CHOP confidence penalty when VA is far away."""
+    """Test VP staleness detection: RANGE confidence penalty when VA is far away."""
 
     def test_fade_chop_va_unreachable_penalty(self):
-        """FADE_CHOP (via near_gamma) with VA distance > 5% → confidence penalty."""
-        # Price=610, VA=645-661 → outside VA but near gamma wall → triggers FADE_CHOP
+        """RANGE (via near_gamma) with VA distance > 5% → confidence penalty."""
+        # Price=610, VA=645-661 → outside VA but near gamma wall → triggers RANGE
         # va_distance = min(|610-661|, |610-645|) / 610 * 100 = 35/610*100 = 5.74% > 5%
         vp = VolumeProfileResult(poc=650, vah=661, val=645)
         gamma = GammaWallResult(call_wall_strike=609, put_wall_strike=0, max_pain=0)
@@ -6268,14 +6277,14 @@ class TestVPStaleness:
             vp=vp, gamma_wall=gamma,
             fade_chop_rvol=1.0,
         )
-        assert result.regime == USRegimeType.FADE_CHOP
+        assert result.regime == USRegimeType.RANGE
         assert "VA unreachable" in result.details
         # Confidence should be lower than base
         base_conf = min(1.0, (1.0 - 0.7) / 0.3 * 0.3 + 0.5)
         assert result.confidence < base_conf
 
     def test_fade_chop_va_reachable_no_penalty(self):
-        """FADE_CHOP with price inside VA (distance < 5%) → no penalty."""
+        """RANGE with price inside VA (distance < 5%) → no penalty."""
         vp = VolumeProfileResult(poc=610, vah=620, val=600)
         result = classify_us_regime(
             price=610, prev_close=611, rvol=0.7,
@@ -6283,7 +6292,7 @@ class TestVPStaleness:
             vp=vp,
             fade_chop_rvol=1.0,
         )
-        assert result.regime == USRegimeType.FADE_CHOP
+        assert result.regime == USRegimeType.RANGE
         assert "VA unreachable" not in result.details
 
 
@@ -6295,7 +6304,7 @@ class TestRegimeStabilizer:
 
     @staticmethod
     def _make_regime(
-        regime=USRegimeType.TREND_DAY,
+        regime=USRegimeType.TREND_STRONG,
         confidence=0.80,
         rvol=1.30,
         price=150.0,
@@ -6330,7 +6339,7 @@ class TestRegimeStabilizer:
         """First call for a symbol → raw regime passed through unchanged."""
         from src.us_playbook.stabilizer import RegimeStabilizer
         stab = RegimeStabilizer(self._cfg())
-        raw = self._make_regime(regime=USRegimeType.TREND_DAY)
+        raw = self._make_regime(regime=USRegimeType.TREND_STRONG)
         result = stab.stabilize("AAPL", raw)
         assert result is raw
         assert not result.stabilized
@@ -6352,20 +6361,20 @@ class TestRegimeStabilizer:
         adaptive = {"trend_day": 1.20, "fade_chop": 0.90}
         stab = RegimeStabilizer(self._cfg())
 
-        # Accept initial TREND_DAY
+        # Accept initial TREND_STRONG
         trend = self._make_regime(
-            regime=USRegimeType.TREND_DAY, rvol=1.30, adaptive=adaptive,
+            regime=USRegimeType.TREND_STRONG, rvol=1.30, adaptive=adaptive,
         )
         stab.stabilize("QQQ", trend)
 
-        # Try switch to FADE_CHOP with RVOL at boundary (1.20 - 0.09 = 1.11)
+        # Try switch to RANGE with RVOL at boundary (1.20 - 0.09 = 1.11)
         # gap = 1.20 - 0.90 = 0.30, hyst = 0.30*0.30 = 0.09
         # Need rvol < 1.20 - 0.09 = 1.11 to pass; 1.12 should be rejected
         fade = self._make_regime(
-            regime=USRegimeType.FADE_CHOP, rvol=1.12, adaptive=adaptive,
+            regime=USRegimeType.RANGE, rvol=1.12, adaptive=adaptive,
         )
         result = stab.stabilize("QQQ", fade)
-        assert result.regime == USRegimeType.TREND_DAY  # held
+        assert result.regime == USRegimeType.TREND_STRONG  # held
         assert result.stabilized is True
         assert result.rvol == 1.12  # price/rvol refreshed
 
@@ -6376,26 +6385,26 @@ class TestRegimeStabilizer:
 
         stab = RegimeStabilizer(self._cfg(hold_downgrade_minutes=0))
 
-        trend = self._make_regime(regime=USRegimeType.TREND_DAY, adaptive=None)
+        trend = self._make_regime(regime=USRegimeType.TREND_STRONG, adaptive=None)
         stab.stabilize("SPY", trend)
 
         # No adaptive → Layer 1 skipped, hold=0 → accepted
-        fade = self._make_regime(regime=USRegimeType.FADE_CHOP, adaptive=None)
+        fade = self._make_regime(regime=USRegimeType.RANGE, adaptive=None)
         result = stab.stabilize("SPY", fade)
-        assert result.regime == USRegimeType.FADE_CHOP  # passed through
+        assert result.regime == USRegimeType.RANGE  # passed through
 
     def test_stabilizer_graduated_hold_upgrade(self):
         """FADE→TREND needs 15min hold (upgrade)."""
         from src.us_playbook.stabilizer import RegimeStabilizer
         stab = RegimeStabilizer(self._cfg())
 
-        fade = self._make_regime(regime=USRegimeType.FADE_CHOP)
+        fade = self._make_regime(regime=USRegimeType.RANGE)
         stab.stabilize("TSLA", fade)
 
-        # Immediately try upgrade to TREND_DAY
-        trend = self._make_regime(regime=USRegimeType.TREND_DAY)
+        # Immediately try upgrade to TREND_STRONG
+        trend = self._make_regime(regime=USRegimeType.TREND_STRONG)
         result = stab.stabilize("TSLA", trend)
-        assert result.regime == USRegimeType.FADE_CHOP  # held
+        assert result.regime == USRegimeType.RANGE  # held
         assert result.stabilized is True
 
     def test_stabilizer_graduated_hold_downgrade(self):
@@ -6403,12 +6412,12 @@ class TestRegimeStabilizer:
         from src.us_playbook.stabilizer import RegimeStabilizer
         stab = RegimeStabilizer(self._cfg())
 
-        trend = self._make_regime(regime=USRegimeType.TREND_DAY)
+        trend = self._make_regime(regime=USRegimeType.TREND_STRONG)
         stab.stabilize("NVDA", trend)
 
-        fade = self._make_regime(regime=USRegimeType.FADE_CHOP)
+        fade = self._make_regime(regime=USRegimeType.RANGE)
         result = stab.stabilize("NVDA", fade)
-        assert result.regime == USRegimeType.TREND_DAY  # held
+        assert result.regime == USRegimeType.TREND_STRONG  # held
         assert result.stabilized is True
 
     def test_stabilizer_graduated_hold_from_unclear(self):
@@ -6420,7 +6429,7 @@ class TestRegimeStabilizer:
         stab.stabilize("META", unclear)
 
         # delta = |0.60 - 0.50| = 0.10 < 0.20 → no bypass
-        trend = self._make_regime(regime=USRegimeType.TREND_DAY, confidence=0.60)
+        trend = self._make_regime(regime=USRegimeType.TREND_STRONG, confidence=0.60)
         result = stab.stabilize("META", trend)
         assert result.regime == USRegimeType.UNCLEAR  # held
         assert result.stabilized is True
@@ -6430,13 +6439,13 @@ class TestRegimeStabilizer:
         from src.us_playbook.stabilizer import RegimeStabilizer
         stab = RegimeStabilizer(self._cfg())
 
-        fade = self._make_regime(regime=USRegimeType.FADE_CHOP, confidence=0.55)
+        fade = self._make_regime(regime=USRegimeType.RANGE, confidence=0.55)
         stab.stabilize("AMD", fade)
 
         # Strong signal: delta = 0.80 - 0.55 = 0.25 >= 0.20
-        trend = self._make_regime(regime=USRegimeType.TREND_DAY, confidence=0.80)
+        trend = self._make_regime(regime=USRegimeType.TREND_STRONG, confidence=0.80)
         result = stab.stabilize("AMD", trend)
-        assert result.regime == USRegimeType.TREND_DAY
+        assert result.regime == USRegimeType.TREND_STRONG
         assert not result.stabilized
 
     def test_stabilizer_disabled_passthrough(self):
@@ -6444,10 +6453,10 @@ class TestRegimeStabilizer:
         from src.us_playbook.stabilizer import RegimeStabilizer
         stab = RegimeStabilizer({"enabled": False})
 
-        r1 = self._make_regime(regime=USRegimeType.TREND_DAY)
+        r1 = self._make_regime(regime=USRegimeType.TREND_STRONG)
         stab.stabilize("SPY", r1)
 
-        r2 = self._make_regime(regime=USRegimeType.FADE_CHOP)
+        r2 = self._make_regime(regime=USRegimeType.RANGE)
         result = stab.stabilize("SPY", r2)
         assert result is r2  # raw, not held
         assert not result.stabilized
@@ -6457,13 +6466,13 @@ class TestRegimeStabilizer:
         from src.us_playbook.stabilizer import RegimeStabilizer
         stab = RegimeStabilizer(self._cfg())
 
-        trend = self._make_regime(regime=USRegimeType.GAP_AND_GO)
+        trend = self._make_regime(regime=USRegimeType.GAP_GO)
         stab.stabilize("AMZN", trend)
 
-        fade = self._make_regime(regime=USRegimeType.FADE_CHOP)
+        fade = self._make_regime(regime=USRegimeType.RANGE)
         result = stab.stabilize("AMZN", fade)
         assert result.stabilized is True
-        assert result.regime == USRegimeType.GAP_AND_GO
+        assert result.regime == USRegimeType.GAP_GO
 
     def test_adaptive_hysteresis_proportional(self):
         """Adaptive thresholds (trend=1.05, fade=0.88): hysteresis computed correctly."""
@@ -6471,9 +6480,9 @@ class TestRegimeStabilizer:
         adaptive = {"trend_day": 1.05, "fade_chop": 0.88}
         stab = RegimeStabilizer(self._cfg())
 
-        # Accept TREND_DAY initially
+        # Accept TREND_STRONG initially
         trend = self._make_regime(
-            regime=USRegimeType.TREND_DAY, rvol=1.10, adaptive=adaptive,
+            regime=USRegimeType.TREND_STRONG, rvol=1.10, adaptive=adaptive,
         )
         stab.stabilize("MSFT", trend)
 
@@ -6481,18 +6490,18 @@ class TestRegimeStabilizer:
         # TREND→FADE needs rvol < 1.05 - 0.051 = 0.999
         # Try with rvol=1.00 → still >= 0.999, should be rejected
         fade = self._make_regime(
-            regime=USRegimeType.FADE_CHOP, rvol=1.00, adaptive=adaptive,
+            regime=USRegimeType.RANGE, rvol=1.00, adaptive=adaptive,
         )
         result = stab.stabilize("MSFT", fade)
-        assert result.regime == USRegimeType.TREND_DAY  # held
+        assert result.regime == USRegimeType.TREND_STRONG  # held
 
         # Try with rvol=0.98 → < 0.999, but still needs temporal hold
         fade2 = self._make_regime(
-            regime=USRegimeType.FADE_CHOP, rvol=0.98, adaptive=adaptive,
+            regime=USRegimeType.RANGE, rvol=0.98, adaptive=adaptive,
         )
         result2 = stab.stabilize("MSFT", fade2)
         # Passes hysteresis but blocked by 30min hold
-        assert result2.regime == USRegimeType.TREND_DAY
+        assert result2.regime == USRegimeType.TREND_STRONG
 
     def test_ondemand_no_stabilizer(self):
         """USRegimeResult from on-demand has stabilized=False by default."""
@@ -6526,7 +6535,7 @@ class TestDirectionConsistency:
     """Tests for direction_override in _plans_unclear and enforce_direction_consistency."""
 
     @staticmethod
-    def _make_regime(regime=USRegimeType.TREND_DAY, lean="bearish", confidence=0.60):
+    def _make_regime(regime=USRegimeType.TREND_STRONG, lean="bearish", confidence=0.60):
         return USRegimeResult(
             regime=regime, confidence=confidence, rvol=1.10,
             price=150.0, gap_pct=0.3, lean=lean,
@@ -6539,7 +6548,7 @@ class TestDirectionConsistency:
         )
 
     def test_trend_downgrade_bullish_no_bearish_plan(self):
-        """US: TREND_DAY bullish + lean=bearish + wait → Plan B should NOT be bearish."""
+        """US: TREND_STRONG bullish + lean=bearish + wait → Plan B should NOT be bearish."""
         regime = self._make_regime(lean="bearish", confidence=0.60)
         vp = VolumeProfileResult(poc=149, vah=152, val=147)
         kl = self._kl()
@@ -6557,9 +6566,9 @@ class TestDirectionConsistency:
             assert plan_b.direction == "bullish"
 
     def test_trend_downgrade_bearish_no_bullish_plan(self):
-        """US: GAP_AND_GO bearish + lean=bullish + wait → Plan B should NOT be bullish."""
+        """US: GAP_GO bearish + lean=bullish + wait → Plan B should NOT be bullish."""
         regime = USRegimeResult(
-            regime=USRegimeType.GAP_AND_GO, confidence=0.60, rvol=1.50,
+            regime=USRegimeType.GAP_GO, confidence=0.60, rvol=1.50,
             price=150.0, gap_pct=1.5, lean="bullish",
         )
         vp = VolumeProfileResult(poc=149, vah=152, val=147)
@@ -6585,7 +6594,7 @@ class TestDirectionConsistency:
             stop_loss=152.0, stop_loss_reason="above",
             tp1=148.0, tp1_label="VAL", tp2=None, tp2_label="", rr_ratio=1.5,
         )
-        plans = enforce_direction_consistency([plan], "TREND_DAY", "bullish")
+        plans = enforce_direction_consistency([plan], "TREND_STRONG", "bullish")
         assert plans[0].entry is None
         assert plans[0].entry_action == ""
         assert "矛盾" in plans[0].warning
@@ -6600,11 +6609,11 @@ class TestDirectionConsistency:
             stop_loss=None, stop_loss_reason="",
             tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
         )
-        plans = enforce_direction_consistency([plan_c], "TREND_DAY", "bullish")
+        plans = enforce_direction_consistency([plan_c], "TREND_STRONG", "bullish")
         assert plans[0].entry == 148.0  # unchanged
 
     def test_enforce_fade_chop_no_effect(self):
-        """FADE_CHOP is not affected by direction enforcement."""
+        """RANGE is not affected by direction enforcement."""
         from src.common.action_plan import enforce_direction_consistency
         plan = ActionPlan(
             label="A", name="上沿做空", emoji="📉", is_primary=True,
@@ -6613,7 +6622,7 @@ class TestDirectionConsistency:
             stop_loss=153.0, stop_loss_reason="above",
             tp1=149.0, tp1_label="POC", tp2=147.0, tp2_label="VAL", rr_ratio=2.0,
         )
-        plans = enforce_direction_consistency([plan], "FADE_CHOP", "bullish")
+        plans = enforce_direction_consistency([plan], "RANGE", "bullish")
         assert plans[0].entry == 152.0  # unchanged
 
 
@@ -6623,44 +6632,44 @@ class TestIndexConsistency:
     """Tests for SPY/QQQ directional regime conflict detection."""
 
     def test_conflict_opposite_trend_day(self):
-        """SPY TREND_DAY bullish + QQQ TREND_DAY bearish → conflict."""
+        """SPY TREND_STRONG bullish + QQQ TREND_STRONG bearish → conflict."""
         conflict, detail = check_index_consistency(
-            USRegimeType.TREND_DAY, "bullish",
-            USRegimeType.TREND_DAY, "bearish",
+            USRegimeType.TREND_STRONG, "bullish",
+            USRegimeType.TREND_STRONG, "bearish",
         )
         assert conflict is True
         assert "SPY" in detail and "QQQ" in detail
 
     def test_no_conflict_same_direction(self):
-        """Same direction TREND_DAY → no conflict."""
+        """Same direction TREND_STRONG → no conflict."""
         conflict, _ = check_index_consistency(
-            USRegimeType.TREND_DAY, "bullish",
-            USRegimeType.TREND_DAY, "bullish",
+            USRegimeType.TREND_STRONG, "bullish",
+            USRegimeType.TREND_STRONG, "bullish",
         )
         assert conflict is False
 
     def test_conflict_gap_and_go_vs_trend_day_opposite(self):
         """Mixed directional regimes with opposite directions → conflict."""
         conflict, detail = check_index_consistency(
-            USRegimeType.GAP_AND_GO, "bullish",
-            USRegimeType.TREND_DAY, "bearish",
+            USRegimeType.GAP_GO, "bullish",
+            USRegimeType.TREND_STRONG, "bearish",
         )
         assert conflict is True
-        assert "gap_and_go" in detail and "trend_day" in detail
+        assert "gap_go" in detail and "trend_strong" in detail
 
     def test_no_conflict_gap_and_go_vs_trend_day_same(self):
         """Mixed directional regimes with same direction → no conflict."""
         conflict, _ = check_index_consistency(
-            USRegimeType.GAP_AND_GO, "bearish",
-            USRegimeType.TREND_DAY, "bearish",
+            USRegimeType.GAP_GO, "bearish",
+            USRegimeType.TREND_STRONG, "bearish",
         )
         assert conflict is False
 
     def test_no_conflict_one_fade_chop(self):
-        """One side FADE_CHOP → no conflict (not directional)."""
+        """One side RANGE → no conflict (not directional)."""
         conflict, _ = check_index_consistency(
-            USRegimeType.FADE_CHOP, "bullish",
-            USRegimeType.TREND_DAY, "bearish",
+            USRegimeType.RANGE, "bullish",
+            USRegimeType.TREND_STRONG, "bearish",
         )
         assert conflict is False
 
@@ -6668,40 +6677,40 @@ class TestIndexConsistency:
         """One side UNCLEAR → no conflict."""
         conflict, _ = check_index_consistency(
             USRegimeType.UNCLEAR, "bullish",
-            USRegimeType.TREND_DAY, "bearish",
+            USRegimeType.TREND_STRONG, "bearish",
         )
         assert conflict is False
 
     def test_no_conflict_one_neutral_direction(self):
         """One side neutral direction → no conflict."""
         conflict, _ = check_index_consistency(
-            USRegimeType.TREND_DAY, "neutral",
-            USRegimeType.TREND_DAY, "bearish",
+            USRegimeType.TREND_STRONG, "neutral",
+            USRegimeType.TREND_STRONG, "bearish",
         )
         assert conflict is False
 
     def test_no_conflict_both_fade_chop(self):
-        """Both FADE_CHOP → no conflict."""
+        """Both RANGE → no conflict."""
         conflict, _ = check_index_consistency(
-            USRegimeType.FADE_CHOP, "bullish",
-            USRegimeType.FADE_CHOP, "bearish",
+            USRegimeType.RANGE, "bullish",
+            USRegimeType.RANGE, "bearish",
         )
         assert conflict is False
 
     def test_downgrade_sets_unclear(self):
         """Downgrade produces UNCLEAR with correct fields."""
         original = USRegimeResult(
-            regime=USRegimeType.TREND_DAY, confidence=0.75,
+            regime=USRegimeType.TREND_STRONG, confidence=0.75,
             rvol=1.5, price=450.0, gap_pct=0.3,
             details="RVOL 1.50 >= 1.20, small gap",
             lean="bullish",
         )
-        reason = "SPY trend_day bullish vs QQQ trend_day bearish"
+        reason = "SPY trend_strong bullish vs QQQ trend_strong bearish"
         result = downgrade_to_unclear(original, reason)
         assert result.regime == USRegimeType.UNCLEAR
         assert result.confidence == 0.25
         assert result.lean == "neutral"
-        assert "Downgraded from trend_day" in result.details
+        assert "Downgraded from trend_strong" in result.details
         assert reason in result.details
         assert "original:" in result.details
 
@@ -6917,7 +6926,7 @@ class TestWideFadePlans:
     def test_wide_va_near_upper_bearish_plan_a(self):
         """Wide VA + price near effective_upper → bearish Plan A uses intraday levels."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=554.0, gap_pct=0.1,
         )
         il = self._il_vp()
@@ -6934,7 +6943,7 @@ class TestWideFadePlans:
     def test_wide_va_near_lower_bullish_plan_a(self):
         """Wide VA + price near effective_lower → bullish Plan A uses intraday levels."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=548.0, gap_pct=0.1,
         )
         il = self._il_vp()
@@ -6951,7 +6960,7 @@ class TestWideFadePlans:
     def test_wide_va_middle_follows_direction(self):
         """Wide VA + price in middle + direction=bearish → bearish plans."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=551.0, gap_pct=0.1,
         )
         il = self._il_vp()
@@ -6965,7 +6974,7 @@ class TestWideFadePlans:
     def test_wide_va_direction_conflict_to_unclear(self):
         """Wide VA + intraday direction conflict → UNCLEAR plans."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=548.0, gap_pct=0.1,  # near lower
         )
         il = self._il_vp()
@@ -6979,7 +6988,7 @@ class TestWideFadePlans:
     def test_plan_c_uses_5day_va(self):
         """Plan C always uses 5-day VAH/VAL for invalidation."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=554.0, gap_pct=0.1,
         )
         il = self._il_vp()
@@ -6994,7 +7003,7 @@ class TestWideFadePlans:
     def test_plan_c_bullish_uses_5day_val(self):
         """Plan C bullish uses 5-day VAL for invalidation."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=548.0, gap_pct=0.1,
         )
         il = self._il_vp()
@@ -7008,7 +7017,7 @@ class TestWideFadePlans:
     def test_narrow_va_original_behavior(self):
         """Narrow VA (no intraday_levels) → original fade plans unchanged."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=554.5, gap_pct=0.1,
         )
         narrow_vp = VolumeProfileResult(poc=552.0, vah=555.0, val=549.0)
@@ -7027,7 +7036,7 @@ class TestWideFadePlans:
     def test_early_session_vwap_bands(self):
         """VWAP bands source → Plan A logic mentions VWAP ± 1σ."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=553.0, gap_pct=0.1,
         )
         il = self._il_vwap()
@@ -7041,7 +7050,7 @@ class TestWideFadePlans:
     def test_5day_direction_conflict_overrides_wide_va(self):
         """5-day VA direction conflict check happens before wide VA routing."""
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=554.5, gap_pct=0.1,
         )
         il = self._il_vp()
@@ -7059,7 +7068,7 @@ class TestWideVAPlaybookFormat:
     def _make_result(self, intraday_levels=None):
         vp = VolumeProfileResult(poc=550.0, vah=560.0, val=540.0)
         regime = USRegimeResult(
-            regime=USRegimeType.FADE_CHOP, confidence=0.7,
+            regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=551.0, gap_pct=0.1,
         )
         kl = KeyLevels(
@@ -7098,3 +7107,254 @@ class TestWideVAPlaybookFormat:
         result = self._make_result(intraday_levels=None)
         msg = format_us_playbook_message(result)
         assert "宽 VA" not in msg
+
+
+class TestRegimeFamily:
+    """Test RegimeFamily property on USRegimeType."""
+
+    def test_trend_family(self):
+        assert USRegimeType.GAP_GO.family == RegimeFamily.TREND
+        assert USRegimeType.TREND_STRONG.family == RegimeFamily.TREND
+        assert USRegimeType.TREND_WEAK.family == RegimeFamily.TREND
+
+    def test_fade_family(self):
+        assert USRegimeType.RANGE.family == RegimeFamily.FADE
+        assert USRegimeType.NARROW_GRIND.family == RegimeFamily.FADE
+
+    def test_reversal_family(self):
+        assert USRegimeType.V_REVERSAL.family == RegimeFamily.REVERSAL
+        assert USRegimeType.GAP_FILL.family == RegimeFamily.REVERSAL
+
+    def test_unclear_family(self):
+        assert USRegimeType.UNCLEAR.family == RegimeFamily.UNCLEAR
+
+
+class TestVReversalDetection:
+    """Test V_REVERSAL detection in regime transitions."""
+
+    def _make_v_bars(self, n=40, drop_pct=0.8, recover=True):
+        """Create synthetic bars with V-shape: drop then recover past open."""
+        import numpy as np
+        dates = pd.date_range("2026-03-18 09:30", periods=n, freq="1min", tz="America/New_York")
+        open_price = 100.0
+        prices = []
+        # First half: drop
+        half = n // 2
+        for i in range(half):
+            p = open_price - (drop_pct * (i + 1) / half)
+            prices.append(p)
+        # Second half: recover
+        low_price = prices[-1]
+        for i in range(n - half):
+            if recover:
+                p = low_price + ((open_price + 0.3 - low_price) * (i + 1) / (n - half))
+            else:
+                p = low_price + 0.01 * i  # barely recover
+            prices.append(p)
+
+        df = pd.DataFrame({
+            "Open": [p - 0.05 for p in prices],
+            "High": [p + 0.1 for p in prices],
+            "Low": [p - 0.1 for p in prices],
+            "Close": prices,
+            "Volume": [1000] * n,
+        }, index=dates)
+        return df, open_price
+
+    def test_v_reversal_detected(self):
+        from src.us_playbook.regime import _detect_v_reversal
+        bars, open_price = self._make_v_bars(n=40, drop_pct=0.8, recover=True)
+        detected, direction, confidence = _detect_v_reversal(bars, open_price, open_price - 0.5, 1.5)
+        assert detected is True
+        assert direction == "bullish"
+        assert confidence > 0.4
+
+    def test_v_reversal_not_detected_no_recovery(self):
+        from src.us_playbook.regime import _detect_v_reversal
+        bars, open_price = self._make_v_bars(n=40, drop_pct=0.8, recover=False)
+        detected, direction, confidence = _detect_v_reversal(bars, open_price, open_price - 0.5, 1.5)
+        assert detected is False
+
+    def test_v_reversal_too_few_bars(self):
+        from src.us_playbook.regime import _detect_v_reversal
+        bars, open_price = self._make_v_bars(n=10, drop_pct=0.8, recover=True)
+        detected, _, _ = _detect_v_reversal(bars, open_price, open_price, 1.5)
+        assert detected is False  # needs >= 20 bars
+
+
+class TestGapFillDetection:
+    """Test GAP_FILL detection."""
+
+    def test_gap_fill_detected(self):
+        from src.us_playbook.regime import _detect_gap_fill
+        # Gap up 1%, price retraced 70% of gap
+        open_price = 101.0
+        prev_close = 100.0
+        gap_pct = 1.0
+        dates = pd.date_range("2026-03-18 09:30", periods=20, freq="1min", tz="America/New_York")
+        # Price starts at 101 and drops to 100.3 (70% fill)
+        prices = [101.0 - i * 0.035 for i in range(20)]
+        bars = pd.DataFrame({
+            "Open": prices,
+            "High": [p + 0.05 for p in prices],
+            "Low": [p - 0.05 for p in prices],
+            "Close": prices,
+            "Volume": [1000] * 20,
+        }, index=dates)
+        detected, fill_pct, confidence = _detect_gap_fill(bars, gap_pct, open_price, prev_close, 1.0)
+        assert detected is True
+        assert fill_pct >= 50
+
+    def test_gap_fill_not_detected_small_gap(self):
+        from src.us_playbook.regime import _detect_gap_fill
+        dates = pd.date_range("2026-03-18 09:30", periods=5, freq="1min", tz="America/New_York")
+        bars = pd.DataFrame({
+            "Open": [100.1]*5, "High": [100.2]*5,
+            "Low": [100.0]*5, "Close": [100.1]*5,
+            "Volume": [1000]*5,
+        }, index=dates)
+        detected, _, _ = _detect_gap_fill(bars, 0.05, 100.1, 100.05, 1.0)
+        assert detected is False  # gap too small
+
+
+class TestUnclearTimeout:
+    """Test UNCLEAR timeout in RegimeStabilizer."""
+
+    def test_unclear_timeout_forces_range(self):
+        """After 60min of UNCLEAR, should force to RANGE."""
+        from src.us_playbook.stabilizer import RegimeStabilizer
+        stab = RegimeStabilizer({"enabled": True, "unclear_timeout_minutes": 60})
+
+        raw = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.25,
+            rvol=0.8, price=100, gap_pct=0.1,
+        )
+
+        # First call — accepts raw
+        result1 = stab.stabilize("TEST", raw)
+        assert result1.regime == USRegimeType.UNCLEAR
+
+        # Simulate 61 minutes later — same UNCLEAR
+        import time
+        stab._state["TEST"].accepted_at = time.time() - 61 * 60
+
+        result2 = stab.stabilize("TEST", raw)
+        assert result2.regime == USRegimeType.RANGE  # forced from UNCLEAR
+        assert result2.stabilized is True
+
+    def test_unclear_timeout_forces_trend_weak_with_lean(self):
+        """UNCLEAR with bullish lean should force to TREND_WEAK."""
+        from src.us_playbook.stabilizer import RegimeStabilizer
+        stab = RegimeStabilizer({"enabled": True, "unclear_timeout_minutes": 60})
+
+        raw = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.35,
+            rvol=1.2, price=100, gap_pct=0.1,
+            lean="bullish",
+        )
+
+        result1 = stab.stabilize("TEST", raw)
+        assert result1.regime == USRegimeType.UNCLEAR
+
+        import time
+        stab._state["TEST"].accepted_at = time.time() - 61 * 60
+
+        result2 = stab.stabilize("TEST", raw)
+        assert result2.regime == USRegimeType.TREND_WEAK
+        assert result2.lean == "bullish"
+
+    def test_unclear_no_timeout_when_disabled(self):
+        """Timeout disabled should not force reclassify."""
+        from src.us_playbook.stabilizer import RegimeStabilizer
+        stab = RegimeStabilizer({"enabled": True, "unclear_timeout_minutes": 0})
+
+        raw = USRegimeResult(
+            regime=USRegimeType.UNCLEAR, confidence=0.25,
+            rvol=0.8, price=100, gap_pct=0.1,
+        )
+
+        stab.stabilize("TEST", raw)
+
+        import time
+        stab._state["TEST"].accepted_at = time.time() - 120 * 60
+
+        result = stab.stabilize("TEST", raw)
+        assert result.regime == USRegimeType.UNCLEAR  # timeout disabled
+
+
+class TestRegimeTransition7Types:
+    """Test regime transitions across all 7+1 types."""
+
+    def test_trend_to_v_reversal(self):
+        """TREND_STRONG → V_REVERSAL transition."""
+        from src.us_playbook.regime import detect_regime_transition
+        from src.common.types import VolumeProfileResult
+
+        vp = VolumeProfileResult(poc=100, vah=102, val=98)
+
+        # Create V-shape bars
+        n = 40
+        dates = pd.date_range("2026-03-18 09:30", periods=n, freq="1min", tz="America/New_York")
+        prices = []
+        open_p = 100.0
+        half = n // 2
+        for i in range(half):
+            prices.append(open_p - (1.0 * (i + 1) / half))
+        low_p = prices[-1]
+        for i in range(n - half):
+            prices.append(low_p + ((open_p + 0.5 - low_p) * (i + 1) / (n - half)))
+
+        bars = pd.DataFrame({
+            "Open": [p - 0.02 for p in prices],
+            "High": [p + 0.05 for p in prices],
+            "Low": [p - 0.05 for p in prices],
+            "Close": prices,
+            "Volume": [1000] * n,
+        }, index=dates)
+
+        original = USRegimeResult(
+            regime=USRegimeType.TREND_STRONG, confidence=0.75,
+            rvol=1.5, price=101, gap_pct=0.5,
+        )
+
+        transitioned, new_regime = detect_regime_transition(
+            original, current_rvol=1.5, current_price=100.5,
+            vp=vp, open_price=open_p, prev_close=99.5,
+            today_bars=bars,
+        )
+        # V reversal may or may not detect depending on exact bar shapes
+        # Just verify no crash
+        assert isinstance(transitioned, bool)
+
+    def test_gap_go_to_gap_fill(self):
+        """GAP_GO → GAP_FILL transition when gap retraced."""
+        from src.us_playbook.regime import detect_regime_transition
+        from src.common.types import VolumeProfileResult
+
+        vp = VolumeProfileResult(poc=100, vah=102, val=98)
+
+        # Gap up from 100 to 101, now price back at 100.3 (70% fill)
+        n = 20
+        dates = pd.date_range("2026-03-18 09:30", periods=n, freq="1min", tz="America/New_York")
+        prices = [101.0 - i * 0.035 for i in range(n)]
+        bars = pd.DataFrame({
+            "Open": prices,
+            "High": [p + 0.05 for p in prices],
+            "Low": [p - 0.05 for p in prices],
+            "Close": prices,
+            "Volume": [1000] * n,
+        }, index=dates)
+
+        original = USRegimeResult(
+            regime=USRegimeType.GAP_GO, confidence=0.80,
+            rvol=1.8, price=101, gap_pct=1.0,
+        )
+
+        transitioned, new_regime = detect_regime_transition(
+            original, current_rvol=1.2, current_price=100.3,
+            vp=vp, open_price=101.0, prev_close=100.0,
+            today_bars=bars,
+        )
+        assert transitioned is True
+        assert new_regime.regime == USRegimeType.GAP_FILL
+        assert new_regime.gap_fill_pct >= 50

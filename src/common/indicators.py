@@ -60,3 +60,48 @@ def calculate_vwap_slope(bars: pd.DataFrame, lookback: int = 15) -> float:
         return 0.0
 
     return slope / mean_vwap  # normalise to %/bar
+
+
+def calculate_vwap_hold_duration(
+    bars: pd.DataFrame,
+    vwap_series: pd.Series | None = None,
+) -> tuple[int, str]:
+    """Count consecutive bars on the same side of VWAP from the tail.
+
+    Returns ``(consecutive_bars, side)`` where side is "bullish" / "bearish" / "neutral".
+    Reuses *vwap_series* if provided; otherwise computes it.
+    """
+    if bars is None or bars.empty:
+        return 0, "neutral"
+
+    if vwap_series is None:
+        vwap_series = calculate_vwap_series(bars)
+    if vwap_series.empty or vwap_series.isna().all():
+        return 0, "neutral"
+
+    closes = bars["Close"].values
+    vwaps = vwap_series.values
+    n = len(closes)
+    if n == 0:
+        return 0, "neutral"
+
+    # Determine side of last bar
+    last_close = closes[-1]
+    last_vwap = vwaps[-1]
+    if np.isnan(last_vwap) or last_close == last_vwap:
+        return 0, "neutral"
+
+    side = "bullish" if last_close > last_vwap else "bearish"
+    count = 0
+    for i in range(n - 1, -1, -1):
+        v = vwaps[i]
+        if np.isnan(v):
+            break
+        if side == "bullish" and closes[i] > v:
+            count += 1
+        elif side == "bearish" and closes[i] < v:
+            count += 1
+        else:
+            break
+
+    return count, side
