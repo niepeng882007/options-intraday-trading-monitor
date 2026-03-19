@@ -789,7 +789,7 @@ def check_regime_consistency(
     If |price - vwap| / vwap > 1.0%, add VWAP deviation warning.
     Only applies to RANGE / GAP_FILL / NARROW_GRIND regimes.
     """
-    if regime_type not in ("RANGE", "GAP_FILL", "NARROW_GRIND"):
+    if regime_type not in ("RANGE", "GAP_FILL", "NARROW_GRIND", "FADE_CHOP"):
         return plans
     if ibh <= 0 or ibl <= 0:
         return plans

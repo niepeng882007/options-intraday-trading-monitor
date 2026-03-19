@@ -225,7 +225,7 @@ class TestSubscribeQuotes:
         args = mock_ctx.subscribe.call_args[0]
         assert "US.AAPL" in args[0]
         assert "US.TSLA" in args[0]
-        assert c._subscription_count == 2
+        assert c._subscription_count == 4  # 2 symbols × 2 sub types (QUOTE+K_1M)
 
     def test_quota_warning(self, collector):
         c, mock_ctx = collector
@@ -240,7 +240,7 @@ class TestSubscribeQuotes:
 
         args = mock_ctx.subscribe.call_args[0]
         assert len(args[0]) == 1
-        assert c._subscription_count == 3
+        assert c._subscription_count == 4  # 2 + 1 symbol × 2 sub types
 
 
 # ── Watchdog tests ──
@@ -336,6 +336,8 @@ class TestWatchdogProbe:
         assert c._watchdog_task is not None
         await c.close()
         assert c._watchdog_task is None
+        # close() shuts down the module-level _thread_pool; reset it for subsequent tests
+        c._reset_thread_pool()
 
 
 class TestRetryUpdatesLastOk:

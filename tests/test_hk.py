@@ -1388,11 +1388,11 @@ class TestRecommend:
         )
         chain = pd.DataFrame([
             {"code": "C1", "option_type": "CALL", "strike_price": 108,
-             "strike_time": "2026-03-17", "open_interest": 200, "delta": 0.5},
+             "strike_time": "2026-03-25", "open_interest": 200, "delta": 0.5},
             {"code": "C2", "option_type": "CALL", "strike_price": 110,
-             "strike_time": "2026-03-17", "open_interest": 150, "delta": 0.35},
+             "strike_time": "2026-03-25", "open_interest": 150, "delta": 0.35},
         ])
-        dates = [{"strike_time": "2026-03-17"}]
+        dates = [{"strike_time": "2026-03-25"}]
         rec = recommend(regime, self._vp(), self._filters(),
                         chain_df=chain, expiry_dates=dates)
         assert rec.action == "call"
@@ -1628,12 +1628,12 @@ class TestRecommendChaseRisk:
         )
         # va_dist = (525-520)/520 = 0.96% → below moderate threshold
         # But use low thresholds to trigger moderate
-        dates = [{"strike_time": "2026-03-17"}]
+        dates = [{"strike_time": "2026-03-25"}]
         chain = pd.DataFrame([
             {"code": "C1", "option_type": "CALL", "strike_price": 524,
-             "strike_time": "2026-03-17", "open_interest": 200, "delta": 0.5},
+             "strike_time": "2026-03-25", "open_interest": 200, "delta": 0.5},
             {"code": "C2", "option_type": "CALL", "strike_price": 526,
-             "strike_time": "2026-03-17", "open_interest": 150, "delta": 0.4},
+             "strike_time": "2026-03-25", "open_interest": 150, "delta": 0.4},
         ])
         rec = recommend(
             regime, self._vp(), self._filters(),
@@ -1653,9 +1653,9 @@ class TestRecommendChaseRisk:
         )
         chain = pd.DataFrame([
             {"code": "C1", "option_type": "CALL", "strike_price": 515,
-             "strike_time": "2026-03-17", "open_interest": 200, "delta": 0.5},
+             "strike_time": "2026-03-25", "open_interest": 200, "delta": 0.5},
         ])
-        dates = [{"strike_time": "2026-03-17"}]
+        dates = [{"strike_time": "2026-03-25"}]
         rec = recommend(
             regime, self._vp(), self._filters(),
             chain_df=chain, expiry_dates=dates,
@@ -2223,6 +2223,7 @@ class TestAutoScanIntegration:
             p._scan_history = {}
             p._scan_history_date = ""
             p._vp_cache = {}
+            p._playbook_snapshots = {}
 
             async def run_sync(fn, *args):
                 return fn(*args)
@@ -2520,19 +2521,19 @@ class TestDTESpreadDowngrade:
         # Build chain with both CALL and PUT, and good R:R for spread
         chain = pd.DataFrame([
             {"code": "C0", "option_type": "CALL", "strike_price": 102,
-             "strike_time": "2026-03-20", "open_interest": 200, "delta": 0.50,
+             "strike_time": "2026-03-29", "open_interest": 200, "delta": 0.50,
              "last_price": 3.0},
             {"code": "C1", "option_type": "CALL", "strike_price": 104,
-             "strike_time": "2026-03-20", "open_interest": 200, "delta": 0.35,
+             "strike_time": "2026-03-29", "open_interest": 200, "delta": 0.35,
              "last_price": 1.5},
             {"code": "P0", "option_type": "PUT", "strike_price": 100,
-             "strike_time": "2026-03-20", "open_interest": 200, "delta": -0.40,
+             "strike_time": "2026-03-29", "open_interest": 200, "delta": -0.40,
              "last_price": 2.0},
             {"code": "P1", "option_type": "PUT", "strike_price": 98,
-             "strike_time": "2026-03-20", "open_interest": 200, "delta": -0.25,
+             "strike_time": "2026-03-29", "open_interest": 200, "delta": -0.25,
              "last_price": 0.5},
         ])
-        dates = [{"strike_time": "2026-03-20"}]
+        dates = [{"strike_time": "2026-03-29"}]
         rec = recommend(regime, vp, filters, chain_df=chain, expiry_dates=dates)
         # DTE=10, spread path is open — should get bear_call_spread or fall through to put
         assert rec.action != "wait"
@@ -2893,11 +2894,11 @@ class TestRangeDTEGuard:
         filters = FilterResult(tradeable=True)
         chain = pd.DataFrame([
             {"code": "P1", "option_type": "PUT", "strike_price": 109.0,
-             "strike_time": "2026-03-13", "open_interest": 200,
+             "strike_time": "2026-03-20", "open_interest": 200,
              "delta": -0.45, "last_price": 1.50},
         ])
         # DTE=1
-        dates = [{"strike_time": "2026-03-13"}]
+        dates = [{"strike_time": "2026-03-20"}]
         rec = recommend(
             regime, vp, filters, chain_df=chain, expiry_dates=dates,
             vwap=109.5, range_min_dte=2,

@@ -45,13 +45,16 @@ docker compose up --build       # Docker 部署
 
 从港股和美股模块中提取的共享工具，消除跨模块依赖。两个市场模块均从 `src/common/` 导入，而非互相导入。
 
-- **`types.py`** — 9 个共享 dataclass：`VolumeProfileResult`、`GammaWallResult`、`FilterResult`、`OptionLeg`、`ChaseRiskResult`、`SpreadMetrics`、`OptionRecommendation`、`QuoteSnapshot`、`OptionMarketSnapshot`。港股特有类型（`RegimeType`、`RegimeResult`、`HKKeyLevels`、`Playbook`、`ScanSignal`、`ScanAlertRecord`、`OrderBookAlert`）保留在 `src/hk/__init__.py` 中。
+- **`types.py`** — 13 个共享 dataclass：`VolumeProfileResult`、`GammaWallResult`、`FilterResult`、`OptionLeg`、`ChaseRiskResult`、`SpreadMetrics`、`OptionRecommendation`、`QuoteSnapshot`、`OptionMarketSnapshot`、`PlaybookResponse`、`DirectionConfidence`、`RelativeStrength`、`PlaybookSnapshot`。港股特有类型（`RegimeType`、`RegimeResult`、`HKKeyLevels`、`Playbook`、`ScanSignal`、`ScanAlertRecord`、`OrderBookAlert`）保留在 `src/hk/__init__.py` 中。
 - **`volume_profile.py`** — `calculate_volume_profile()`（POC/VAH/VAL）。`src/hk/volume_profile.py` 为重导出垫片。
 - **`gamma_wall.py`** — `calculate_gamma_wall()`、`format_gamma_wall_message()`。`src/hk/gamma_wall.py` 为重导出垫片。
 - **`formatting.py`** — 12 个 playbook 格式化工具：`confidence_bar()`、`pct_change()`、`format_percent()`、`split_reason_lines()`、`closest_value_area_edge()`、`action_label()`、`action_plain_language()`、`format_strike()`、`format_leg_line()`、`position_size_text()`、`spread_execution_text()`、`risk_status_text()`。市场特有的格式化函数（`_format_turnover`、`_price_position`、`_regime_reason_lines`）保留在各模块的 `playbook.py` 中。
 - **`option_utils.py`** — `classify_moneyness()`、`option_leg_from_row()`、`calculate_spread_metrics()`、`is_positive_ev()`、`recommend_single_leg()`、`recommend_spread()`、`assess_chase_risk()`。默认参数匹配港股值（min_oi=50, chase 2.0/3.5%）；美股调用方传入更严格的覆盖值（min_oi=100, chase 1.5/2.5%）。
-- **`indicators.py`** — `calculate_vwap()`。RVOL 保留在各模块中（算法不同）。
-- **`action_plan.py`** — `ActionPlan`、`PlanContext` dataclass + 12 个共享计划工具（`calculate_rr`、`reachable_range_pct`、`compact_option_line`、`format_action_plan`、`nearest_levels`、`find_fade_entry_zone`、`cap_tp2`、`check_entry_reachability`、`apply_wait_coherence`、`apply_min_rr_gate`）。美股和港股 playbook 均从此处导入。
+- **`indicators.py`** — `calculate_vwap()`、`calculate_vwap_series()`、`calculate_vwap_slope()`。RVOL 保留在各模块中（算法不同）。
+- **`action_plan.py`** — `ActionPlan`、`PlanContext` dataclass + 12 个共享计划工具（`calculate_rr`、`reachable_range_pct`、`compact_option_line`、`format_action_plan`、`nearest_levels`、`find_fade_entry_zone`、`cap_tp2`、`check_entry_reachability`、`apply_wait_coherence`、`apply_min_rr_gate`、`check_regime_consistency`）。美股和港股 playbook 均从此处导入。
+- **`version_diff.py`** — `extract_snapshot()` / `diff_snapshots()` 冻结 playbook 状态并比较快照（方向、regime、入场价位变化），输出中文 diff 文本。
+- **`checklist.py`** — `validate_checklist()` 10 项只读质量检查（观望超时、入场可达、反向对冲、止损下限、TP1 可达、R:R 门槛、版本 diff、RVOL 校正、相对强度、日型归类）。
+- **`trading_days.py`** — `previous_trading_day(market, ref_date)`、`trading_day_range(d, market)`（US/HK，跳过周末+假日）。
 - **`watchlist.py`** — `Watchlist` 基类，带 `config_parser` 回调。`HKWatchlist` 和 `USWatchlist` 为轻量包装器。
 - **`telegram_handlers.py`** — `handle_query_base()`、`handle_add_base()`、`handle_remove_base()`、`handle_watchlist_base()`、`build_combined_keyboard()`。市场模块保留各自的正则模式、帮助文本和 `register_*_handlers()`。
 - **`chart.py`** — `generate_chart()` / `generate_chart_async()` 生成深色主题 K 线图 PNG（BytesIO），包含关键价位 + VP 侧边栏。`ChartData` 输入 dataclass。`HKPredictor` 和 `USPredictor` 都从 `generate_playbook_for_symbol()` 返回 `PlaybookResponse(html, chart)`。`handle_query_base()` 先发送图表照片再发送 HTML 文本；图表失败时优雅降级为纯文本。
@@ -78,7 +81,8 @@ docker compose up --build       # Docker 部署
 按需美股期权交易预测器。通过共享 Telegram Application 集成。无定时推送 — 文本触发的 playbook 生成 + 强信号自动扫描警报。从 `src/common/` 导入共享逻辑（不依赖 `src/hk/`）。
 
 - **核心：** `USPredictor` 编排器（按需 + 自动扫描）。复用共享 `FutuCollector`。`get_snapshot()` 获取报价（无需订阅），`get_history_bars()` 获取多日 1 分钟 bars，`get_premarket_hl()` 获取盘前范围。二进制 bar 缓存（历史缓存 120s TTL，当天始终刷新）。SPY 上下文 300s TTL，按需查询和自动扫描共享。
-- **分析：** `levels`（PDH/PDL、PMH/PML、VP 通过 `src.common.volume_profile`、Gamma Wall 通过 `src.common.gamma_wall`），`indicators`（窗口式 RVOL、自适应阈值），`regime`（GAP_AND_GO/TREND_DAY/FADE_CHOP/UNCLEAR，带 SPY 上下文）。
+- **分析：** `levels`（PDH/PDL、PMH/PML、VP 通过 `src.common.volume_profile`、Gamma Wall 通过 `src.common.gamma_wall`），`indicators`（窗口式 RVOL、自适应阈值），`regime`（8 类 regime 分 4 族：TREND 族 [TREND_STRONG/TREND_WEAK/GAP_GO]、FADE 族 [RANGE/NARROW_GRIND]、REVERSAL 族 [V_REVERSAL/GAP_FILL]、UNCLEAR，带 SPY 上下文）。`stabilizer`（L1 扫描防抖：迟滞 + 时间持续 + 60 分钟 UNCLEAR 超时强制归类）。
+- **市场基调：** `market_tone.py` — `MarketToneEngine` 通过 6 个信号（宏观日历、VIX、SPY gap、ORB、VWAP、市场宽度）计算 A+~D 评级，输出 `confidence_modifier`（-0.15~+0.10）、`position_size_hint`、`direction`、`day_type`。评级影响 regime 置信度、自动扫描门控（D=跳过、C=仅高 R:R）、playbook Section 0 展示。
 - **期权推荐：** `option_recommend.py` — 方向由 regime + 价格位置决定，到期日选择（过滤 0DTE，优选 2-7 DTE 周期权），委托 `src.common.option_utils` 并传入美股覆盖参数（min_oi=100, chase 1.5/2.5%），Greeks 降级处理（delta 不可用时回退到 moneyness）。
 - **自选列表：** `watchlist.py` — `USWatchlist(Watchlist)` 轻量包装器 + `normalize_us_symbol()`。JSON 持久化（`data/us_watchlist.json`），`+AAPL` 添加 / `-AAPL` 移除 / `uswl` 查看。首次运行时回退到 `us_playbook_settings.yaml`。
 - **自动扫描：** L1 轻量筛选 → L2 完整流水线验证。结构/执行解耦（结构门控推送，期权推荐仅供参考）。3 层频率控制（同信号 30 分钟冷却、每次扫描最多 2 条、每日最多 3 条）+ 覆盖例外。
@@ -109,7 +113,7 @@ docker compose up --build       # Docker 部署
 
 ## 美股配置
 
-- `config/us_playbook_settings.yaml` — 美股自选列表（SPY/QQQ/AAPL/TSLA/NVDA/META/AMD/AMZN，运行时通过 `data/us_watchlist.json` 管理）、VP lookback（5 天）、RVOL 参数（skip_open 3 分钟、lookback 10 天）、regime 阈值（adaptive 启用、gap_and_go 1.5、trend_day 1.2、fade_chop 1.0）、市场上下文标的、Gamma Wall 开关、auto_scan（间隔 180s、breakout/range_reversal 配置、cooldown/override）、chase_risk 阈值、option_recommend（dte_min 1、dte_preferred_max 7、delta 0.30-0.50、min_oi 100）、hist_cache_ttl 120s、`simulation` 块（tp/sl/slippage、exit_mode、trailing 参数、exclude_symbols、skip_signal_types）。
+- `config/us_playbook_settings.yaml` — 美股自选列表（SPY/QQQ/AAPL/TSLA/NVDA/META/AMD/AMZN，运行时通过 `data/us_watchlist.json` 管理）、VP lookback（5 天）、RVOL 参数（skip_open 3 分钟、lookback 10 天）、regime 阈值（adaptive 启用、gap_and_go 1.5、trend_day 1.2、trend_strong 1.8、fade_chop 1.0）、市场上下文标的、Gamma Wall 开关、auto_scan（间隔 180s、breakout/range_reversal 配置、cooldown/override）、chase_risk 阈值、option_recommend（dte_min 1、dte_preferred_max 7、delta 0.30-0.50、min_oi 100）、hist_cache_ttl 120s、`simulation` 块（tp/sl/slippage、exit_mode、trailing 参数、exclude_symbols、skip_signal_types）。
 - `config/us_calendar.yaml` — 2026 年美股宏观日历（FOMC/NFP/CPI/假日）。月度 OpEx 自动计算。
 
 ## 关键约定
@@ -122,18 +126,18 @@ docker compose up --build       # Docker 部署
 - `src/hk/` 中的重导出垫片保持向后兼容（如 `from src.hk import VolumeProfileResult` 仍可使用）
 - 添加共享功能时放入 `src/common/` 并设置合理默认值；市场模块按需传入覆盖参数
 
-## 重构目标 (v2)
+## 重构目标 (v2) — 已完成
 
-本次重构基于 playbook_template_v2.md 规范，核心改进:
+本次重构基于 playbook_template_v2.md 规范，核心改进（均已实现）:
 
-1. 观望超时机制: "不明确" 最多持续 60 分钟后强制归类
-2. 入场可执行性: 必须包含近端方案 (距当前价 < 0.3%)
-3. 多空对称: 主方案 + 反向对冲方案，各有具体价位
-4. 止损下限: > 1.5x 5min ATR
-5. R:R 校验: 首选 ≥ 1.5:1，> 8:1 触发异常检查
-6. 版本 diff: 每次更新标注与上一版的变化
-7. 相对强度: 个股 vs SPY 相关性，脱钩时降低大盘权重
-8. RVOL 开盘校正: 09:35 前的 RVOL 需用历史同时段校正
+1. ✅ 观望超时机制: "不明确" 最多持续 60 分钟后强制归类（`stabilizer.py` UNCLEAR timeout + `checklist.py` #1/#10）
+2. ✅ 入场可执行性: 必须包含近端方案（`check_entry_reachability()` + `checklist.py` #2）
+3. ✅ 多空对称: 主方案 + 反向对冲方案（`checklist.py` #3 检查）
+4. ✅ 止损下限: > 1.5x 5min ATR（ATR-based stop loss + `checklist.py` #4）
+5. ✅ R:R 校验: ≥ 1.5:1（`apply_min_rr_gate()` + `checklist.py` #6）
+6. ✅ 版本 diff: 每次更新标注变化（`version_diff.py` + `checklist.py` #7）
+7. ✅ 相对强度: 个股 vs SPY 相关性（`checklist.py` #9，指数豁免）
+8. ✅ RVOL 开盘校正: 09:35 前警告（`checklist.py` #8，HK 豁免）
 
 ## 开发规范
 

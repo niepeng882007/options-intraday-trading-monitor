@@ -1525,6 +1525,10 @@ class TestScanHeader:
 
 class TestUSPlaybookStandaloneEntry:
     def test_build_telegram_application_wires_dual_requests(self, monkeypatch):
+        # Clear proxy env vars so they don't leak into the test
+        monkeypatch.delenv("https_proxy", raising=False)
+        monkeypatch.delenv("HTTPS_PROXY", raising=False)
+
         created_requests = []
 
         class FakeRequest:
@@ -1577,6 +1581,7 @@ class TestUSPlaybookStandaloneEntry:
             "write_timeout": us_playbook_entry.TELEGRAM_WRITE_TIMEOUT_SECONDS,
             "connect_timeout": us_playbook_entry.TELEGRAM_CONNECT_TIMEOUT_SECONDS,
             "pool_timeout": us_playbook_entry.TELEGRAM_POOL_TIMEOUT_SECONDS,
+            "proxy": None,
         }
         assert created_requests[1].kwargs == created_requests[0].kwargs
 
@@ -1906,6 +1911,9 @@ class TestFadeEntryStaleness:
         Price 674 with VAH=680/VAL=670 gives position_ratio=0.40 (transition zone).
         Provide upward momentum to confirm bullish direction, then moderate staleness applies.
         """
+        from datetime import date, timedelta
+
+        future_expiry = (date.today() + timedelta(days=5)).strftime("%Y-%m-%d")
         vp = VolumeProfileResult(poc=670.0, vah=680.0, val=670.0)
         regime = USRegimeResult(
             regime=USRegimeType.RANGE, confidence=0.7,
@@ -1914,7 +1922,7 @@ class TestFadeEntryStaleness:
         filters = FilterResult(tradeable=True, warnings=[], risk_level="normal")
         chain_df = pd.DataFrame([{
             "code": "SPY260313C00674000", "option_type": "CALL",
-            "strike_price": 674.0, "strike_time": "2026-03-13",
+            "strike_price": 674.0, "strike_time": future_expiry,
             "open_interest": 500, "implied_volatility": 0.2,
             "delta": 0.50, "gamma": 0.05, "theta": -0.10, "vega": 0.15,
             "last_price": 3.0, "snap_volume": 100,
@@ -1927,7 +1935,7 @@ class TestFadeEntryStaleness:
         rec = recommend(
             regime, vp, filters,
             chain_df=chain_df,
-            expiry_dates=["2026-03-13"],
+            expiry_dates=[future_expiry],
             today_bars=today_bars,
         )
         assert rec.action != "wait"
@@ -1936,6 +1944,9 @@ class TestFadeEntryStaleness:
 
     def test_recommend_none_shows_near_val(self):
         """RANGE + low penetration → rationale says '靠近 VAL'."""
+        from datetime import date, timedelta
+
+        future_expiry = (date.today() + timedelta(days=5)).strftime("%Y-%m-%d")
         regime = USRegimeResult(
             regime=USRegimeType.RANGE, confidence=0.7,
             rvol=0.8, price=671.0, gap_pct=0.1,
@@ -1944,7 +1955,7 @@ class TestFadeEntryStaleness:
         filters = FilterResult(tradeable=True, warnings=[], risk_level="normal")
         chain_df = pd.DataFrame([{
             "code": "SPY260313C00671000", "option_type": "CALL",
-            "strike_price": 671.0, "strike_time": "2026-03-13",
+            "strike_price": 671.0, "strike_time": future_expiry,
             "open_interest": 500, "implied_volatility": 0.2,
             "delta": 0.50, "gamma": 0.05, "theta": -0.10, "vega": 0.15,
             "last_price": 3.0, "snap_volume": 100,
@@ -1953,7 +1964,7 @@ class TestFadeEntryStaleness:
         rec = recommend(
             regime, vp, filters,
             chain_df=chain_df,
-            expiry_dates=["2026-03-13"],
+            expiry_dates=[future_expiry],
         )
         assert rec.action != "wait"
         assert "靠近" in rec.rationale
