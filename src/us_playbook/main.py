@@ -17,7 +17,6 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from src.common.action_plan import PlanContext
 from src.common.chart import ChartData, generate_chart_async
 from src.common.checklist import validate_checklist
 from src.common.indicators import compute_relative_strength
@@ -53,7 +52,7 @@ from src.us_playbook.option_recommend import (
     recommend,
     select_expiry,
 )
-from src.us_playbook.playbook import format_us_playbook_message, get_regime_strategy
+from src.us_playbook.playbook import format_us_playbook_message, get_regime_strategy, prepare_plans
 from src.us_playbook.stabilizer import RegimeStabilizer
 from src.us_playbook.regime import (
     classify_us_regime, check_index_consistency, detect_regime_transition,
@@ -663,19 +662,12 @@ class USPredictor:
         spy_result = self._last_playbooks.get("SPY")
         qqq_result = self._last_playbooks.get("QQQ")
 
-        # --- Version diff ---
+        # --- Pre-compute plans ---
+        plans, plan_ctx, _dir = prepare_plans(result, spy_result=spy_result)
+
+        # --- Version diff (with actual plans) ---
         now_et = datetime.now(ET)
         trading_day = now_et.strftime("%Y-%m-%d")
-        _dir = _decide_direction(
-            result.regime, result.volume_profile,
-            vwap=result.key_levels.vwap,
-            pdl=result.key_levels.pdl, pdh=result.key_levels.pdh,
-            pml=result.key_levels.pml, pmh=result.key_levels.pmh,
-        )
-        if _dir == "neutral":
-            vwap = result.key_levels.vwap
-            if vwap > 0:
-                _dir = "bullish" if result.regime.price > vwap else "bearish"
 
         prev_snap = self._playbook_snapshots.get(symbol)
         curr_snap = extract_snapshot(
@@ -684,24 +676,18 @@ class USPredictor:
             direction=_dir,
             regime_type=result.regime.regime.value,
             confidence=result.regime.confidence,
-            plans=[],
+            plans=plans,
         )
         diff_text = diff_snapshots(prev_snap, curr_snap)
 
-        # --- Checklist ---
-        _close_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        # --- Checklist (with actual plans) ---
         _open_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
         _min_since_open = max(0, int((now_et - _open_et).total_seconds() / 60))
         _rs = result.relative_strength
         _is_index = symbol in ("SPY", "QQQ")
         violations = validate_checklist(
-            plans=[],
-            ctx=PlanContext(
-                minutes_to_close=max(0, int((_close_et - now_et).total_seconds() / 60)),
-                rvol=result.regime.rvol,
-                avg_daily_range_pct=result.avg_daily_range_pct,
-                atr_5min=result.atr_5min,
-            ),
+            plans=plans,
+            ctx=plan_ctx,
             direction=_dir,
             regime_type=result.regime.regime.value,
             minutes_since_open=_min_since_open,
@@ -715,6 +701,7 @@ class USPredictor:
             result, spy_result=spy_result, qqq_result=qqq_result,
             version_diff=diff_text,
             checklist_violations=violations if violations else None,
+            plans=plans, plan_ctx=plan_ctx, direction=_dir,
         )
         self._playbook_snapshots[symbol] = curr_snap
 

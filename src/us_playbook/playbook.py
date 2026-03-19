@@ -1758,12 +1758,25 @@ def _make_unclear_fade_plan(
 def _make_unclear_directional_plan(
     lean: str, vp: VolumeProfileResult, kl: KeyLevels,
     option_line: str | None,
+    gamma_wall: GammaWallResult | None = None,
 ) -> ActionPlan:
     """Build the original light-position directional plan for UNCLEAR with lean.
 
     Used when is_chop_likely is False (RVOL >= 1.0 or confidence > 0.30).
+    Now includes stop_loss from nearest structural level in the opposing direction.
     """
     dir_cn = "做多" if lean == "bullish" else "做空"
+    tp1 = vp.vah if lean == "bullish" else vp.val
+    tp1_label = "VAH" if lean == "bullish" else "VAL"
+
+    # Find stop_loss from nearest opposing structural level
+    sl_side = "below" if lean == "bullish" else "above"
+    levels = _us_key_levels_to_dict(vp, kl, gamma_wall, current_price=kl.vwap)
+    sl_candidates = _nearest_levels_common(kl.vwap, sl_side, levels, n=1)
+    sl_price = sl_candidates[0][1] if sl_candidates else None
+    sl_label = sl_candidates[0][0] if sl_candidates else "严格止损"
+
+    rr = _calculate_rr(kl.vwap, sl_price, tp1) if sl_price else 0.0
     return ActionPlan(
         label="B", name=f"轻仓{dir_cn}", emoji="📈" if lean == "bullish" else "📉",
         is_primary=False,
@@ -1771,11 +1784,60 @@ def _make_unclear_directional_plan(
         direction=lean,
         trigger=f"价格确认 VWAP {'上方' if lean == 'bullish' else '下方'}",
         entry=kl.vwap, entry_action=dir_cn,
-        stop_loss=None, stop_loss_reason="严格止损",
-        tp1=vp.vah if lean == "bullish" else vp.val,
-        tp1_label="VAH" if lean == "bullish" else "VAL",
-        tp2=None, tp2_label="", rr_ratio=0.0,
+        stop_loss=sl_price, stop_loss_reason=sl_label,
+        tp1=tp1,
+        tp1_label=tp1_label,
+        tp2=None, tp2_label="", rr_ratio=rr,
         option_line=option_line,
+    )
+
+
+def _make_unclear_hedge_plan(
+    lean: str, vp: VolumeProfileResult, kl: KeyLevels,
+    option_line: str | None,
+    gamma_wall: GammaWallResult | None = None,
+) -> ActionPlan:
+    """Build a reverse hedge plan for UNCLEAR with lean direction.
+
+    If lean=bullish, hedge = bearish (short from nearest resistance → TP=VWAP).
+    If lean=bearish, hedge = bullish (long from nearest support → TP=VWAP).
+    """
+    hedge_dir = "bearish" if lean == "bullish" else "bullish"
+    hedge_cn = "做空" if hedge_dir == "bearish" else "做多"
+    hedge_emoji = "📉" if hedge_dir == "bearish" else "📈"
+
+    levels = _us_key_levels_to_dict(vp, kl, gamma_wall, current_price=kl.vwap)
+
+    if hedge_dir == "bearish":
+        # Entry = nearest resistance above VWAP
+        entry_candidates = _nearest_levels_common(kl.vwap, "above", levels, n=2)
+        entry_price = entry_candidates[0][1] if entry_candidates else vp.vah
+        entry_label = entry_candidates[0][0] if entry_candidates else "VAH"
+        # SL = next resistance above entry
+        sl_price = entry_candidates[1][1] if len(entry_candidates) >= 2 else None
+        sl_label = entry_candidates[1][0] if len(entry_candidates) >= 2 else "上方结构位"
+    else:
+        # Entry = nearest support below VWAP
+        entry_candidates = _nearest_levels_common(kl.vwap, "below", levels, n=2)
+        entry_price = entry_candidates[0][1] if entry_candidates else vp.val
+        entry_label = entry_candidates[0][0] if entry_candidates else "VAL"
+        # SL = next support below entry
+        sl_price = entry_candidates[1][1] if len(entry_candidates) >= 2 else None
+        sl_label = entry_candidates[1][0] if len(entry_candidates) >= 2 else "下方结构位"
+
+    rr = _calculate_rr(entry_price, sl_price, kl.vwap) if sl_price else 0.0
+    return ActionPlan(
+        label="C", name=f"反向对冲{hedge_cn}", emoji=hedge_emoji,
+        is_primary=False,
+        logic=f"方向反转时的对冲方案, {entry_label} 附近{hedge_cn}",
+        direction=hedge_dir,
+        trigger=f"价格{'反弹至' if hedge_dir == 'bearish' else '回落至'} {entry_label} {entry_price:,.2f}",
+        entry=entry_price, entry_action=hedge_cn,
+        stop_loss=sl_price, stop_loss_reason=sl_label,
+        tp1=kl.vwap, tp1_label="VWAP",
+        tp2=None, tp2_label="", rr_ratio=rr,
+        option_line=option_line,
+        plan_b_role="hedge",
     )
 
 
@@ -1804,9 +1866,11 @@ def _plans_unclear(
         if is_chop_likely:
             plan_b = _make_unclear_fade_plan(lean, vp, kl, gamma_wall, option_line)
             if plan_b is None:
-                plan_b = _make_unclear_directional_plan(lean, vp, kl, option_line)
+                plan_b = _make_unclear_directional_plan(lean, vp, kl, option_line, gamma_wall)
         else:
-            plan_b = _make_unclear_directional_plan(lean, vp, kl, option_line)
+            plan_b = _make_unclear_directional_plan(lean, vp, kl, option_line, gamma_wall)
+        # Plan C: reverse hedge when lean has direction
+        plan_c = _make_unclear_hedge_plan(lean, vp, kl, option_line, gamma_wall)
     else:
         plan_b = ActionPlan(
             label="B", name="观察关键位", emoji="👀", is_primary=False,
@@ -1817,16 +1881,15 @@ def _plans_unclear(
             stop_loss=None, stop_loss_reason="",
             tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
         )
-
-    plan_c = ActionPlan(
-        label="C", name="保持空仓", emoji="⚡", is_primary=False,
-        logic="无明确信号时保留资金",
-        direction="neutral",
-        trigger="全天信号混杂",
-        entry=None, entry_action="",
-        stop_loss=None, stop_loss_reason="",
-        tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
-    )
+        plan_c = ActionPlan(
+            label="C", name="保持空仓", emoji="⚡", is_primary=False,
+            logic="无明确信号时保留资金",
+            direction="neutral",
+            trigger="全天信号混杂",
+            entry=None, entry_action="",
+            stop_loss=None, stop_loss_reason="",
+            tp1=None, tp1_label="", tp2=None, tp2_label="", rr_ratio=0.0,
+        )
     return [plan_a, plan_b, plan_c]
 
 
@@ -1981,6 +2044,77 @@ def _collect_levels(
     return items
 
 
+# ── Pre-compute plans (for checklist / version diff) ──
+
+
+def _resolve_direction(result: USPlaybookResult) -> str:
+    """Resolve direction from USPlaybookResult using unified logic."""
+    r = result.regime
+    vp = result.volume_profile
+    kl = result.key_levels
+    vwap = kl.vwap
+    direction = _decide_direction(
+        r, vp, vwap=vwap, pdl=kl.pdl, pdh=kl.pdh, pml=kl.pml, pmh=kl.pmh,
+    )
+    if direction == "neutral":
+        if r.price > vp.vah:
+            direction = "bullish"
+        elif r.price < vp.val:
+            direction = "bearish"
+        elif vwap > 0:
+            direction = "bullish" if r.price > vwap else "bearish"
+        elif vp.poc > 0:
+            direction = "bullish" if r.price > vp.poc else "bearish"
+        else:
+            direction = "bullish"
+    return direction
+
+
+def prepare_plans(
+    result: USPlaybookResult,
+    spy_result: USPlaybookResult | None = None,
+    trend_downgrade_confidence: float = 0.70,
+) -> tuple[list[ActionPlan], PlanContext, str]:
+    """Pre-compute plans, PlanContext, and direction for checklist/diff use."""
+    r = result.regime
+    kl = result.key_levels
+    vp = result.volume_profile
+    gamma_wall = result.gamma_wall
+    recommendation = result.option_rec
+    now = result.generated_at or datetime.now(ET)
+
+    _direction = _resolve_direction(result)
+
+    _close_et = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    _min_left = max(0, int((_close_et - now).total_seconds() / 60))
+    _intraday_range = 0.0
+    quote = result.quote
+    if quote and quote.high_price > 0 and quote.low_price > 0:
+        _intraday_range = (quote.high_price - quote.low_price) / quote.low_price * 100
+    _spy_direction = _infer_market_direction(spy_result)
+    _rs = getattr(result, "relative_strength", None)
+    _decoupled = _rs.decoupled if _rs else False
+    plan_ctx = PlanContext(
+        minutes_to_close=_min_left,
+        rvol=r.rvol,
+        avg_daily_range_pct=getattr(result, "avg_daily_range_pct", 0.0),
+        intraday_range_pct=_intraday_range,
+        option_action=recommendation.action if recommendation else "",
+        market_direction=_spy_direction,
+        current_price=r.price,
+        decoupled_from_benchmark=_decoupled,
+        atr_5min=getattr(result, "atr_5min", 0.0),
+    )
+
+    _intraday_levels = getattr(result, "intraday_levels", None)
+    plans = _generate_action_plans(
+        r, _direction, vp, kl, gamma_wall, recommendation,
+        ctx=plan_ctx, trend_downgrade_confidence=trend_downgrade_confidence,
+        intraday_levels=_intraday_levels,
+    )
+    return plans, plan_ctx, _direction
+
+
 # ── Main formatter ──
 
 
@@ -1991,6 +2125,9 @@ def format_us_playbook_message(
     trend_downgrade_confidence: float = 0.70,
     version_diff: str = "",
     checklist_violations: list[str] | None = None,
+    plans: list[ActionPlan] | None = None,
+    plan_ctx: PlanContext | None = None,
+    direction: str | None = None,
 ) -> str:
     """Format US Playbook as Telegram HTML message — institutional-grade intraday playbook."""
     r = result.regime
@@ -2003,21 +2140,8 @@ def format_us_playbook_message(
 
     vwap = kl.vwap
 
-    # Determine direction via unified logic (structure-aware)
-    _direction = _decide_direction(
-        r, vp, vwap=vwap, pdl=kl.pdl, pdh=kl.pdh, pml=kl.pml, pmh=kl.pmh,
-    )
-    if _direction == "neutral":
-        if r.price > vp.vah:
-            _direction = "bullish"
-        elif r.price < vp.val:
-            _direction = "bearish"
-        elif vwap > 0:
-            _direction = "bullish" if r.price > vwap else "bearish"
-        elif vp.poc > 0:
-            _direction = "bullish" if r.price > vp.poc else "bearish"
-        else:
-            _direction = "bullish"
+    # Use pre-computed direction or resolve internally
+    _direction = direction if direction is not None else _resolve_direction(result)
     emoji = get_regime_emoji(r.regime, _direction)
     option_market = result.option_market
     recommendation = result.option_rec
@@ -2068,32 +2192,21 @@ def format_us_playbook_message(
     lines.append("")
 
     # ── Pre-compute: plans + direction confidence (needed by Section 2) ──
+    if plans is not None and plan_ctx is not None:
+        # Use pre-computed plans from caller
+        _plan_ctx = plan_ctx
+    else:
+        # Compute internally (backward compat)
+        plans, _plan_ctx, _direction = prepare_plans(
+            result, spy_result=spy_result,
+            trend_downgrade_confidence=trend_downgrade_confidence,
+        )
+        emoji = get_regime_emoji(r.regime, _direction)
+
     _close_et = now.replace(hour=16, minute=0, second=0, microsecond=0)
     _min_left = max(0, int((_close_et - now).total_seconds() / 60))
-    _intraday_range = 0.0
-    if quote and quote.high_price > 0 and quote.low_price > 0:
-        _intraday_range = (quote.high_price - quote.low_price) / quote.low_price * 100
-    _spy_direction = _infer_market_direction(spy_result)
-    _rs = getattr(result, "relative_strength", None)
-    _decoupled = _rs.decoupled if _rs else False
-    _plan_ctx = PlanContext(
-        minutes_to_close=_min_left,
-        rvol=r.rvol,
-        avg_daily_range_pct=getattr(result, "avg_daily_range_pct", 0.0),
-        intraday_range_pct=_intraday_range,
-        option_action=recommendation.action if recommendation else "",
-        market_direction=_spy_direction,
-        current_price=r.price,
-        decoupled_from_benchmark=_decoupled,
-        atr_5min=getattr(result, "atr_5min", 0.0),
-    )
-
     _intraday_levels = getattr(result, "intraday_levels", None)
-    plans = _generate_action_plans(
-        r, _direction, vp, kl, gamma_wall, recommendation,
-        ctx=_plan_ctx, trend_downgrade_confidence=trend_downgrade_confidence,
-        intraday_levels=_intraday_levels,
-    )
+    _rs = getattr(result, "relative_strength", None)
 
     _dir_conf = _compute_direction_confidence(
         r, vp, kl, _direction,
@@ -2116,7 +2229,11 @@ def format_us_playbook_message(
         lines.append(f"<b>{' '.join(parts_line)}</b>")
     else:
         conclusion = _core_conclusion_text(r, _direction, vp, kl, recommendation)
-        lines.append(f"⏳ <b>观望 — {_esc(conclusion)}</b>")
+        lines.append("═══════════════════════════════")
+        lines.append(f"⏳ <b>观望</b> — {_esc(conclusion)}")
+        # 60min forced classification hint for UNCLEAR
+        if r.regime == USRegimeType.UNCLEAR:
+            lines.append("  → 60min 后强制归类")
         # Add trigger conditions from plans
         bullish_trigger = ""
         bearish_trigger = ""
@@ -2132,8 +2249,9 @@ def format_us_playbook_message(
             if bearish_trigger:
                 trigger_parts.append(f"偏空触发: {_esc(bearish_trigger[:40])}")
             lines.append(f"  {' | '.join(trigger_parts)}")
+        lines.append("═══════════════════════════════")
 
-    lines.append(f"▸ 当前状态: {_esc(_price_position(r.price, vp, vwap, kl))}")
+    lines.append(f"▸ 模式识别: {_esc(_price_position(r.price, vp, vwap, kl))}")
 
     # Confidence
     if _dir_conf.score > 0:
@@ -2172,6 +2290,15 @@ def format_us_playbook_message(
         for plan_line in _format_action_plan_v2(plan, current_price=r.price):
             lines.append(plan_line)
         lines.append("")
+
+    # Fix 6: Append "失效与切换" when Plan C was replaced by near-entry alternative
+    has_near_entry_c = any(p.label == "C" and p.is_near_entry for p in plans)
+    if has_near_entry_c:
+        inv_text = _invalidation_text(r.regime, _direction, vp)
+        if inv_text:
+            lines.append("── 失效与切换 ──────────────────")
+            lines.append(f"🚫 {_esc(inv_text)}")
+            lines.append("")
 
     lines.append(SECTION_SEP)
 

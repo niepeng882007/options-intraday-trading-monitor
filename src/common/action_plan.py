@@ -314,6 +314,8 @@ def format_action_plan_v2(plan: ActionPlan, current_price: float = 0.0) -> list[
         lines.append(rr_line)
     if plan.reachability_tag:
         lines.append(f"  📍 {plan.reachability_tag}")
+    if plan.is_near_entry:
+        lines.append("  ▸ 仓位: 主方案的 30-50%")
     if plan.option_line:
         lines.append(plan.option_line)
     if plan.demoted and plan.demote_reason:

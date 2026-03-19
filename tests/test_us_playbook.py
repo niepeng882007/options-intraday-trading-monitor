@@ -425,7 +425,7 @@ class TestPlaybookFormat:
         result = self._make_result()
         msg = format_us_playbook_message(result)
         assert "Apple" in msg
-        assert "当前状态" in msg  # Section 2: conclusion
+        assert "模式识别" in msg  # Section 2: conclusion
         assert "日型" in msg       # Section 2: regime type
         assert "剧本推演" in msg
         assert "盘面逻辑" in msg
@@ -3913,7 +3913,7 @@ class TestUnclearFadePlan:
         plan_b = plans[1]
         assert "轻仓" in plan_b.name
         assert plan_b.direction == "bullish"
-        assert plan_b.stop_loss is None  # original has no explicit SL
+        assert plan_b.stop_loss is not None  # now has structural SL
 
     def test_amd_scenario(self):
         """AMD-like: RVOL=0.57, confidence=0.25, lean=bearish, price=204.85."""
@@ -3951,7 +3951,7 @@ class TestUnclearFadePlan:
         # Should fallback to directional plan, not fade
         assert "轻仓" in plan_b.name
         assert plan_b.direction == "bullish"
-        assert plan_b.stop_loss is None  # directional plan has no explicit SL
+        assert plan_b.stop_loss is not None  # directional plan now has structural SL
 
     def test_vwap_near_vah_fallback_to_directional(self):
         """VWAP≈VAH → fade short unprofitable, fallback to 轻仓做空."""
@@ -3969,7 +3969,7 @@ class TestUnclearFadePlan:
         plan_b = plans[1]
         assert "轻仓" in plan_b.name
         assert plan_b.direction == "bearish"
-        assert plan_b.stop_loss is None
+        assert plan_b.stop_loss is not None  # now has structural SL
 
     def test_sl_capped_when_distant_put_wall(self):
         """SL only candidate is Put Wall at 510 (15% away) → capped to 1%.
@@ -4041,7 +4041,7 @@ class TestUnclearFadePlan:
         # R:R too low for fade → should fallback to directional
         assert "轻仓" in plan_b.name
         assert plan_b.direction == "bullish"
-        assert plan_b.stop_loss is None
+        assert plan_b.stop_loss is not None  # now has structural SL
 
     def test_low_rr_bearish_fade_fallback(self):
         """Bearish fade with R:R < 0.8 → fallback to 轻仓做空.
@@ -4063,7 +4063,7 @@ class TestUnclearFadePlan:
         plan_b = plans[1]
         assert "轻仓" in plan_b.name
         assert plan_b.direction == "bearish"
-        assert plan_b.stop_loss is None
+        assert plan_b.stop_loss is not None  # now has structural SL
 
 
 class TestVwapDeviationWarning:
