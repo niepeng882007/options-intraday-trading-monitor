@@ -55,7 +55,7 @@ class ActionPlan:
     effective_rr: float = 0.0          # 概率加权后的有效 R:R
     stop_atr_multiple: float = 0.0     # 止损占 5min ATR 的倍数
     stop_floor_applied: bool = False    # True = 止损被自动扩大
-    plan_b_role: str = ""  # "hedge" / "addon" / "" — controls Plan B label in template
+    plan_b_role: str = ""  # "hedge" / "addon" / "" — controls Plan B/C label in template
 
 
 @dataclass
@@ -235,7 +235,10 @@ def format_action_plan_v2(plan: ActionPlan, current_price: float = 0.0) -> list[
         else:
             section_label = "备选方案"
     elif plan.label == "C":
-        if plan.is_near_entry:
+        role = getattr(plan, "plan_b_role", "")
+        if role == "hedge":
+            section_label = "对冲方案"
+        elif plan.is_near_entry:
             section_label = "近端备选"
         else:
             section_label = "失效条件"

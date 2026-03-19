@@ -2229,11 +2229,19 @@ def format_us_playbook_message(
         lines.append(f"<b>{' '.join(parts_line)}</b>")
     else:
         conclusion = _core_conclusion_text(r, _direction, vp, kl, recommendation)
+        # Bug 1: strip redundant "观望" prefix — the wait box already adds "⏳ 观望 —"
+        conclusion = conclusion.removeprefix("观望 — ").removeprefix("观望, ")
         lines.append("═══════════════════════════════")
         lines.append(f"⏳ <b>观望</b> — {_esc(conclusion)}")
         # 60min forced classification hint for UNCLEAR
         if r.regime == USRegimeType.UNCLEAR:
             lines.append("  → 60min 后强制归类")
+        # Bug 3: trend downgraded to wait — show hint
+        if (
+            r.regime.family == RegimeFamily.TREND
+            and r.confidence < trend_downgrade_confidence
+        ):
+            lines.append(f"  ⚠️ 趋势置信度仅 {r.confidence:.0%}, 降级为观望")
         # Add trigger conditions from plans
         bullish_trigger = ""
         bearish_trigger = ""
@@ -2280,7 +2288,10 @@ def format_us_playbook_message(
             header = "对冲方案" if role == "hedge" else "备选方案"
             lines.append(f"── {header} ──────────────────────")
         elif plan.label == "C":
-            if plan.is_near_entry:
+            role = getattr(plan, "plan_b_role", "")
+            if role == "hedge":
+                lines.append("── 对冲方案 ────────────────────")
+            elif plan.is_near_entry:
                 lines.append("── 近端备选 ────────────────────")
             else:
                 lines.append("── 失效与切换 ──────────────────")
