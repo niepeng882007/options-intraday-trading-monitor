@@ -26,6 +26,7 @@ from src.common.action_plan import (  # noqa: F401 — re-export for backward co
     ensure_near_entry_exists as _ensure_near_entry_exists_common,
     find_fade_entry_zone as _find_fade_entry_zone_common,
     format_action_plan as _format_action_plan,
+    format_action_plan_v2 as _format_action_plan_v2,
     nearest_levels as _nearest_levels_common,
     reachable_range_pct as _reachable_range_pct,
     validate_target_reachability as _validate_target_reachability,
@@ -1285,6 +1286,7 @@ def _plans_trend_bullish(
             hedge_sl[1] if hedge_sl else None,
             hedge_tp1[1] if hedge_tp1 else None,
         ),
+        plan_b_role="hedge",
     )
 
     plan_c = ActionPlan(
@@ -1353,6 +1355,7 @@ def _plans_trend_bearish(
             hedge_sl[1] if hedge_sl else None,
             hedge_tp1[1] if hedge_tp1 else None,
         ),
+        plan_b_role="hedge",
     )
 
     plan_c = ActionPlan(
@@ -1435,6 +1438,7 @@ def _plans_fade_bearish(
         tp2=hedge_tp2[1] if hedge_tp2 else None,
         tp2_label=hedge_tp2[0] if hedge_tp2 else "",
         rr_ratio=_calculate_rr(hedge_entry, hedge_sl_price, hedge_tp1[1] if hedge_tp1 else None),
+        plan_b_role="addon",
     )
 
     plan_c = ActionPlan(
@@ -1500,6 +1504,7 @@ def _plans_fade_bullish(
         tp2=hedge_tp2[1] if hedge_tp2 else None,
         tp2_label=hedge_tp2[0] if hedge_tp2 else "",
         rr_ratio=_calculate_rr(hedge_entry, hedge_sl_price, hedge_tp1[1] if hedge_tp1 else None),
+        plan_b_role="addon",
     )
 
     plan_c = ActionPlan(
@@ -1591,6 +1596,7 @@ def _build_wide_va_plans_bearish(
         tp2=hedge_tp2[1] if hedge_tp2 else None,
         tp2_label=hedge_tp2[0] if hedge_tp2 else "",
         rr_ratio=_calculate_rr(hedge_entry, il.effective_mid, hedge_tp1[1] if hedge_tp1 else None),
+        plan_b_role="addon",
     )
 
     # Plan C: always 5-day VA for invalidation
@@ -1648,6 +1654,7 @@ def _build_wide_va_plans_bullish(
         tp2=hedge_tp2[1] if hedge_tp2 else None,
         tp2_label=hedge_tp2[0] if hedge_tp2 else "",
         rr_ratio=_calculate_rr(hedge_entry, il.effective_mid, hedge_tp1[1] if hedge_tp1 else None),
+        plan_b_role="addon",
     )
 
     # Plan C: always 5-day VA for invalidation
@@ -1982,6 +1989,8 @@ def format_us_playbook_message(
     spy_result: USPlaybookResult | None = None,
     qqq_result: USPlaybookResult | None = None,
     trend_downgrade_confidence: float = 0.70,
+    version_diff: str = "",
+    checklist_violations: list[str] | None = None,
 ) -> str:
     """Format US Playbook as Telegram HTML message — institutional-grade intraday playbook."""
     r = result.regime
@@ -2058,33 +2067,7 @@ def format_us_playbook_message(
 
     lines.append("")
 
-    # ── Section 2: 核心结论 ──
-    conclusion = _core_conclusion_text(r, _direction, vp, kl, recommendation)
-    lines.append(f"🎯 <b>核心结论: {_esc(conclusion)}</b>")
-    lines.append(f"▸ 当前状态: {_esc(_price_position(r.price, vp, vwap, kl))}")
-
-    strategy_text = get_regime_strategy(r.regime, _direction)
-    first_line = strategy_text.splitlines()[0] if strategy_text else ""
-    lines.append(f"▸ 核心策略: {_esc(first_line)}")
-
-    # Direction confidence
-    _dir_conf = _compute_direction_confidence(
-        r, vp, kl, _direction,
-        market_tone=result.market_tone,
-        relative_strength=getattr(result, "relative_strength", None),
-    )
-    if _dir_conf.score > 0:
-        dir_cn = "做多" if _dir_conf.direction == "bullish" else "做空" if _dir_conf.direction == "bearish" else "中性"
-        aligned_names = [k for k, v in _dir_conf.signals.items() if v == _dir_conf.direction]
-        lines.append(f"▸ 方向置信: {dir_cn} {_dir_conf.score:.0%} ({', '.join(aligned_names)})")
-
-    lines.append("")
-    lines.append(SECTION_SEP)
-
-    # ── Section 3: 剧本推演 ──
-    lines.append("⚔️ <b>剧本推演</b>")
-    lines.append("")
-
+    # ── Pre-compute: plans + direction confidence (needed by Section 2) ──
     _close_et = now.replace(hour=16, minute=0, second=0, microsecond=0)
     _min_left = max(0, int((_close_et - now).total_seconds() / 60))
     _intraday_range = 0.0
@@ -2111,15 +2094,83 @@ def format_us_playbook_message(
         ctx=_plan_ctx, trend_downgrade_confidence=trend_downgrade_confidence,
         intraday_levels=_intraday_levels,
     )
-    for plan in plans:
-        for plan_line in _format_action_plan(plan):
-            lines.append(plan_line)
-        lines.append("")
 
-    # ── Section 3b: 失效与切换 ──
-    invalidation = _invalidation_text(r.regime, _direction, vp)
-    if invalidation:
-        lines.append(f"🔄 <b>失效与切换</b>: {_esc(invalidation)}")
+    _dir_conf = _compute_direction_confidence(
+        r, vp, kl, _direction,
+        market_tone=result.market_tone,
+        relative_strength=getattr(result, "relative_strength", None),
+    )
+
+    # ── Section 2: 核心结论 ──
+    _plan_a = next((p for p in plans if p.label == "A"), None)
+    if _plan_a and _plan_a.entry is not None and not _plan_a.demoted and _plan_a.direction in ("bullish", "bearish"):
+        dir_label = "做多" if _plan_a.direction == "bullish" else "做空"
+        entry_str = f"{_plan_a.entry:,.2f}"
+        parts_line = [f"🎯 {dir_label} {entry_str}"]
+        if _plan_a.tp1 is not None:
+            parts_line.append(f"→ TP {_plan_a.tp1:,.2f}")
+        if _plan_a.stop_loss is not None:
+            parts_line.append(f"| SL {_plan_a.stop_loss:,.2f}")
+        if _plan_a.rr_ratio > 0:
+            parts_line.append(f"| R:R 1:{_plan_a.rr_ratio:.1f}")
+        lines.append(f"<b>{' '.join(parts_line)}</b>")
+    else:
+        conclusion = _core_conclusion_text(r, _direction, vp, kl, recommendation)
+        lines.append(f"⏳ <b>观望 — {_esc(conclusion)}</b>")
+        # Add trigger conditions from plans
+        bullish_trigger = ""
+        bearish_trigger = ""
+        for p in plans:
+            if p.direction == "bullish" and p.trigger and not bullish_trigger:
+                bullish_trigger = p.trigger
+            elif p.direction == "bearish" and p.trigger and not bearish_trigger:
+                bearish_trigger = p.trigger
+        if bullish_trigger or bearish_trigger:
+            trigger_parts = []
+            if bullish_trigger:
+                trigger_parts.append(f"偏多触发: {_esc(bullish_trigger[:40])}")
+            if bearish_trigger:
+                trigger_parts.append(f"偏空触发: {_esc(bearish_trigger[:40])}")
+            lines.append(f"  {' | '.join(trigger_parts)}")
+
+    lines.append(f"▸ 当前状态: {_esc(_price_position(r.price, vp, vwap, kl))}")
+
+    # Confidence
+    if _dir_conf.score > 0:
+        dir_cn = "做多" if _dir_conf.direction == "bullish" else "做空" if _dir_conf.direction == "bearish" else "中性"
+        opp_score = 1.0 - _dir_conf.score
+        lines.append(f"▸ 置信度: {dir_cn} {_dir_conf.score:.0%} / {'做空' if dir_cn == '做多' else '做多'} {opp_score:.0%}")
+        aligned_names = [k for k, v in _dir_conf.signals.items() if v == _dir_conf.direction]
+        lines.append(f"  ({', '.join(aligned_names)})")
+
+    lines.append(f"▸ 日型: {emoji} {regime_cn}")
+
+    if version_diff:
+        lines.append(f"▸ vs 上一版: {_esc(version_diff)}")
+
+    lines.append("")
+    lines.append(SECTION_SEP)
+
+    # ── Section 3: 剧本推演 ──
+    lines.append("⚔️ <b>剧本推演</b>")
+    lines.append("")
+
+    for plan in plans:
+        # Section header for each plan
+        if plan.label == "B":
+            role = getattr(plan, "plan_b_role", "")
+            header = "对冲方案" if role == "hedge" else "备选方案"
+            lines.append(f"── {header} ──────────────────────")
+        elif plan.label == "C":
+            if plan.is_near_entry:
+                lines.append("── 近端备选 ────────────────────")
+            else:
+                lines.append("── 失效与切换 ──────────────────")
+        elif plan.label == "A":
+            lines.append("── 主方案 ──────────────────────")
+
+        for plan_line in _format_action_plan_v2(plan, current_price=r.price):
+            lines.append(plan_line)
         lines.append("")
 
     lines.append(SECTION_SEP)
@@ -2281,6 +2332,13 @@ def format_us_playbook_message(
     # DTE gamma warning
     if recommendation and recommendation.dte > 0 and recommendation.dte <= 3 and recommendation.action != "wait":
         lines.append(f"⚠️ 仅剩 {recommendation.dte} DTE, Gamma 风险极高")
+
+    # Checklist violations
+    if checklist_violations:
+        lines.append("")
+        lines.append("⚠️ <b>Checklist</b>")
+        for v in checklist_violations:
+            lines.append(f"  • {_esc(v)}")
 
     lines.append(sep)
     return "\n".join(lines)

@@ -706,9 +706,9 @@ class TestPlaybook:
         )
         pb = generate_playbook(regime, vp, vwap=502, option_rec=rec)
         msg = format_playbook_message(pb, symbol="Tencent (HK.00700)")
-        # 5-section checks: header, 核心结论, 剧本推演, 盘面逻辑, 数据雷达
+        # 5-section checks: header, 核心结论/观望, 剧本推演, 盘面逻辑, 数据雷达
         assert "震荡日" in msg
-        assert "核心结论" in msg
+        assert "观望" in msg or "核心结论" in msg  # v2: 观望 replaces 核心结论 for wait scenarios
         assert "剧本推演" in msg
         assert "盘面逻辑" in msg
         assert "数据雷达" in msg
@@ -2057,6 +2057,7 @@ class TestFrequencyControl:
                 )
             ]}
             p._scan_history_date = "2026-03-09"  # yesterday
+            p._playbook_snapshots = {}
 
             p._reset_scan_history_if_new_day()
             assert len(p._scan_history) == 0

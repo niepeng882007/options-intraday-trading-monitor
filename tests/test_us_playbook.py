@@ -425,7 +425,8 @@ class TestPlaybookFormat:
         result = self._make_result()
         msg = format_us_playbook_message(result)
         assert "Apple" in msg
-        assert "核心结论" in msg
+        assert "当前状态" in msg  # Section 2: conclusion
+        assert "日型" in msg       # Section 2: regime type
         assert "剧本推演" in msg
         assert "盘面逻辑" in msg
         assert "数据雷达" in msg
@@ -1770,7 +1771,7 @@ class TestDirectionEmoji:
         )
         msg = format_us_playbook_message(result)
         assert "\U0001f4c9" in msg  # 📉
-        assert "向下跟随" in msg
+        assert "强趋势日" in msg  # regime type in Section 2
 
 
 class TestPdhPdlWarning:
@@ -7488,9 +7489,9 @@ class TestPlanBHedgeStructure:
 
 
 class TestInvalidationSection:
-    """Test that the formatted playbook includes '失效与切换' section."""
+    """Test that the formatted playbook includes Plan C section (失效与切换 or 近端备选)."""
 
-    def test_trend_includes_invalidation(self):
+    def test_trend_includes_plan_c_section(self):
         regime = USRegimeResult(
             regime=USRegimeType.TREND_STRONG, confidence=0.8,
             rvol=1.5, price=260.0, gap_pct=0.5,
@@ -7505,9 +7506,10 @@ class TestInvalidationSection:
             quote=QuoteSnapshot(symbol="AAPL", last_price=260.0, high_price=261.0, low_price=258.0),
         )
         msg = format_us_playbook_message(result)
-        assert "失效与切换" in msg
+        # v2: Plan C shows as either "失效与切换" or "近端备选" section header
+        assert "失效与切换" in msg or "近端备选" in msg
 
-    def test_unclear_includes_invalidation(self):
+    def test_unclear_includes_plan_c_section(self):
         regime = USRegimeResult(
             regime=USRegimeType.UNCLEAR, confidence=0.3,
             rvol=0.8, price=255.0, gap_pct=0.1,
@@ -7522,7 +7524,8 @@ class TestInvalidationSection:
             quote=QuoteSnapshot(symbol="SPY", last_price=255.0, high_price=256.0, low_price=254.0),
         )
         msg = format_us_playbook_message(result)
-        assert "失效与切换" in msg
+        # v2: Plan C shows as either "失效与切换" or "近端备选" section header
+        assert "失效与切换" in msg or "近端备选" in msg
 
 
 class TestEndToEndActionPlans:

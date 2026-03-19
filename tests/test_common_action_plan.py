@@ -914,3 +914,79 @@ class TestWarningAppend:
         result = apply_vwap_deviation_warning([plan], price=102.0, vwap=100.0)
         if result[0].warning:
             assert "existing warning" in result[0].warning
+
+
+class TestFormatActionPlanV2:
+    """Tests for format_action_plan_v2."""
+
+    def test_direction_line(self):
+        from src.common.action_plan import format_action_plan_v2
+        plan = ActionPlan(
+            label="A", name="趋势回调做多", emoji="📈", is_primary=True,
+            logic="回调做多", direction="bullish", trigger="VWAP 企稳",
+            entry=394.50, entry_action="做多",
+            stop_loss=392.0, stop_loss_reason="下方支撑",
+            tp1=397.0, tp1_label="VAH", tp2=400.0, tp2_label="Gamma",
+            rr_ratio=2.0,
+        )
+        lines = format_action_plan_v2(plan)
+        text = "\n".join(lines)
+        assert "方向: 做多" in text
+
+    def test_entry_distance(self):
+        from src.common.action_plan import format_action_plan_v2
+        plan = ActionPlan(
+            label="A", name="test", emoji="📈", is_primary=True,
+            logic="test", direction="bullish", trigger="test",
+            entry=100.0, entry_action="做多",
+            stop_loss=95.0, stop_loss_reason="test",
+            tp1=105.0, tp1_label="TP", tp2=None, tp2_label="",
+            rr_ratio=2.0,
+        )
+        lines = format_action_plan_v2(plan, current_price=99.0)
+        text = "\n".join(lines)
+        assert "距当前价" in text
+
+    def test_tp1_distance(self):
+        from src.common.action_plan import format_action_plan_v2
+        plan = ActionPlan(
+            label="A", name="test", emoji="📈", is_primary=True,
+            logic="test", direction="bullish", trigger="test",
+            entry=100.0, entry_action="做多",
+            stop_loss=95.0, stop_loss_reason="test",
+            tp1=105.0, tp1_label="TP", tp2=None, tp2_label="",
+            rr_ratio=2.0,
+        )
+        lines = format_action_plan_v2(plan)
+        text = "\n".join(lines)
+        assert "距入场" in text
+
+    def test_plan_b_hedge_label(self):
+        from src.common.action_plan import format_action_plan_v2
+        plan = ActionPlan(
+            label="B", name="反向对冲", emoji="📉", is_primary=False,
+            logic="对冲", direction="bearish", trigger="test",
+            entry=105.0, entry_action="做空",
+            stop_loss=107.0, stop_loss_reason="test",
+            tp1=100.0, tp1_label="TP", tp2=None, tp2_label="",
+            rr_ratio=2.5,
+            plan_b_role="hedge",
+        )
+        lines = format_action_plan_v2(plan)
+        text = "\n".join(lines)
+        assert "对冲方案" in text
+
+    def test_plan_b_addon_label(self):
+        from src.common.action_plan import format_action_plan_v2
+        plan = ActionPlan(
+            label="B", name="突破加仓", emoji="📈", is_primary=False,
+            logic="加仓", direction="bullish", trigger="test",
+            entry=105.0, entry_action="做多",
+            stop_loss=100.0, stop_loss_reason="test",
+            tp1=110.0, tp1_label="TP", tp2=None, tp2_label="",
+            rr_ratio=2.0,
+            plan_b_role="addon",
+        )
+        lines = format_action_plan_v2(plan)
+        text = "\n".join(lines)
+        assert "备选方案" in text

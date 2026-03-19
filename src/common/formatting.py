@@ -129,3 +129,44 @@ def risk_status_text(filters: FilterResult) -> str:
     if filters.risk_level == "elevated":
         return "🟡 风险偏高 - 必须控制节奏"
     return "🟢 正常交易日"
+
+
+TELEGRAM_MAX_LENGTH = 4096
+
+
+def split_telegram_message(html: str, max_length: int = TELEGRAM_MAX_LENGTH) -> list[str]:
+    """Split long Telegram HTML message at section separators.
+
+    Strategy:
+    1. Try splitting at ━━━ or ── separators
+    2. If a single section exceeds max_length, split at newlines
+    3. Each part gets (1/N) suffix when split
+    """
+    if len(html) <= max_length:
+        return [html]
+
+    # Split at major section separators first
+    # Try ━ lines (major sections), then ── (minor sections)
+    parts: list[str] = []
+    current = ""
+
+    for line in html.split("\n"):
+        test = current + "\n" + line if current else line
+        if len(test) > max_length - 20:  # Reserve space for suffix
+            if current:
+                parts.append(current)
+            current = line
+        else:
+            current = test
+    if current:
+        parts.append(current)
+
+    if len(parts) <= 1:
+        return [html[:max_length]]
+
+    # Add part numbers
+    total = len(parts)
+    if total > 1:
+        parts = [f"{p}\n({i+1}/{total})" for i, p in enumerate(parts)]
+
+    return parts

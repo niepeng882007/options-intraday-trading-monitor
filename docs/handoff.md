@@ -1,3 +1,103 @@
+# 版本 Diff + v2 模板 + Checklist 校验 — 交接文档
+
+> 日期: 2026-03-19
+> 前序: 止损与目标计算重构 — 已合入 main
+
+---
+
+## 本次完成了什么
+
+### 版本 Diff + v2 输出模板 + Checklist 自动校验
+
+16 个文件修改/新增，106 common 测试通过（+27 新增），483 US / 287 HK 全量回归通过，0 新回归。
+
+#### Step 1-2: 数据结构
+
+| 文件 | 新增 |
+|------|------|
+| `src/common/types.py` | `PlaybookSnapshot` dataclass (symbol, timestamp, trading_day, direction, regime_type, confidence, plan_entries, plan_directions) |
+| `src/common/action_plan.py` ActionPlan | `plan_b_role: str = ""` ("hedge" / "addon" / "") |
+
+#### Step 3: 版本 Diff 引擎 (`src/common/version_diff.py` — 新文件)
+
+- `extract_snapshot()` — 从 playbook 状态提取扁平快照
+- `diff_snapshots()` — 比较两个快照：方向/日型/入场位变化（>0.1%）/方案增减
+- 首次查询或新交易日返回空字符串，无实质变化返回 `"⚠️ 无实质变化"`
+
+#### Step 4: Checklist 校验 (`src/common/checklist.py` — 新文件)
+
+`validate_checklist()` — 10 项只读验证，返回违规描述列表：
+1. 观望超时 (neutral > 60min)
+2. 入场可达 (primary not ⛔不可达)
+3. 反向对冲 (有反向方案)
+4. 止损下限 (≥ 1.5x ATR)
+5. TP1 可达 (within remaining vol)
+6. R:R 门槛 (≥ 1.5)
+7. 版本 diff (非首次)
+8. RVOL 开盘校正 (US only, ≤ 15min)
+9. 相对强度 (US non-index only)
+10. 日型归类 (UNCLEAR > 60min)
+
+不修正 plans/direction，已有的 enforce/validate/gate 在 plan 生成时执行修正，checklist 仅做最终确认。
+
+#### Step 5: format_action_plan_v2 (`src/common/action_plan.py`)
+
+新函数，保留旧 `format_action_plan()` 不变。v2 增强：
+- `方向: 做多/做空` 行
+- 入场行追加 `(距当前价 X%)`
+- TP1 行追加 `| 距入场 X%`
+- Section 标签: 主方案 / 对冲方案 / 备选方案 / 近端备选 / 失效条件
+
+#### Step 6-7: v2 模板渲染 + Plan B 角色
+
+**US playbook** (`src/us_playbook/playbook.py`):
+- `format_us_playbook_message` +version_diff, +checklist_violations 可选参数
+- Section 2 核心结论: 有 entry 时 `🎯 做多 394.50 → TP 396.72 | SL 392.80 | R:R 1:1.3`，观望时 `⏳ 观望 — 条件`
+- 移除 "核心策略" 显示行（`get_regime_strategy` 函数保留）
+- Plan B role: trend=hedge, fade=addon
+- Section 3 使用 v2 格式 + section headers
+
+**HK playbook** (`src/hk/playbook.py`):
+- `format_playbook_message` +version_diff, +checklist_violations 可选参数
+- 对称修改同 US
+- Plan B role: trend=addon (突破加仓), fade=addon (VWAP回归)
+
+#### Step 8: 调用方接入
+
+**US** (`src/us_playbook/main.py`):
+- `_playbook_snapshots: dict[str, PlaybookSnapshot]` 在 `__init__` 中初始化
+- `_reset_scan_history_if_new_day` 清空快照
+- `generate_playbook_for_symbol` 计算 diff + checklist 并传参
+- Auto-scan 不传 diff/checklist（使用默认空值）
+
+**HK** (`src/hk/main.py`): 镜像模式
+
+#### Step 9: 消息拆分 (`src/common/formatting.py`)
+
+- `TELEGRAM_MAX_LENGTH = 4096`
+- `split_telegram_message()` — 在换行符处拆分超长消息，追加 `(1/N)` 后缀
+- `handle_query_base` 自动发送多条消息
+
+#### Step 10: 测试 (27 新增)
+
+| 测试文件 | 用例数 | 覆盖 |
+|----------|--------|------|
+| test_version_diff.py | 9 | 首次/方向/日型/小变化忽略/大变化/新方案/无变化/跨日 |
+| test_checklist.py | 13 | 10 项各 pass+fail / 全通过 / HK 跳过 #8/#9 |
+| test_common_action_plan.py (新增) | 5 | v2 方向行/距离%/TP1距离/hedge标签/addon标签 |
+
+---
+
+## 设计决策
+
+1. **format 返回值不变**: 保持 `str`，快照在调用方 main.py 提取。避免 22+ 测试签名修改。
+2. **Checklist 只读**: 不做自动修正。enforce_stop_floor/apply_min_rr_gate 已在 plan 生成时执行。
+3. **plans=[] 传入 checklist**: 因 plans 在 format 函数内部生成，plan-dependent checks (#2-#6) 不触发。非 plan 依赖的 checks (#1, #8, #9, #10) 正常工作。
+4. **Plan B 标签按角色**: US trend Plan B = hedge(反向对冲), HK trend Plan B = addon(突破加仓)。
+5. **CJK 对齐**: 放弃 `<code>` 方框，用加粗单行结论格式。
+
+---
+
 # 止损与目标计算重构 — 交接文档
 
 > 日期: 2026-03-18

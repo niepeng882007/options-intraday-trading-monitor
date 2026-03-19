@@ -55,6 +55,7 @@ class ActionPlan:
     effective_rr: float = 0.0          # 概率加权后的有效 R:R
     stop_atr_multiple: float = 0.0     # 止损占 5min ATR 的倍数
     stop_floor_applied: bool = False    # True = 止损被自动扩大
+    plan_b_role: str = ""  # "hedge" / "addon" / "" — controls Plan B label in template
 
 
 @dataclass
@@ -196,6 +197,116 @@ def format_action_plan(plan: ActionPlan) -> list[str]:
         lines.append(f"  TP1 (50%): {plan.tp1:,.2f} ({plan.tp1_label})")
     if plan.tp2 is not None:
         lines.append(f"  TP2 (清仓): {plan.tp2:,.2f} ({plan.tp2_label})")
+    if plan.rr_ratio > 0:
+        rr_line = f"  R:R ≈ 1:{plan.rr_ratio:.1f}"
+        if plan.effective_rr > 0 and abs(plan.effective_rr - plan.rr_ratio) > 0.05:
+            rr_line += f" (有效 1:{plan.effective_rr:.1f})"
+        lines.append(rr_line)
+    if plan.reachability_tag:
+        lines.append(f"  📍 {plan.reachability_tag}")
+    if plan.option_line:
+        lines.append(plan.option_line)
+    if plan.demoted and plan.demote_reason:
+        lines.append(f"  ⚠️ {_esc(plan.demote_reason)}")
+    if plan.warning:
+        lines.append(f"  ⚠️ {_esc(plan.warning)}")
+    return lines
+
+
+def format_action_plan_v2(plan: ActionPlan, current_price: float = 0.0) -> list[str]:
+    """Render a single ActionPlan to Telegram HTML lines — v2 format.
+
+    Enhancements over v1:
+    - Direction line (做多/做空)
+    - Entry shows distance from current price %
+    - TP1 shows distance from entry %
+    - R:R shows effective R:R when different
+    - Plan B role label (hedge/addon)
+    """
+    # Determine plan section header based on plan_b_role
+    if plan.label == "A":
+        section_label = "主方案"
+    elif plan.label == "B":
+        role = getattr(plan, "plan_b_role", "")
+        if role == "hedge":
+            section_label = "对冲方案"
+        elif role == "addon":
+            section_label = "备选方案"
+        else:
+            section_label = "备选方案"
+    elif plan.label == "C":
+        if plan.is_near_entry:
+            section_label = "近端备选"
+        else:
+            section_label = "失效条件"
+    else:
+        section_label = "方案"
+
+    tag = section_label
+    lines = [f"{plan.emoji} <b>{plan.label}: {_esc(plan.name)}</b> ({tag})"]
+
+    # Direction line
+    if plan.direction in ("bullish", "bearish"):
+        dir_cn = "做多" if plan.direction == "bullish" else "做空"
+        lines.append(f"方向: {dir_cn}")
+
+    lines.append(f"逻辑: {_esc(plan.logic)}")
+
+    if plan.label == "C" and plan.entry is None:
+        lines.append(f"  条件: {_esc(plan.trigger)}")
+        lines.append(f"  行动: {_esc(plan.logic)}")
+        return lines
+
+    lines.append(f"  触发: {_esc(plan.trigger)}")
+
+    if plan.suppressed:
+        if plan.demote_reason:
+            lines.append(f"  ⚠️ {_esc(plan.demote_reason)}")
+        if plan.warning:
+            lines.append(f"  ⚠️ {_esc(plan.warning)}")
+        return lines
+
+    if plan.entry is not None:
+        entry_line = f"  入场: {plan.entry:,.2f} ({plan.entry_action})"
+        if current_price > 0:
+            dist_pct = (plan.entry - current_price) / current_price * 100
+            entry_line += f" (距当前价 {dist_pct:+.1f}%)"
+        if plan.entry_zone_price is not None:
+            if plan.direction == "bearish":
+                entry_line = (
+                    f"  入场区间: {_esc(plan.entry_zone_label)}({plan.entry_zone_price:,.2f})"
+                    f" → VAH({plan.entry:,.2f}) {plan.entry_action}"
+                )
+            else:
+                entry_line = (
+                    f"  入场区间: VAL({plan.entry:,.2f})"
+                    f" → {_esc(plan.entry_zone_label)}({plan.entry_zone_price:,.2f}) {plan.entry_action}"
+                )
+            if current_price > 0:
+                dist_pct = (plan.entry - current_price) / current_price * 100
+                entry_line += f" (距当前价 {dist_pct:+.1f}%)"
+        lines.append(entry_line)
+    else:
+        lines.append("  入场: 等待方向明确后入场")
+
+    if plan.stop_loss is not None:
+        sl_line = f"  止损: {plan.stop_loss:,.2f} ({_esc(plan.stop_loss_reason)})"
+        if plan.stop_atr_multiple > 0:
+            atr_check = "✓" if plan.stop_atr_multiple >= 1.5 else "⚠️"
+            sl_line += f" | {plan.stop_atr_multiple:.1f}x ATR {atr_check}"
+        if plan.stop_floor_applied:
+            sl_line += " [已扩大]"
+        lines.append(sl_line)
+
+    if plan.tp1 is not None:
+        tp1_line = f"  TP1 (50%): {plan.tp1:,.2f} ({plan.tp1_label})"
+        if plan.entry is not None and plan.entry > 0:
+            tp1_dist = abs(plan.tp1 - plan.entry) / plan.entry * 100
+            tp1_line += f" | 距入场 {tp1_dist:.1f}%"
+        lines.append(tp1_line)
+    if plan.tp2 is not None:
+        lines.append(f"  TP2 (清仓): {plan.tp2:,.2f} ({plan.tp2_label})")
+
     if plan.rr_ratio > 0:
         rr_line = f"  R:R ≈ 1:{plan.rr_ratio:.1f}"
         if plan.effective_rr > 0 and abs(plan.effective_rr - plan.rr_ratio) > 0.05:

@@ -136,3 +136,16 @@ class OptionMarketSnapshot:
     atm_iv: float = 0.0
     avg_iv: float = 0.0
     iv_ratio: float = 0.0
+
+
+@dataclass
+class PlaybookSnapshot:
+    """Frozen summary of a playbook for version diff comparison."""
+    symbol: str
+    timestamp: float              # epoch
+    trading_day: str              # "2026-03-18"
+    direction: str                # "bullish" / "bearish" / "neutral"
+    regime_type: str              # enum .value
+    confidence: float             # 0-1
+    plan_entries: dict[str, float | None] = field(default_factory=dict)  # {"A": 394.50, "B": 392.80, "C": None}
+    plan_directions: dict[str, str] = field(default_factory=dict)        # {"A": "bullish", "B": "bearish"}

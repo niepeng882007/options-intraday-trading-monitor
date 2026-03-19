@@ -101,9 +101,12 @@ async def handle_query_base(
                 ))
             except Exception:
                 logger.warning("Failed to send chart for %s", symbol)
-        await _retry_send(lambda: update.message.reply_text(
-            result.html, parse_mode="HTML", read_timeout=30, write_timeout=30,
-        ))
+        from src.common.formatting import split_telegram_message
+        parts = split_telegram_message(result.html)
+        for part in parts:
+            await _retry_send(lambda p=part: update.message.reply_text(
+                p, parse_mode="HTML", read_timeout=30, write_timeout=30,
+            ))
         _log_to_archive(source, "playbook_query", result.html, market)
     except Exception as e:
         logger.exception("Playbook generation failed for %s", symbol)

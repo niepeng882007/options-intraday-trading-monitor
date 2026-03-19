@@ -17,8 +17,11 @@ from datetime import date, datetime, timedelta, timezone
 import pandas as pd
 import yaml
 
+from src.common.action_plan import PlanContext
 from src.common.chart import ChartData, generate_chart_async
-from src.common.types import PlaybookResponse
+from src.common.checklist import validate_checklist
+from src.common.types import PlaybookResponse, PlaybookSnapshot
+from src.common.version_diff import extract_snapshot, diff_snapshots
 from src.hk import (
     FilterResult, GammaWallResult, HKKeyLevels, OptionMarketSnapshot, OptionRecommendation,
     Playbook, QuoteSnapshot,
@@ -161,6 +164,9 @@ class HKPredictor:
 
         # Market context cache: symbol → (RegimeResult, timestamp)
         self._market_context_cache: dict[str, tuple[RegimeResult, float]] = {}
+
+        # Version diff: playbook snapshots per symbol (reset daily)
+        self._playbook_snapshots: dict[str, PlaybookSnapshot] = {}
 
     # ── Lifecycle ──
 
@@ -556,11 +562,60 @@ class HKPredictor:
         hstech_regime = await self._get_market_context_regime(ctx_cfg.get("hstech_symbol", "HK.800700"))
 
         playbook_cfg = self._cfg.get("playbook", {})
+
+        # --- Version diff ---
+        now_hkt = datetime.now(HKT)
+        trading_day = now_hkt.strftime("%Y-%m-%d")
+        _direction = regime.direction or "neutral"
+        if _direction == "neutral":
+            if regime.price > vp.vah:
+                _direction = "bullish"
+            elif regime.price < vp.val:
+                _direction = "bearish"
+            elif vp.poc > 0:
+                _direction = "bullish" if regime.price > vp.poc else "bearish"
+
+        prev_snap = self._playbook_snapshots.get(symbol)
+        curr_snap = extract_snapshot(
+            symbol=symbol,
+            trading_day=trading_day,
+            direction=_direction,
+            regime_type=regime.regime.value,
+            confidence=regime.confidence,
+            plans=[],
+        )
+        diff_text = diff_snapshots(prev_snap, curr_snap)
+
+        # --- Checklist ---
+        _min_left = minutes_to_close_hk(now_hkt)
+        _total_session = 330
+        _min_since_open = max(0, _total_session - _min_left)
+        violations = validate_checklist(
+            plans=[],
+            ctx=PlanContext(
+                minutes_to_close=_min_left,
+                total_session_minutes=_total_session,
+                rvol=regime.rvol,
+                avg_daily_range_pct=playbook.avg_daily_range_pct,
+                atr_5min=playbook.atr_5min,
+            ),
+            direction=_direction,
+            regime_type=regime.regime.value,
+            minutes_since_open=_min_since_open,
+            has_version_diff=bool(diff_text),
+            has_relative_strength=False,
+            is_index=symbol.startswith("HK.8"),
+            market="hk",
+        )
+
         html_text = format_playbook_message(
             playbook, symbol=display,
             hsi_regime=hsi_regime, hstech_regime=hstech_regime,
             fade_mid_zone_pct=playbook_cfg.get("fade_mid_zone_pct", 0.35),
+            version_diff=diff_text,
+            checklist_violations=violations if violations else None,
         )
+        self._playbook_snapshots[symbol] = curr_snap
 
         # Generate chart (best-effort — failure degrades to text-only)
         chart_bytes: bytes | None = None
@@ -909,6 +964,7 @@ class HKPredictor:
         today = datetime.now(HKT).strftime("%Y-%m-%d")
         if self._scan_history_date != today:
             self._scan_history.clear()
+            self._playbook_snapshots.clear()
             self._scan_history_date = today
 
     def _check_frequency(
