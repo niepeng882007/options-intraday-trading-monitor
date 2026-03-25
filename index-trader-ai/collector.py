@@ -191,43 +191,71 @@ class DataCollector:
         return self._subscribed_count
 
     async def _load_daily_caches(self) -> None:
-        """加载每日缓存：VP、PDH/PDL、Weekly HL、Gamma Wall、Mag7 均量。"""
-        # 指数的 VP + PDH/PDL + Weekly HL + Gamma Wall
+        """加载每日缓存：PDH/PDL（日线）、VP（分钟线）、Weekly HL、Gamma Wall、Mag7 均量。"""
         for futu_sym in self._index_symbols:
             short = _short_symbol(futu_sym)
+
+            # ── PDH/PDL/PDC + Weekly HL：从日线提取（可靠） ──
             try:
-                bars = await self._get_history_bars(futu_sym, days=self._vp_lookback * 2 + 2)
-                if bars is not None and not bars.empty:
-                    pdh, pdl, pdc = _extract_prev_day_levels(bars)
-                    poc, vah, val = _calculate_volume_profile(
-                        bars, self._vp_value_area,
-                    )
+                daily_bars = await self._get_history_bars(
+                    futu_sym, days=self._weekly_lookback + 5, interval="1d",
+                )
+                if daily_bars is not None and not daily_bars.empty:
+                    # PDH/PDL/PDC = 倒数第二根日线（昨天）
+                    if len(daily_bars) >= 2:
+                        prev_day = daily_bars.iloc[-2]
+                        pdh = float(prev_day["High"])
+                        pdl = float(prev_day["Low"])
+                        pdc = float(prev_day["Close"])
+                    else:
+                        pdh, pdl, pdc = 0.0, 0.0, 0.0
+
+                    # Weekly HL = 最近 N 根日线
+                    recent = daily_bars.tail(self._weekly_lookback)
+                    wk_high = float(recent["High"].max())
+                    wk_low = float(recent["Low"].min())
+                    self._weekly_hl[short] = (wk_high, wk_low)
+
                     self._daily_levels[short] = {
                         "pdh": pdh, "pdl": pdl, "pdc": pdc,
-                        "poc": poc, "vah": vah, "val": val,
                     }
                     logger.info(
-                        "%s levels: PDH=%.2f PDL=%.2f POC=%.2f VAH=%.2f VAL=%.2f",
-                        short, pdh, pdl, poc, vah, val,
+                        "%s daily levels: PDH=%.2f PDL=%.2f PDC=%.2f WkH=%.2f WkL=%.2f",
+                        short, pdh, pdl, pdc, wk_high, wk_low,
                     )
             except Exception:
                 logger.warning("Failed to load daily bars for %s", short, exc_info=True)
 
-            # Weekly HL
+            # ── VP（POC/VAH/VAL）：从分钟线计算 ──
             try:
-                wk_bars = await self._get_history_bars(futu_sym, days=self._weekly_lookback + 5, interval="1d")
-                if wk_bars is not None and not wk_bars.empty:
-                    recent = wk_bars.tail(self._weekly_lookback)
-                    self._weekly_hl[short] = (
-                        float(recent["High"].max()),
-                        float(recent["Low"].min()),
+                min_bars = await self._get_history_bars(
+                    futu_sym, days=self._vp_lookback * 2 + 2, interval="1m",
+                )
+                if min_bars is not None and not min_bars.empty:
+                    poc, vah, val = _calculate_volume_profile(
+                        min_bars, self._vp_value_area,
                     )
+                    cached = self._daily_levels.get(short, {})
+                    cached["poc"] = poc
+                    cached["vah"] = vah
+                    cached["val"] = val
+                    self._daily_levels[short] = cached
+                    logger.info(
+                        "%s VP levels: POC=%.2f VAH=%.2f VAL=%.2f",
+                        short, poc, vah, val,
+                    )
+                else:
+                    logger.warning("%s: 1-min bars empty, VP unavailable", short)
             except Exception:
-                logger.debug("Weekly HL load failed for %s", short)
+                logger.warning("Failed to load VP for %s", short, exc_info=True)
 
-            # Gamma wall
+            # ── Gamma Wall ──
             try:
-                cw, pw = await self._get_gamma_wall(futu_sym)
+                # 用实时快照价格作为回退基准（而非 VP POC）
+                snap = await self._get_snapshots([futu_sym])
+                snap_data = snap.get(futu_sym, {})
+                current_price = snap_data.get("last_price", 0) or snap_data.get("pre_price", 0)
+                cw, pw = await self._get_gamma_wall(futu_sym, current_price)
                 self._gamma_walls[short] = (cw, pw)
             except Exception:
                 logger.debug("Gamma wall load failed for %s", short)
@@ -415,8 +443,8 @@ class DataCollector:
                 }
 
             return await asyncio.to_thread(_fetch)
-        except Exception:
-            logger.debug("yfinance %s fetch failed", ticker_symbol, exc_info=True)
+        except Exception as e:
+            logger.warning("yfinance %s fetch failed: %s", ticker_symbol, e)
             return None
 
     async def _fetch_vix_ma(self) -> float | None:
@@ -736,18 +764,19 @@ class DataCollector:
 
         return _normalize_kline(raw)
 
-    async def _get_gamma_wall(self, futu_symbol: str) -> tuple[float | None, float | None]:
+    async def _get_gamma_wall(
+        self, futu_symbol: str, current_price: float = 0.0,
+    ) -> tuple[float | None, float | None]:
         """获取 gamma wall（OI），失败回退整数关口。"""
         if not self._gamma_enabled:
-            short = _short_symbol(futu_symbol)
-            cached = self._daily_levels.get(short, {})
-            price = cached.get("poc", 0)
-            if price > 0:
-                return _integer_round_levels(price)
+            if current_price > 0:
+                return _integer_round_levels(current_price)
             return None, None
 
         ctx = self._quote_ctx
         if ctx is None:
+            if current_price > 0:
+                return _integer_round_levels(current_price)
             return None, None
 
         try:
@@ -765,12 +794,9 @@ class DataCollector:
         except Exception:
             logger.debug("Gamma wall fetch failed for %s", futu_symbol)
 
-        # 回退整数关口
-        short = _short_symbol(futu_symbol)
-        cached = self._daily_levels.get(short, {})
-        price = cached.get("poc", 0)
-        if price > 0:
-            return _integer_round_levels(price)
+        # 回退：用实时价格计算整数关口
+        if current_price > 0:
+            return _integer_round_levels(current_price)
         return None, None
 
     # ── 工具方法 ──
