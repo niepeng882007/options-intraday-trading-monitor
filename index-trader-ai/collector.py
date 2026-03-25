@@ -51,9 +51,14 @@ class DataCollector:
         self._index_symbols: list[str] = sym_cfg.get("indexes", [])
         self._mag7_symbols: list[str] = sym_cfg.get("mag7", [])
         macro_cfg = sym_cfg.get("macro", {})
-        self._vix_ticker: str = macro_cfg.get("vix", "^VIX")
-        self._tnx_ticker: str = macro_cfg.get("tnx", "^TNX")
-        self._uup_ticker: str = macro_cfg.get("uup", "UUP")
+        # Futu 代码（优先）
+        self._futu_vix: str = macro_cfg.get("futu_vix", "US.VIX")
+        self._futu_tnx: str = macro_cfg.get("futu_tnx", "US.TNX")
+        self._futu_uup: str = macro_cfg.get("futu_uup", "US.UUP")
+        # yfinance ticker（回退）
+        self._yf_vix: str = macro_cfg.get("yf_vix", "^VIX")
+        self._yf_tnx: str = macro_cfg.get("yf_tnx", "^TNX")
+        self._yf_uup: str = macro_cfg.get("yf_uup", "UUP")
 
         # 采集参数
         col_cfg = config.get("collector", {})
@@ -287,31 +292,46 @@ class DataCollector:
             detail="" if futu_ok else "FutuOpenD 连接失败",
         ))
 
-        # yfinance VIX
-        vix = await self._fetch_yf_ticker(self._vix_ticker)
-        vix_ok = vix is not None and vix.get("last_price", 0) >= self._vix_min
+        # VIX — Futu 优先
+        futu_macro = {}
+        if futu_ok:
+            try:
+                futu_macro = await self._get_snapshots(
+                    [self._futu_vix, self._futu_tnx, self._futu_uup],
+                )
+            except Exception:
+                pass
+
+        vix_snap = self._parse_macro_snap(futu_macro.get(self._futu_vix, {}), "VIX")
+        if not vix_snap:
+            vix_snap = await self._fetch_yf_ticker(self._yf_vix)
+        vix_ok = vix_snap is not None and vix_snap.get("last_price", 0) >= self._vix_min
         statuses.append(DataStatus(
-            source="yfinance_vix",
+            source="vix",
             ok=vix_ok,
-            detail="" if vix_ok else f"VIX 数据异常: {vix}",
+            detail="" if vix_ok else f"VIX 数据异常: {vix_snap}",
         ))
 
-        # yfinance TNX
-        tnx = await self._fetch_yf_ticker(self._tnx_ticker)
-        tnx_ok = tnx is not None and tnx.get("last_price", 0) >= self._tnx_min
+        # TNX — Futu 优先
+        tnx_snap = self._parse_macro_snap(futu_macro.get(self._futu_tnx, {}), "TNX")
+        if not tnx_snap:
+            tnx_snap = await self._fetch_yf_ticker(self._yf_tnx)
+        tnx_ok = tnx_snap is not None and tnx_snap.get("last_price", 0) >= self._tnx_min
         statuses.append(DataStatus(
-            source="yfinance_tnx",
+            source="tnx",
             ok=tnx_ok,
-            detail="" if tnx_ok else f"TNX 数据异常: {tnx}",
+            detail="" if tnx_ok else f"TNX 数据异常: {tnx_snap}",
         ))
 
-        # yfinance UUP
-        uup = await self._fetch_yf_ticker(self._uup_ticker)
-        uup_ok = uup is not None and uup.get("last_price", 0) >= self._uup_min
+        # UUP — Futu 优先
+        uup_snap = self._parse_macro_snap(futu_macro.get(self._futu_uup, {}), "UUP")
+        if not uup_snap:
+            uup_snap = await self._fetch_yf_ticker(self._yf_uup)
+        uup_ok = uup_snap is not None and uup_snap.get("last_price", 0) >= self._uup_min
         statuses.append(DataStatus(
-            source="yfinance_uup",
+            source="uup",
             ok=uup_ok,
-            detail="" if uup_ok else f"UUP 数据异常: {uup}",
+            detail="" if uup_ok else f"UUP 数据异常: {uup_snap}",
         ))
 
         # Futu 指数 snapshot
@@ -367,18 +387,39 @@ class DataCollector:
     # ── 宏观采集 ──
 
     async def _collect_macro(self) -> MacroData:
-        """采集 VIX + TNX + UUP 宏观数据。"""
-        vix_data, tnx_data, uup_data = await asyncio.gather(
-            self._fetch_yf_cached(self._vix_ticker, "_vix_cache"),
-            self._fetch_yf_cached(self._tnx_ticker, "_tnx_cache"),
-            self._fetch_yf_cached(self._uup_ticker, "_uup_cache"),
-        )
+        """采集 VIX + TNX + UUP — Futu snapshot 优先，yfinance 回退。"""
+        # 第一层：Futu snapshot（不消耗订阅额度）
+        futu_symbols = [self._futu_vix, self._futu_tnx, self._futu_uup]
+        futu_data: dict[str, dict] = {}
+        try:
+            futu_data = await self._get_snapshots(futu_symbols)
+        except Exception:
+            logger.debug("Macro Futu snapshot failed, will fall back to yfinance")
+
+        # 解析 Futu 数据
+        vix_data = self._parse_macro_snap(futu_data.get(self._futu_vix, {}), "VIX")
+        tnx_data = self._parse_macro_snap(futu_data.get(self._futu_tnx, {}), "TNX")
+        uup_data = self._parse_macro_snap(futu_data.get(self._futu_uup, {}), "UUP")
+
+        # 第二层：yfinance 回退（仅对 Futu 获取失败的标的）
+        if not vix_data:
+            vix_data = await self._fetch_macro_cached(self._yf_vix, "_vix_cache")
+            if vix_data:
+                logger.info("VIX: yfinance fallback OK")
+        if not tnx_data:
+            tnx_data = await self._fetch_macro_cached(self._yf_tnx, "_tnx_cache")
+            if tnx_data:
+                logger.info("TNX: yfinance fallback OK")
+        if not uup_data:
+            uup_data = await self._fetch_macro_cached(self._yf_uup, "_uup_cache")
+            if uup_data:
+                logger.info("UUP: yfinance fallback OK")
 
         # VIX
         vix_current = vix_data.get("last_price") if vix_data else None
         vix_prev = vix_data.get("prev_close") if vix_data else None
 
-        # VIX MA10
+        # VIX MA10（仍用 yfinance 历史数据）
         vix_ma10 = await self._fetch_vix_ma()
 
         # VIX 偏离
@@ -414,20 +455,35 @@ class DataCollector:
             timestamp=time.time(),
         )
 
-    async def _fetch_yf_cached(self, ticker_symbol: str, cache_attr: str) -> dict | None:
-        """yfinance 获取 + TTL 缓存。"""
+    @staticmethod
+    def _parse_macro_snap(snap: dict, label: str) -> dict | None:
+        """解析 Futu snapshot → {last_price, prev_close}，无效返回 None。"""
+        if not snap:
+            return None
+        last = snap.get("last_price", 0)
+        prev = snap.get("prev_close_price", 0)
+        # 盘前优先 pre_price
+        pre = snap.get("pre_price", 0)
+        if pre and pre > 0:
+            last = pre
+        if last and last > 0:
+            logger.debug("%s from Futu: last=%.4f prev=%.4f", label, last, prev)
+            return {"last_price": float(last), "prev_close": float(prev)}
+        return None
+
+    async def _fetch_macro_cached(self, yf_ticker: str, cache_attr: str) -> dict | None:
+        """yfinance 获取 + TTL 缓存（宏观回退用）。"""
         now = time.time()
         cache: tuple[float, dict | None] = getattr(self, cache_attr)
         if cache[1] is not None and now - cache[0] < self._macro_cache_ttl:
             return cache[1]
 
-        data = await self._fetch_yf_ticker(ticker_symbol)
+        data = await self._fetch_yf_ticker(yf_ticker)
         if data is not None and data.get("last_price", 0) > 0:
             setattr(self, cache_attr, (now, data))
             return data
 
-        # 获取失败，返回旧缓存
-        return cache[1]
+        return cache[1]  # 返回旧缓存
 
     async def _fetch_yf_ticker(self, ticker_symbol: str) -> dict | None:
         """yfinance fast_info 获取。"""

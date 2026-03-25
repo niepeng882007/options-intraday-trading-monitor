@@ -19,7 +19,10 @@ def default_config():
         "symbols": {
             "indexes": ["US.QQQ", "US.SPY", "US.IWM"],
             "mag7": ["US.AAPL", "US.MSFT", "US.NVDA", "US.AMZN", "US.GOOGL", "US.META", "US.TSLA"],
-            "macro": {"vix": "^VIX", "tnx": "^TNX", "uup": "UUP"},
+            "macro": {
+                "futu_vix": "US.VIX", "futu_tnx": "US.TNX", "futu_uup": "US.UUP",
+                "yf_vix": "^VIX", "yf_tnx": "^TNX", "yf_uup": "UUP",
+            },
         },
         "collector": {
             "macro_cache_ttl": 120,

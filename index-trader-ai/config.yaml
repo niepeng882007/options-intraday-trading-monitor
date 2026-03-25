@@ -23,9 +23,14 @@ symbols:
     - "US.META"
     - "US.TSLA"
   macro:
-    vix: "^VIX"          # yfinance ticker
-    uup: "UUP"           # yfinance ticker
-    tnx: "^TNX"          # yfinance ticker
+    # Futu 代码（优先，snapshot 轮询，不消耗订阅额度）
+    futu_vix: "US.VIX"
+    futu_tnx: "US.TNX"
+    futu_uup: "US.UUP"
+    # yfinance ticker（回退，Futu 获取失败时使用）
+    yf_vix: "^VIX"
+    yf_tnx: "^TNX"
+    yf_uup: "UUP"
 
 # === 采集 ===
 collector:
