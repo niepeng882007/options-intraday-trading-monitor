@@ -1,13 +1,16 @@
 """IndexDataCollector — 纯轮询封装 FutuCollector snapshot + yfinance 宏观数据。
 
 M1+M2 阶段不使用 Futu 订阅，全部 snapshot + yfinance 轮询。
+盘前时段（ET 04:00-09:30）通过 yfinance prepost=True 获取真实盘前价格。
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, time as dt_time
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -27,6 +30,8 @@ if TYPE_CHECKING:
 
 logger = setup_logger("index_collector")
 
+_ET = ZoneInfo("America/New_York")
+
 
 class IndexDataCollector:
     """数据采集层 — 封装 Futu snapshot + yfinance，带 TTL 缓存。"""
@@ -40,6 +45,10 @@ class IndexDataCollector:
         self._vix_history_cache: tuple[float, list | None] = (0.0, None)
         self._tnx_cache: tuple[float, dict | None] = (0.0, None)
         self._uup_cache: tuple[float, dict | None] = (0.0, None)
+
+        # 盘前价格缓存: (timestamp, {symbol: {pre_price, prev_close, pmh, pml}})
+        self._premarket_cache: tuple[float, dict[str, dict]] = (0.0, {})
+        self._premarket_cache_ttl = 60  # 60s TTL
 
         # 每日缓存（盘前加载一次）
         self._daily_bars: dict[str, pd.DataFrame] = {}
@@ -204,10 +213,57 @@ class IndexDataCollector:
                 return sum(closes) / len(closes)
             return 0.0
 
+    # ── 盘前数据 ──
+
+    @staticmethod
+    def _is_premarket() -> bool:
+        """判断当前是否处于美股盘前时段（ET 04:00-09:30）。"""
+        et_now = datetime.now(_ET).time()
+        return dt_time(4, 0) <= et_now < dt_time(9, 30)
+
+    async def _fetch_yf_premarket_prices(self, symbols: list[str]) -> dict[str, dict]:
+        """通过 yfinance history(prepost=True) 批量获取盘前最新价，60s TTL 缓存。"""
+        now = time.time()
+        if self._premarket_cache[1] and now - self._premarket_cache[0] < self._premarket_cache_ttl:
+            return self._premarket_cache[1]
+
+        async def _fetch_one(sym: str) -> tuple[str, dict]:
+            try:
+                import yfinance as yf
+                ticker = yf.Ticker(sym)
+                df = await asyncio.to_thread(
+                    ticker.history, period="1d", interval="1m", prepost=True,
+                )
+                if df.empty:
+                    return sym, {}
+                if df.index.tz is None:
+                    df.index = df.index.tz_localize(_ET)
+                else:
+                    df.index = df.index.tz_convert(_ET)
+                pre = df[df.index.time < dt_time(9, 30)]
+                if pre.empty:
+                    return sym, {}
+                prev_close = float(getattr(ticker.fast_info, "previous_close", 0) or 0)
+                return sym, {
+                    "pre_price": float(pre.iloc[-1]["Close"]),
+                    "prev_close": prev_close,
+                    "pmh": float(pre["High"].max()),
+                    "pml": float(pre["Low"].min()),
+                }
+            except Exception:
+                logger.debug("yfinance premarket fetch failed for %s", sym)
+                return sym, {}
+
+        results = await asyncio.gather(*[_fetch_one(s) for s in symbols])
+        data = {sym: d for sym, d in results if d}
+        self._premarket_cache = (now, data)
+        logger.info("Premarket prices fetched: %d/%d symbols", len(data), len(symbols))
+        return data
+
     # ── 指数报价 ──
 
     async def fetch_indices(self) -> list[IndexQuote]:
-        """批量获取 QQQ/SPY/IWM 报价快照。"""
+        """批量获取 QQQ/SPY/IWM 报价快照。盘前时段用 yfinance 覆盖。"""
         index_symbols = [i["symbol"] for i in self._cfg.get("indices", [])]
         if not index_symbols:
             return []
@@ -216,35 +272,57 @@ class IndexDataCollector:
             snapshots = await self._futu.get_snapshots(index_symbols)
         except Exception:
             logger.warning("Index snapshot fetch failed", exc_info=True)
-            return []
+            snapshots = {}
+
+        # 盘前：获取 yfinance 盘前价格
+        premarket = self._is_premarket()
+        yf_data: dict[str, dict] = {}
+        if premarket:
+            all_symbols = index_symbols + self._cfg.get("mag7", {}).get("symbols", [])
+            yf_data = await self._fetch_yf_premarket_prices(all_symbols)
 
         result = []
         for cfg_item in self._cfg.get("indices", []):
             sym = cfg_item["symbol"]
             snap = snapshots.get(sym, {})
-            if not snap:
+            yf = yf_data.get(sym, {})
+
+            if premarket and yf.get("pre_price", 0) > 0:
+                # 盘前：yfinance 数据为准
+                price = yf["pre_price"]
+                prev_close = yf["prev_close"]
+                change_pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
+                gap_pct = change_pct  # 盘前尚未开盘，gap ≈ change
+                pmh = yf.get("pmh", 0.0)
+                pml = yf.get("pml", 0.0)
+            elif snap:
+                # 盘中：Futu snapshot 为准
+                price = snap.get("last_price", 0.0)
+                prev_close = snap.get("prev_close_price", 0.0)
+                change_pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
+                open_price = snap.get("open_price", 0.0)
+                gap_pct = ((open_price - prev_close) / prev_close * 100) if prev_close > 0 and open_price > 0 else 0.0
+                pmh = snap.get("pre_high_price", 0.0)
+                pml = snap.get("pre_low_price", 0.0)
+            else:
                 continue
-            price = snap.get("last_price", 0.0)
-            prev_close = snap.get("prev_close_price", 0.0)
-            change_pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
-            open_price = snap.get("open_price", 0.0)
-            gap_pct = ((open_price - prev_close) / prev_close * 100) if prev_close > 0 and open_price > 0 else 0.0
+
             result.append(IndexQuote(
                 symbol=sym,
-                price=price,
-                prev_close=prev_close,
-                change_pct=change_pct,
-                volume=snap.get("volume", 0),
-                premarket_high=snap.get("pre_high_price", 0.0) if "pre_high_price" in snap else 0.0,
-                premarket_low=snap.get("pre_low_price", 0.0) if "pre_low_price" in snap else 0.0,
-                gap_pct=gap_pct,
+                price=round(price, 2),
+                prev_close=round(prev_close, 2),
+                change_pct=round(change_pct, 2),
+                volume=snap.get("volume", 0) if snap else 0,
+                premarket_high=pmh,
+                premarket_low=pml,
+                gap_pct=round(gap_pct, 2),
             ))
         return result
 
     # ── Mag7 报价 ──
 
     async def fetch_mag7(self) -> list[Mag7Stock]:
-        """批量获取 Mag7 报价快照。"""
+        """批量获取 Mag7 报价快照。盘前时段用 yfinance 覆盖。"""
         symbols = self._cfg.get("mag7", {}).get("symbols", [])
         if not symbols:
             return []
@@ -253,23 +331,38 @@ class IndexDataCollector:
             snapshots = await self._futu.get_snapshots(symbols)
         except Exception:
             logger.warning("Mag7 snapshot fetch failed", exc_info=True)
-            return []
+            snapshots = {}
 
+        # 盘前：复用 fetch_indices 已缓存的 yfinance 数据
+        premarket = self._is_premarket()
+        yf_data: dict[str, dict] = {}
+        if premarket:
+            yf_data = await self._fetch_yf_premarket_prices(symbols)  # 命中缓存
+
+        anomaly_ratio = self._cfg.get("mag7", {}).get("volume_anomaly_ratio", 2.0)
         result = []
         for sym in symbols:
             snap = snapshots.get(sym, {})
-            if not snap:
+            yf = yf_data.get(sym, {})
+
+            if premarket and yf.get("pre_price", 0) > 0:
+                price = yf["pre_price"]
+                prev_close = yf["prev_close"]
+                change_pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
+            elif snap:
+                price = snap.get("last_price", 0.0)
+                prev_close = snap.get("prev_close_price", 0.0)
+                change_pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
+            else:
                 continue
-            price = snap.get("last_price", 0.0)
-            prev_close = snap.get("prev_close_price", 0.0)
-            change_pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
+
             result.append(Mag7Stock(
                 code=sym,
-                price=price,
-                change_pct=change_pct,
-                volume=snap.get("volume", 0),
-                volume_ratio=snap.get("volume_ratio", 0.0),
-                is_anomaly=snap.get("volume_ratio", 0.0) >= self._cfg.get("mag7", {}).get("volume_anomaly_ratio", 2.0),
+                price=round(price, 2),
+                change_pct=round(change_pct, 2),
+                volume=snap.get("volume", 0) if snap else 0,
+                volume_ratio=snap.get("volume_ratio", 0.0) if snap else 0.0,
+                is_anomaly=(snap.get("volume_ratio", 0.0) if snap else 0.0) >= anomaly_ratio,
             ))
         return result
 

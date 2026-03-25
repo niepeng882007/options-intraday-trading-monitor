@@ -115,6 +115,7 @@ class IndexTrader:
             confidence=confidence,
             risk=risk,
             calendar_events=calendar_events,
+            is_premarket=self._data._is_premarket(),
         )
 
         self._report_cache = (now, report)

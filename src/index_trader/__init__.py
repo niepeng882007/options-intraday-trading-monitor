@@ -171,7 +171,7 @@ class ConfidenceReport:
     bearish_score: float
     direction: str                    # "bullish" / "bearish" / "neutral"
     direction_pct: float              # 主导方向的占比
-    resonance_count: int              # 同方向且 strength >= 0.5 的信号数
+    resonance_count: int              # 同方向且 strength > 0 的信号数
     confidence_grade: str             # "A" / "B" / "C" / "D"
     has_conflict: bool
     conflict_detail: str = ""
@@ -211,3 +211,4 @@ class DailyReport:
     confidence: ConfidenceReport
     risk: RiskParams
     calendar_events: list[str] = field(default_factory=list)
+    is_premarket: bool = False

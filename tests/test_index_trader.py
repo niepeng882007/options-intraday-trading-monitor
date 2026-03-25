@@ -200,6 +200,8 @@ class TestMag7Analyzer:
         snap, signal = Mag7Analyzer(default_config).analyze(stocks, index_avg_change=0.3)
         assert snap.is_kidnapped
         assert "NVDA" in snap.kidnap_detail
+        assert "vs 指数均值" in snap.kidnap_detail
+        assert "偏离" in snap.kidnap_detail and "x）" in snap.kidnap_detail
 
     def test_empty(self, default_config):
         snap, signal = Mag7Analyzer(default_config).analyze([], 0.0)
@@ -273,6 +275,63 @@ class TestScenarioEngine:
         judgment, signal = engine.judge(macro, rotation, mag7, gap_pct=0.1, calendar_events=[])
         assert judgment.primary_script == ScriptType.CHOP
 
+    def test_insufficient_conditions_fallback(self, default_config):
+        """辅助条件 <2 时 signal 应降级为 neutral。"""
+        engine = ScenarioEngine(default_config)
+        # 构造让所有剧本命中 <2 的场景:
+        # VIX deviation +2.8% > 0 → GAP_AND_GO VIX ❌
+        # VIX偏离 2.8% < 15% → GAP_FILL VIX ✅ (hit=1)
+        # gap bearish + mag7 bearish → aligned → GAP_FILL not_aligned=False ❌
+        # 有异常成交量 → PM 量不正常 ❌
+        # SEESAW ≠ SYNC → GAP_AND_GO sync ❌
+        # VIX NORMAL ≠ HIGH → REVERSAL VIX ❌
+        macro = MacroSnapshot(
+            vix_current=18.5, vix_prev_close=18.0, vix_ma10=18.0,
+            vix_deviation_pct=0.028, vix_regime=VIXRegime.NORMAL,
+            tnx_current=4.30, tnx_prev_close=4.30, tnx_change_bps=0.0,
+            uup_current=27.5, uup_prev_close=27.5, uup_change_pct=0.0,
+            dxy_direction="flat",
+        )
+        rotation = RotationSnapshot(
+            indices=[], leader="SPY", laggard="IWM",
+            spread_pct=0.5, scenario=RotationScenario.SEESAW,
+        )
+        mag7 = Mag7Snapshot(
+            stocks=[Mag7Stock(code="NVDA", price=140.0, change_pct=-1.0, is_anomaly=True)],
+            bullish_count=0, bearish_count=1,
+            avg_change_pct=-1.0, consistency_score=1.0,
+        )
+        # 各剧本最高 hit=1，触发条件不充分回退
+        judgment, signal = engine.judge(macro, rotation, mag7, gap_pct=-0.62, calendar_events=[])
+        assert signal.direction == "neutral"
+        assert signal.strength <= 0.2
+        assert "条件不充分" in signal.reason
+
+    def test_vix_positive_deviation_blocks_gap_and_go(self, default_config):
+        """VIX 偏离 >0 时 GAP_AND_GO 的 VIX 条件应该 ❌。"""
+        engine = ScenarioEngine(default_config)
+        macro = MacroSnapshot(
+            vix_current=26.95, vix_prev_close=25.0, vix_ma10=25.36,
+            vix_deviation_pct=0.0626, vix_regime=VIXRegime.NORMAL,
+            tnx_current=4.39, tnx_prev_close=4.33, tnx_change_bps=5.8,
+            uup_current=27.65, uup_prev_close=27.54, uup_change_pct=0.40,
+            dxy_direction="flat",
+        )
+        rotation = RotationSnapshot(
+            indices=[], leader="SPY", laggard="IWM",
+            spread_pct=0.1, scenario=RotationScenario.SYNC,
+        )
+        mag7 = Mag7Snapshot(
+            stocks=[], bullish_count=6, bearish_count=1,
+            avg_change_pct=0.5, consistency_score=0.86,
+        )
+        judgment, signal = engine.judge(macro, rotation, mag7, gap_pct=0.8, calendar_events=[])
+        # VIX 条件被 block，只有 mag7 和 sync 命中 → hit=2
+        # 但 GAP_AND_GO 不应该因为 VIX 而得到 3 分
+        vix_cond = [c for c in judgment.primary_conditions if "VIX" in c.name]
+        if vix_cond:
+            assert not vix_cond[0].met
+
     def test_reversal(self, default_config, bearish_macro):
         engine = ScenarioEngine(default_config)
         rotation = RotationSnapshot(
@@ -332,7 +391,27 @@ class TestConfidenceScorer:
         ]
         report = scorer.score(signals)
         assert report.confidence_grade == "D"
+        # total_score = 2.5 + 0 + 3.0 + 0 + 2.5 = 8.0（含 neutral 模块）
         assert report.total_score < 40
+        assert report.total_score > 0  # neutral 模块有贡献
+
+    def test_total_score_includes_neutral(self, default_config):
+        """total_score 应含全部模块，不排除 neutral。"""
+        scorer = ConfidenceScorer(default_config)
+        signals = [
+            Signal(source="macro", direction="bearish", strength=0.19, reason="vix up"),
+            Signal(source="rotation", direction="neutral", strength=0.30, reason="diverge"),
+            Signal(source="mag7", direction="neutral", strength=0.30, reason="mixed"),
+            Signal(source="levels", direction="bearish", strength=0.17, reason="below pdl"),
+            Signal(source="script", direction="bearish", strength=0.60, reason="gap and go"),
+        ]
+        report = scorer.score(signals)
+        # 全部加总: 0.19*0.25*100 + 0.30*0.20*100 + 0.30*0.15*100 + 0.17*0.15*100 + 0.60*0.25*100
+        # = 4.75 + 6.0 + 4.5 + 2.55 + 15.0 = 32.8
+        assert 32 <= report.total_score <= 34
+        assert report.direction == "bearish"
+        # 共振: macro(bearish) + levels(bearish) + script(bearish) = 3
+        assert report.resonance_count == 3
 
 
 # ── Risk Calculator ──
@@ -430,6 +509,79 @@ class TestReportFormatter:
         assert "开盘剧本" in html
         assert "评分明细" in html
         assert "chop" in html
+
+    def test_pdc_in_levels(self, default_config):
+        """关键点位应包含 PDC。"""
+        lm = LevelMap("SPY", 555.0, 553.0, 556.0, 550.0, 554.0, 552.0)
+        text = ReportFormatter._format_level_map(lm)
+        assert "PDC:553.00" in text
+
+    def test_premarket_rotation_format(self, default_config):
+        """盘前模式只显示一个值标注'盘前'。"""
+        from src.index_trader import DailyReport, RiskParams
+
+        report = DailyReport(
+            date=date(2026, 3, 25), timestamp=0.0,
+            macro=MacroSnapshot(
+                vix_current=18.0, vix_prev_close=18.0, vix_ma10=18.0,
+                vix_deviation_pct=0.0, vix_regime=VIXRegime.NORMAL,
+                tnx_current=4.30, tnx_prev_close=4.30, tnx_change_bps=0.0,
+                uup_current=27.5, uup_prev_close=27.5, uup_change_pct=0.0,
+                dxy_direction="flat",
+            ),
+            rotation=RotationSnapshot(
+                indices=[IndexQuote("SPY", 555.0, 553.0, 0.36, gap_pct=0.36)],
+                leader="SPY", laggard="SPY", spread_pct=0.0,
+                scenario=RotationScenario.SYNC,
+            ),
+            mag7=Mag7Snapshot(stocks=[], bullish_count=4, bearish_count=3,
+                             avg_change_pct=0.1, consistency_score=0.57),
+            levels={},
+            script=ScriptJudgment(ScriptType.CHOP, [], 2, []),
+            confidence=ConfidenceReport(
+                signals=[], total_score=45.0, bullish_score=30.0, bearish_score=15.0,
+                direction="bullish", direction_pct=0.67, resonance_count=2,
+                confidence_grade="C", has_conflict=False,
+            ),
+            risk=RiskParams(VolatilityRegime.NORMAL, 2.0, 1.0, 3, 30),
+            is_premarket=True,
+        )
+        formatter = ReportFormatter(default_config)
+        html = formatter.format(report)
+        assert "盘前:" in html
+        assert "缺口:" not in html
+
+    def test_insufficient_script_display(self, default_config):
+        """hit_count < 2 时应显示条件不充分。"""
+        from src.index_trader import DailyReport, RiskParams
+
+        report = DailyReport(
+            date=date(2026, 3, 25), timestamp=0.0,
+            macro=MacroSnapshot(
+                vix_current=18.0, vix_prev_close=18.0, vix_ma10=18.0,
+                vix_deviation_pct=0.0, vix_regime=VIXRegime.NORMAL,
+                tnx_current=4.30, tnx_prev_close=4.30, tnx_change_bps=0.0,
+                uup_current=27.5, uup_prev_close=27.5, uup_change_pct=0.0,
+                dxy_direction="flat",
+            ),
+            rotation=RotationSnapshot(
+                indices=[], leader="SPY", laggard="IWM",
+                spread_pct=0.1, scenario=RotationScenario.SYNC,
+            ),
+            mag7=Mag7Snapshot(stocks=[], bullish_count=4, bearish_count=3,
+                             avg_change_pct=0.1, consistency_score=0.57),
+            levels={},
+            script=ScriptJudgment(ScriptType.GAP_AND_GO, [], 1, []),  # hit=1 < 2
+            confidence=ConfidenceReport(
+                signals=[], total_score=20.0, bullish_score=10.0, bearish_score=10.0,
+                direction="neutral", direction_pct=0.0, resonance_count=0,
+                confidence_grade="D", has_conflict=False,
+            ),
+            risk=RiskParams(VolatilityRegime.NORMAL, 2.0, 1.0, 3, 30),
+        )
+        formatter = ReportFormatter(default_config)
+        html = formatter.format(report)
+        assert "条件不充分" in html
 
     def test_diff_markers(self, default_config):
         """Version 2 报告应标注 △ 变化。"""

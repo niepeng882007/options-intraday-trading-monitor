@@ -106,10 +106,14 @@ class ReportFormatter:
 
         lines = ["<b>🔄 板块轮动</b>"]
         for idx in rot.indices:
-            lines.append(
-                f"  {idx.symbol}: {idx.price:.2f} ({format_percent(idx.change_pct)}) "
-                f"gap:{format_percent(idx.gap_pct)}"
-            )
+            if r.is_premarket:
+                lines.append(f"  {idx.symbol}: {idx.price:.2f} 盘前:{format_percent(idx.change_pct)}")
+            else:
+                lines.append(
+                    f"  {idx.symbol}: {idx.price:.2f} "
+                    f"涨跌:{format_percent(idx.change_pct)} "
+                    f"缺口:{format_percent(idx.gap_pct)}"
+                )
         lines.append(f"格局: {label} | 领先: {rot.leader} | 落后: {rot.laggard} | 极差: {rot.spread_pct:.2f}%")
 
         if prev and prev.rotation.scenario != rot.scenario:
@@ -148,6 +152,8 @@ class ReportFormatter:
     def _format_level_map(lm: LevelMap) -> str:
         parts = [f"<b>{lm.symbol}</b> @ {lm.current_price:.2f}"]
         levels_line = []
+        if lm.pdc > 0:
+            levels_line.append(f"PDC:{lm.pdc:.2f}")
         if lm.pdh > 0:
             levels_line.append(f"PDH:{lm.pdh:.2f}")
         if lm.pdl > 0:
@@ -179,10 +185,11 @@ class ReportFormatter:
         j = r.script
         emoji = _SCRIPT_EMOJI.get(j.primary_script, "❓")
 
-        lines = [
-            "<b>🎬 开盘剧本</b>",
-            f"主判定: {emoji} <b>{j.primary_script.value}</b> (命中 {j.primary_hit_count} 条件)",
-        ]
+        lines = ["<b>🎬 开盘剧本</b>"]
+        if j.primary_hit_count < 2:
+            lines.append(f"⚠️ 条件不充分 — {j.primary_script.value} 仅命中 {j.primary_hit_count} 条件")
+        else:
+            lines.append(f"主判定: {emoji} <b>{j.primary_script.value}</b> (命中 {j.primary_hit_count} 条件)")
         for cond in j.primary_conditions:
             check = "✅" if cond.met else "❌"
             detail = f" — {cond.detail}" if cond.detail else ""

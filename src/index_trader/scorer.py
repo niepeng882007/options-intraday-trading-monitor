@@ -49,8 +49,8 @@ class ConfidenceScorer:
                 bearish_score += module_score
             # neutral 不计入任何方向
 
-        # 净得分 = max(bullish, bearish)
-        total_score = max(bullish_score, bearish_score)
+        # 总分 = 全部模块加权综合（不区分方向）
+        total_score = sum(s.strength * s.weight * 100 for s in signals)
 
         # 主导方向
         if bullish_score > bearish_score:
@@ -63,10 +63,10 @@ class ConfidenceScorer:
             direction = "neutral"
             direction_pct = 0.0
 
-        # 共振数：同方向且 strength >= 0.5
+        # 共振数：同方向且 strength > 0
         resonance = sum(
             1 for s in signals
-            if s.direction == direction and s.strength >= 0.5
+            if s.direction == direction and s.strength > 0
         )
 
         # 冲突检测：存在反向强信号

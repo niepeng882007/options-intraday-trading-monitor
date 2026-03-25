@@ -47,7 +47,11 @@ class Mag7Analyzer:
             for s in stocks:
                 if abs(s.change_pct) > abs(index_avg_change) * kidnap_ratio:
                     is_kidnapped = True
-                    kidnap_detail = f"{s.code} {s.change_pct:+.2f}% 偏离指数均值 {index_avg_change:+.2f}%"
+                    deviation_x = abs(s.change_pct / index_avg_change) if abs(index_avg_change) > 0.01 else 0
+                    kidnap_detail = (
+                        f"{s.code} {s.change_pct:+.2f}% vs 指数均值 {index_avg_change:+.2f}%"
+                        f"（偏离 {deviation_x:.1f}x）"
+                    )
                     break
 
         snapshot = Mag7Snapshot(

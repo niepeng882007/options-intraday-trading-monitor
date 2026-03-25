@@ -34,11 +34,13 @@ script:
 
 confidence:
   weights:
-    macro: 0.25
+    # 注：PRD 定义 6 模块（含 risk 0.10）。实现中 risk 独立于评分
+    # （依赖 grade 输出，存在循环依赖），权重重分配给 macro 和 script。
+    macro: 0.25       # PRD: 0.20, +0.05 补偿 risk
     rotation: 0.20
     mag7: 0.15
     levels: 0.15
-    script: 0.25
+    script: 0.25      # PRD: 0.20, +0.05 补偿 risk
   grade_thresholds:
     A: {min_score: 75, min_resonance: 4}
     B: {min_score: 60, min_resonance: 3}

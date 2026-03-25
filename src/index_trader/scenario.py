@@ -59,6 +59,16 @@ class ScenarioEngine:
             alternatives=alternatives,
         )
 
+        # 辅助条件不足时降级为中性信号
+        if primary[2] < 2:
+            signal = Signal(
+                source="script",
+                direction="neutral",
+                strength=0.1,
+                reason=f"条件不充分 ({primary[0].value} 仅命中 {primary[2]})",
+            )
+            return judgment, signal
+
         # 信号
         direction, strength = self._script_to_signal(primary[0], gap_pct, primary[2])
         reason = f"{primary[0].value} (命中 {primary[2]} 条件)"
@@ -87,10 +97,10 @@ class ScenarioEngine:
         if not has_gap:
             return conditions, 0
 
-        # 辅助 1: VIX 偏低
-        vix_low = macro.vix_regime in (VIXRegime.LOW, VIXRegime.NORMAL)
-        conditions.append(ScriptCondition("VIX 偏低/中性", vix_low, f"VIX={macro.vix_regime.value}"))
-        if vix_low:
+        # 辅助 1: VIX 偏离 MA10 < 0（走低）
+        vix_below_ma = macro.vix_deviation_pct < 0
+        conditions.append(ScriptCondition("VIX偏离MA10<0", vix_below_ma, f"deviation={macro.vix_deviation_pct:+.1%}"))
+        if vix_below_ma:
             hit += 1
 
         # 辅助 2: gap 方向 = Mag7 方向
