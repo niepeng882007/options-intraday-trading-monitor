@@ -228,6 +228,32 @@ async def main() -> None:
     except Exception:
         logger.warning("HK Predictor init failed", exc_info=True)
 
+    # ── Index Trader (纯数据管道) ──
+    idx_trader_bot = None
+    idx_collector = None
+    try:
+        import sys
+        from pathlib import Path
+        _idx_dir = str(Path(__file__).resolve().parent.parent / "index-trader-ai")
+        if _idx_dir not in sys.path:
+            sys.path.insert(0, _idx_dir)
+
+        from config import load_config as idx_load_config
+        from collector import DataCollector
+        from formatter import DataFormatter
+        from bot import TelegramBot as IdxTelegramBot
+
+        idx_cfg = idx_load_config(str(Path(_idx_dir) / "config.yaml"))
+        idx_collector = DataCollector(idx_cfg)
+        await idx_collector.start()
+        idx_formatter = DataFormatter(idx_cfg)
+        idx_trader_bot = IdxTelegramBot(idx_cfg, idx_collector, idx_formatter)
+        logger.info("Index Trader initialized (subs=%d)", idx_collector.get_subscription_count())
+    except FileNotFoundError:
+        logger.info("Index Trader config not found, skipping")
+    except Exception:
+        logger.warning("Index Trader init failed", exc_info=True)
+
     # ── Message archive ──
     message_archive.init("data/monitor.db")
 
@@ -248,6 +274,10 @@ async def main() -> None:
             from src.hk.telegram import register_hk_predictor_handlers
             register_hk_predictor_handlers(app, hk_predictor)
 
+        # Register Index Trader handlers
+        if idx_trader_bot:
+            await idx_trader_bot.start(app)
+
         # Keyboard & utility commands
         app.add_handler(CommandHandler("kb", _cmd_keyboard))
         app.add_handler(CommandHandler("start", _cmd_keyboard))
@@ -260,6 +290,8 @@ async def main() -> None:
         commands = [
             BotCommand("hk_help", "港股期权监控说明"),
             BotCommand("us_help", "美股期权监控说明"),
+            BotCommand("report", "指数盘前数据报告"),
+            BotCommand("raw", "纯文本数据(喂给LLM)"),
             BotCommand("messages", "查看上一交易日消息归档"),
             BotCommand("kb", "显示快捷查询键盘"),
             BotCommand("kboff", "关闭快捷键盘"),
@@ -318,6 +350,27 @@ async def main() -> None:
             )
             logger.info("HK auto-scan scheduled: every %ds", interval)
 
+    # ── Index Trader scheduled reports ──
+    if idx_trader_bot:
+        sched_cfg = idx_cfg.get("schedule", {}) if idx_cfg else {}
+        v1 = sched_cfg.get("report_push_1", "09:00").split(":")
+        scheduler.add_job(
+            idx_trader_bot.push_report, "cron",
+            hour=int(v1[0]), minute=int(v1[1]),
+            kwargs={"is_update": False},
+            id="idx_report_v1", max_instances=1,
+        )
+        v2 = sched_cfg.get("report_push_2", "09:25").split(":")
+        scheduler.add_job(
+            idx_trader_bot.push_report, "cron",
+            hour=int(v2[0]), minute=int(v2[1]),
+            kwargs={"is_update": True},
+            id="idx_report_v2", max_instances=1,
+        )
+        logger.info("Index Trader reports scheduled: %s, %s",
+                     sched_cfg.get("report_push_1", "09:00"),
+                     sched_cfg.get("report_push_2", "09:25"))
+
     # APScheduler error/miss listener → log + Telegram alert
     def _scheduler_listener(event):
         if event.exception:
@@ -339,9 +392,10 @@ async def main() -> None:
 
     scheduler.add_listener(_scheduler_listener, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
     scheduler.start()
-    logger.info("Playbook system started — US=%s, HK=%s",
+    logger.info("Playbook system started — US=%s, HK=%s, IDX=%s",
                 "ON" if us_predictor else "OFF",
-                "ON" if hk_predictor else "OFF")
+                "ON" if hk_predictor else "OFF",
+                "ON" if idx_trader_bot else "OFF")
 
     # ── Graceful shutdown ──
     shutdown = asyncio.Event()
@@ -355,6 +409,9 @@ async def main() -> None:
         if us_predictor:
             with suppress(Exception):
                 us_predictor.close()
+        if idx_collector:
+            with suppress(Exception):
+                idx_collector.close()
         if app:
             await _shutdown_telegram_application(app)
         if hk_predictor:

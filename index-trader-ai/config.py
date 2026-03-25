@@ -29,4 +29,10 @@ def load_config(config_path: str | None = None) -> dict:
     tg["bot_token"] = os.environ.get("TELEGRAM_BOT_TOKEN", tg.get("bot_token", ""))
     tg["chat_id"] = os.environ.get("TELEGRAM_CHAT_ID", tg.get("chat_id", ""))
 
+    # Futu host 支持环境变量覆盖（Docker 中用 host.docker.internal）
+    futu = cfg.setdefault("futu", {})
+    futu_host_env = os.environ.get("FUTU_HOST")
+    if futu_host_env:
+        futu["host"] = futu_host_env
+
     return cfg

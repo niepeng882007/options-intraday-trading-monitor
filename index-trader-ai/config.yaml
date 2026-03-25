@@ -89,4 +89,4 @@ update_thresholds:
 archive_dir: "data/raw"
 
 # === 经济日历 ===
-calendar_file: "../config/us_calendar.yaml"   # 复用主项目日历
+calendar_file: "config/us_calendar.yaml"      # Docker 中挂载到 /app/config
