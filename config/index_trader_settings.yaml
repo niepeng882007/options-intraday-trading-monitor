@@ -1,0 +1,74 @@
+# Index Trader AI — 指数日内交易盘前分析配置
+
+indices:
+  - {symbol: QQQ, name: "Nasdaq 100 ETF"}
+  - {symbol: SPY, name: "S&P 500 ETF"}
+  - {symbol: IWM, name: "Russell 2000 ETF"}
+
+mag7:
+  symbols: [AAPL, MSFT, GOOGL, AMZN, NVDA, META, TSLA]
+  kidnap_ratio: 3.0           # 单股偏离 > 指数均值 Nx → 绑架
+  volume_anomaly_ratio: 2.0   # PM 成交量 > 5日均值 Nx → 异常
+
+macro:
+  vix:
+    ma_period: 10
+    high_deviation: 0.20      # VIX 偏离 MA10 > 20% → high
+    extreme_deviation: 0.40   # VIX 偏离 MA10 > 40% → extreme
+    low_deviation: -0.05      # VIX 偏离 < -5% → low
+    cache_ttl: 120
+  tnx:
+    surge_threshold_bps: 5    # TNX 变动 > 5bps → 突变
+    cache_ttl: 120
+  uup:
+    strong_threshold_pct: 0.5
+    cache_ttl: 120            # 统一用 yfinance, 120s TTL
+
+rotation:
+  sync_threshold_pct: 0.2     # 差值 < 0.2% → 同步
+  spread_threshold_pct: 1.0   # 差值 > 1.0% → 明显分化
+
+script:
+  gap_threshold_pct: 0.3
+  pm_range_threshold_ratio: 0.3
+
+confidence:
+  weights:
+    macro: 0.25
+    rotation: 0.20
+    mag7: 0.15
+    levels: 0.15
+    script: 0.25
+  grade_thresholds:
+    A: {min_score: 75, min_resonance: 4}
+    B: {min_score: 60, min_resonance: 3}
+    C: {min_score: 40, min_resonance: 0}
+
+risk:
+  normal:
+    max_daily_loss_pct: 2.0
+    max_single_risk_pct: 1.0
+    circuit_breaker_count: 3
+    cooldown_minutes: 30
+  high_volatility:
+    max_daily_loss_pct: 1.0
+    max_single_risk_pct: 0.5
+    circuit_breaker_count: 2
+    cooldown_minutes: 9999     # 当日停手
+
+volume_profile:
+  lookback_trading_days: 5
+  value_area_pct: 0.70
+  recency_decay: 0.15
+
+gamma_wall:
+  enabled: true               # 使用真实 OI 计算，失败回退整数关口
+
+level_proximity_pct: 0.001    # 价位接近 0.1%
+
+scheduled_reports:
+  enabled: true
+  v1_time: "09:00"
+  v2_time: "09:25"
+
+calendar_file: "config/us_calendar.yaml"
