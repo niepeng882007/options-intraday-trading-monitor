@@ -99,7 +99,7 @@ class ScenarioEngine:
 
         # 辅助 1: VIX 偏离 MA10 < 0（走低）
         vix_below_ma = macro.vix_deviation_pct < 0
-        conditions.append(ScriptCondition("VIX偏离MA10<0", vix_below_ma, f"deviation={macro.vix_deviation_pct:+.1%}"))
+        conditions.append(ScriptCondition("VIX偏离MA10&lt;0", vix_below_ma, f"deviation={macro.vix_deviation_pct:+.1%}"))
         if vix_below_ma:
             hit += 1
 
@@ -134,7 +134,7 @@ class ScenarioEngine:
 
         # VIX 偏离温和
         vix_moderate = abs(macro.vix_deviation_pct) < 0.15
-        conditions.append(ScriptCondition("VIX偏离<15%", vix_moderate, f"deviation={macro.vix_deviation_pct:.1%}"))
+        conditions.append(ScriptCondition("VIX偏离&lt;15%", vix_moderate, f"deviation={macro.vix_deviation_pct:.1%}"))
         if vix_moderate:
             hit += 1
 
