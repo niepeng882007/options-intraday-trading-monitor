@@ -228,22 +228,6 @@ async def main() -> None:
     except Exception:
         logger.warning("HK Predictor init failed", exc_info=True)
 
-    # ── Index Trader ──
-    index_trader = None
-    idx_cfg: dict | None = None
-    try:
-        idx_cfg_path = "config/index_trader_settings.yaml"
-        with open(idx_cfg_path) as f:
-            idx_cfg = yaml.safe_load(f)
-        from src.index_trader.main import IndexTrader
-        index_trader = IndexTrader(idx_cfg, collector)
-        await index_trader.start()
-        logger.info("Index Trader initialized")
-    except FileNotFoundError:
-        logger.info("Index Trader config not found, skipping")
-    except Exception:
-        logger.warning("Index Trader init failed", exc_info=True)
-
     # ── Message archive ──
     message_archive.init("data/monitor.db")
 
@@ -264,11 +248,6 @@ async def main() -> None:
             from src.hk.telegram import register_hk_predictor_handlers
             register_hk_predictor_handlers(app, hk_predictor)
 
-        # Register Index Trader handlers
-        if index_trader:
-            from src.index_trader.telegram import register_index_trader_handlers
-            register_index_trader_handlers(app, index_trader)
-
         # Keyboard & utility commands
         app.add_handler(CommandHandler("kb", _cmd_keyboard))
         app.add_handler(CommandHandler("start", _cmd_keyboard))
@@ -281,8 +260,6 @@ async def main() -> None:
         commands = [
             BotCommand("hk_help", "港股期权监控说明"),
             BotCommand("us_help", "美股期权监控说明"),
-            BotCommand("report", "指数盘前分析报告"),
-            BotCommand("idx_help", "指数交易助手说明"),
             BotCommand("messages", "查看上一交易日消息归档"),
             BotCommand("kb", "显示快捷查询键盘"),
             BotCommand("kboff", "关闭快捷键盘"),
@@ -341,34 +318,6 @@ async def main() -> None:
             )
             logger.info("HK auto-scan scheduled: every %ds", interval)
 
-    # ── Index Trader scheduled reports ──
-    if index_trader:
-        idx_sched = idx_cfg.get("scheduled_reports", {}) if idx_cfg else {}
-        if idx_sched.get("enabled", False):
-            async def _idx_send_fn(text: str, parse_mode: str = "HTML") -> None:
-                if app and chat_id:
-                    await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
-                    message_archive.log("index_trader", "scheduled_report", text, "us")
-                else:
-                    logger.info("Index Trader report (no TG): %s", text[:200])
-
-            v1_time = idx_sched.get("v1_time", "09:00").split(":")
-            scheduler.add_job(
-                index_trader.push_report, "cron",
-                hour=int(v1_time[0]), minute=int(v1_time[1]),
-                kwargs={"send_fn": _idx_send_fn, "is_update": False},
-                id="idx_report_v1", max_instances=1,
-            )
-            v2_time = idx_sched.get("v2_time", "09:25").split(":")
-            scheduler.add_job(
-                index_trader.push_report, "cron",
-                hour=int(v2_time[0]), minute=int(v2_time[1]),
-                kwargs={"send_fn": _idx_send_fn, "is_update": True},
-                id="idx_report_v2", max_instances=1,
-            )
-            logger.info("Index Trader reports scheduled: v1=%s, v2=%s",
-                        idx_sched.get("v1_time"), idx_sched.get("v2_time"))
-
     # APScheduler error/miss listener → log + Telegram alert
     def _scheduler_listener(event):
         if event.exception:
@@ -390,10 +339,9 @@ async def main() -> None:
 
     scheduler.add_listener(_scheduler_listener, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
     scheduler.start()
-    logger.info("Playbook system started — US=%s, HK=%s, IDX=%s",
+    logger.info("Playbook system started — US=%s, HK=%s",
                 "ON" if us_predictor else "OFF",
-                "ON" if hk_predictor else "OFF",
-                "ON" if index_trader else "OFF")
+                "ON" if hk_predictor else "OFF")
 
     # ── Graceful shutdown ──
     shutdown = asyncio.Event()
@@ -407,9 +355,6 @@ async def main() -> None:
         if us_predictor:
             with suppress(Exception):
                 us_predictor.close()
-        if index_trader:
-            with suppress(Exception):
-                index_trader.close()
         if app:
             await _shutdown_telegram_application(app)
         if hk_predictor:

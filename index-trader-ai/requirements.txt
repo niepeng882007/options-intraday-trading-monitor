@@ -1,0 +1,7 @@
+futu-api
+python-telegram-bot>=20.0
+pyyaml
+python-dotenv
+yfinance
+pandas
+apscheduler>=3.10

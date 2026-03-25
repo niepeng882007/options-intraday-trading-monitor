@@ -1,0 +1,92 @@
+# === Index Trader AI — 纯数据管道配置 ===
+
+# === 连接 ===
+futu:
+  host: "127.0.0.1"
+  port: 11111
+
+telegram:
+  # bot_token 和 chat_id 从 .env 读取
+
+# === 标的 ===
+symbols:
+  indexes:
+    - "US.QQQ"
+    - "US.SPY"
+    - "US.IWM"
+  mag7:
+    - "US.AAPL"
+    - "US.MSFT"
+    - "US.NVDA"
+    - "US.AMZN"
+    - "US.GOOGL"
+    - "US.META"
+    - "US.TSLA"
+  macro:
+    vix: "^VIX"          # yfinance ticker
+    uup: "UUP"           # yfinance ticker
+    tnx: "^TNX"          # yfinance ticker
+
+# === 采集 ===
+collector:
+  snapshot_interval_sec: 30          # VIX/TNX/UUP 快照轮询间隔
+  vix_ma_period: 10                  # VIX 均值周期（天）
+  vix_ma_cache_ttl: 86400           # VIX MA 缓存 TTL（秒，每日刷新一次）
+  macro_cache_ttl: 120              # VIX/TNX/UUP 单次数据缓存 TTL（秒）
+  mag7_volume_avg_days: 5            # Mag7 均量计算天数
+  weekly_lookback_days: 5            # 周高低点回溯天数
+  volume_profile:
+    lookback_trading_days: 5         # VP 回溯交易日
+    value_area_pct: 0.70             # 价值区域百分比
+  gamma_wall:
+    enabled: true                    # 使用真实 OI，失败回退整数关口
+
+# === 数据校验 ===
+validation:
+  vix_min_valid: 1.0                 # VIX 低于此值判定异常
+  tnx_min_valid: 0.01                # TNX 低于此值判定异常
+  uup_min_valid: 1.0                 # UUP 低于此值判定异常
+  stale_data_cutoff_hour_et: 4       # 早于此时间(ET)的数据判定为陈旧
+
+# === 点位 ===
+levels:
+  proximity_pct: 0.001               # 点位触及判定距离（0.1%）
+
+# === 风控查表 ===
+risk:
+  vix_high_deviation_threshold: 0.20 # VIX 偏离 MA10 超过此值 → 高波动
+  normal:
+    max_single_risk_pct: 1.0
+    max_daily_loss_pct: 2.0
+    circuit_breaker_count: 3
+    cooldown_minutes: 30
+  high_volatility:
+    max_single_risk_pct: 0.5
+    max_daily_loss_pct: 1.0
+    circuit_breaker_count: 2
+    cooldown_minutes: 999            # 当日停手
+
+# === 盘中监控 ===
+monitor:
+  enabled: true
+  volume_anomaly_ratio: 3.0          # 成交量异常倍数（5min bar > 均值 Nx）
+  data_alert_minutes_before: 5       # 数据发布前 N 分钟提醒
+
+# === 调度（美东时间）===
+schedule:
+  collector_start: "08:00"
+  report_push_1: "09:00"
+  report_push_2: "09:25"
+  market_open: "09:30"
+  market_close: "16:00"
+
+# === 更新标记阈值 ===
+update_thresholds:
+  price_change_pct: 0.05             # △ 标记：价格变化超过 0.05%
+  pct_change_abs: 0.10               # △ 标记：涨跌幅变化超过 0.10 个百分点
+
+# === 数据存档 ===
+archive_dir: "data/raw"
+
+# === 经济日历 ===
+calendar_file: "../config/us_calendar.yaml"   # 复用主项目日历
