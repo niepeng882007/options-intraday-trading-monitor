@@ -24,13 +24,15 @@ def load_config(config_path: str | None = None) -> dict:
     if env_path.exists():
         load_dotenv(env_path, override=False)
 
-    # 注入 Telegram 配置
-    tg = cfg.setdefault("telegram", {})
+    # 注入 Telegram 配置（YAML 中 telegram: 只有注释时解析为 None）
+    tg = cfg.get("telegram") or {}
+    cfg["telegram"] = tg
     tg["bot_token"] = os.environ.get("TELEGRAM_BOT_TOKEN", tg.get("bot_token", ""))
     tg["chat_id"] = os.environ.get("TELEGRAM_CHAT_ID", tg.get("chat_id", ""))
 
     # Futu host 支持环境变量覆盖（Docker 中用 host.docker.internal）
-    futu = cfg.setdefault("futu", {})
+    futu = cfg.get("futu") or {}
+    cfg["futu"] = futu
     futu_host_env = os.environ.get("FUTU_HOST")
     if futu_host_env:
         futu["host"] = futu_host_env
