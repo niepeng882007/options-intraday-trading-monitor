@@ -132,6 +132,9 @@ class IndexDataCollector:
         else:
             dxy_direction = "flat"
 
+        if vix_current < 1:
+            logger.warning("Macro data unavailable: VIX=%.2f TNX=%.3f UUP=%.2f", vix_current, tnx_current, uup_current)
+
         return MacroSnapshot(
             vix_current=vix_current,
             vix_prev_close=vix_prev,
@@ -332,10 +335,14 @@ class IndexDataCollector:
         except Exception:
             snap = {}
 
-        price = snap.get("last_price", 0.0)
+        pre_price = snap.get("pre_price", 0.0)
+        if self._is_premarket() and pre_price > 0:
+            price = pre_price
+        else:
+            price = snap.get("last_price", 0.0)
         prev_close = snap.get("prev_close_price", 0.0)
-        pmh = snap.get("pre_high_price", 0.0) if "pre_high_price" in snap else 0.0
-        pml = snap.get("pre_low_price", 0.0) if "pre_low_price" in snap else 0.0
+        pmh = snap.get("pre_high_price", 0.0)
+        pml = snap.get("pre_low_price", 0.0)
 
         # 每日缓存的 VP + PDH/PDL
         cached = self._daily_levels.get(symbol, {})

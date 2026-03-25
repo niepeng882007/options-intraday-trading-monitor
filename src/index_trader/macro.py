@@ -16,6 +16,10 @@ class MacroAnalyzer:
 
     def analyze(self, snapshot: MacroSnapshot) -> Signal:
         """综合 VIX + TNX + UUP 输出单个宏观信号。"""
+        if not snapshot.is_valid:
+            return Signal(source="macro", direction="neutral", strength=0.0,
+                          reason="⚠️ 宏观数据不可用")
+
         sub_signals: list[tuple[str, float]] = []  # (direction, strength)
 
         # ── VIX 分析 ──

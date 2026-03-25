@@ -81,6 +81,10 @@ class ReportFormatter:
 
     def _section_macro(self, r: DailyReport, prev: DailyReport | None) -> str:
         m = r.macro
+
+        if not m.is_valid:
+            return "<b>🌍 宏观面板</b>\n⚠️ 宏观数据暂不可用（VIX/TNX/UUP 获取失败）"
+
         vix_emoji = "🔴" if m.vix_regime in (VIXRegime.HIGH, VIXRegime.EXTREME) else "🟢" if m.vix_regime == VIXRegime.LOW else "⚪"
 
         lines = [
@@ -125,9 +129,13 @@ class ReportFormatter:
 
     def _section_mag7(self, r: DailyReport, prev: DailyReport | None) -> str:
         m7 = r.mag7
+        neutral_count = len(m7.stocks) - m7.bullish_count - m7.bearish_count
+        dir_text = f"{m7.bullish_count}涨 / {m7.bearish_count}跌"
+        if neutral_count > 0:
+            dir_text += f" / {neutral_count}平"
         lines = [
             "<b>🌡 Mag7 温度计</b>",
-            f"方向: {m7.bullish_count}涨 / {m7.bearish_count}跌 | 一致性: {m7.consistency_score:.0%} | 均涨: {format_percent(m7.avg_change_pct)}",
+            f"方向: {dir_text} | 一致性: {m7.consistency_score:.0%} | 均涨: {format_percent(m7.avg_change_pct)}",
         ]
         for s in m7.stocks:
             anomaly_tag = " ⚡" if s.is_anomaly else ""
@@ -191,7 +199,10 @@ class ReportFormatter:
         else:
             lines.append(f"主判定: {emoji} <b>{j.primary_script.value}</b> (命中 {j.primary_hit_count} 条件)")
         for cond in j.primary_conditions:
-            check = "✅" if cond.met else "❌"
+            if cond.is_prerequisite:
+                check = "🔑" if cond.met else "❌"
+            else:
+                check = "✅" if cond.met else "❌"
             detail = f" — {cond.detail}" if cond.detail else ""
             lines.append(f"  {check} {cond.name}{detail}")
 

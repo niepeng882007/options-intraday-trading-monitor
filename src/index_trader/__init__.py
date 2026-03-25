@@ -50,6 +50,11 @@ class MacroSnapshot:
     dxy_direction: str                # "strong" / "weak" / "flat"
     timestamp: float = 0.0
 
+    @property
+    def is_valid(self) -> bool:
+        """VIX < 1 视为数据异常（yfinance 获取失败返回零值）。"""
+        return self.vix_current >= 1.0
+
 
 # ── 轮动快照 ──
 
@@ -148,6 +153,7 @@ class ScriptCondition:
     name: str
     met: bool
     detail: str = ""
+    is_prerequisite: bool = False     # 前提条件（不计入 hit）
 
 
 @dataclass

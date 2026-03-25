@@ -93,7 +93,7 @@ class ScenarioEngine:
 
         # 前提：gap > threshold
         has_gap = abs(gap_pct) > self._gap_threshold
-        conditions.append(ScriptCondition("gap > 0.3%", has_gap, f"gap={gap_pct:+.2f}%"))
+        conditions.append(ScriptCondition("gap > 0.3%", has_gap, f"gap={gap_pct:+.2f}%", is_prerequisite=True))
         if not has_gap:
             return conditions, 0
 
@@ -128,7 +128,7 @@ class ScenarioEngine:
         hit = 0
 
         has_gap = abs(gap_pct) > self._gap_threshold
-        conditions.append(ScriptCondition("gap > 0.3%", has_gap, f"gap={gap_pct:+.2f}%"))
+        conditions.append(ScriptCondition("gap > 0.3%", has_gap, f"gap={gap_pct:+.2f}%", is_prerequisite=True))
         if not has_gap:
             return conditions, 0
 
@@ -163,7 +163,7 @@ class ScenarioEngine:
         hit = 0
 
         has_gap = abs(gap_pct) > self._gap_threshold
-        conditions.append(ScriptCondition("gap > 0.3%", has_gap, f"gap={gap_pct:+.2f}%"))
+        conditions.append(ScriptCondition("gap > 0.3%", has_gap, f"gap={gap_pct:+.2f}%", is_prerequisite=True))
         if not has_gap:
             return conditions, 0
 
@@ -198,7 +198,7 @@ class ScenarioEngine:
         hit = 0
 
         small_gap = abs(gap_pct) <= self._gap_threshold
-        conditions.append(ScriptCondition("gap ≤ 0.3%", small_gap, f"gap={gap_pct:+.2f}%"))
+        conditions.append(ScriptCondition("gap ≤ 0.3%", small_gap, f"gap={gap_pct:+.2f}%", is_prerequisite=True))
         if not small_gap:
             return conditions, 0
 
